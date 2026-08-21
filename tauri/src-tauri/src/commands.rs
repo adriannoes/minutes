@@ -21095,7 +21095,12 @@ fn start_dictation_session(
                         crate::text_insertion::TextInsertionRequest {
                             text: result.text.clone(),
                             mode: crate::text_insertion::TextInsertionMode::BestEffortVerified,
-                            restore_clipboard: config_for_results.dictation.auto_paste_restore,
+                            // Routine dictation has one predictable delivery
+                            // contract: the final text stays in both the target
+                            // app and the clipboard. Explicit re-paste and
+                            // reprocess actions may still preserve the previous
+                            // clipboard through auto_paste_restore.
+                            restore_clipboard: false,
                             clipboard_snapshot: None,
                             expected_target: dictation_target_context_for_results.clone(),
                         },

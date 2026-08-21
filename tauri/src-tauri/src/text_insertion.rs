@@ -300,6 +300,85 @@ fn copy_only(text: &str, target_context: Option<ActiveTargetContext>) -> TextIns
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn target_prefers_clipboard_paste(target: Option<&ActiveTargetContext>) -> bool {
+    let bundle_id = target
+        .and_then(|context| context.bundle_id.as_deref())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let app_name = target
+        .and_then(|context| context.app_name.as_deref())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    [
+        "ghostty",
+        "terminal",
+        "iterm",
+        "wezterm",
+        "alacritty",
+        "kitty",
+        "warp",
+    ]
+    .iter()
+    .any(|marker| bundle_id.contains(marker) || app_name.contains(marker))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn native_ax_delivery_verified(
+    before: Option<&str>,
+    after: Option<&str>,
+    inserted_text: &str,
+) -> bool {
+    matches!((before, after), (Some(before), Some(after)) if before != after && after.contains(inserted_text))
+}
+
+#[cfg(target_os = "macos")]
+fn copy_after_unverified_native_insert(
+    request: TextInsertionRequest,
+    target_context: Option<ActiveTargetContext>,
+    operation_started: std::time::Instant,
+    visible_ms: u64,
+    verification_ms: u64,
+) -> TextInsertionResult {
+    let diagnostic = "native_ax: macOS accepted the write but delivery was not verified";
+    tracing::warn!(diagnostic, "dictation native insertion was not verified");
+
+    match write_clipboard(&request.text) {
+        Ok(()) => TextInsertionResult {
+            outcome: InsertOutcome::Copied,
+            method: InsertMethod::ClipboardOnly,
+            verified: true,
+            clipboard_restored: false,
+            target_context,
+            message: "Could not verify typing into the active app. Copied dictation instead."
+                .into(),
+            timing: TextInsertionTiming {
+                visible_ms: Some(visible_ms),
+                clipboard_restore_ms: None,
+                verification_ms: Some(verification_ms),
+                total_ms: operation_started.elapsed().as_millis() as u64,
+                diagnostic: Some(diagnostic.into()),
+            },
+        },
+        Err(error) => TextInsertionResult {
+            outcome: InsertOutcome::Failed,
+            method: InsertMethod::ClipboardOnly,
+            verified: false,
+            clipboard_restored: false,
+            target_context,
+            message: error.clone(),
+            timing: TextInsertionTiming {
+                visible_ms: Some(visible_ms),
+                clipboard_restore_ms: None,
+                verification_ms: Some(verification_ms),
+                total_ms: operation_started.elapsed().as_millis() as u64,
+                diagnostic: Some(format!("{diagnostic}; clipboard_copy: {error}")),
+            },
+        },
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn best_effort_verified(
     request: TextInsertionRequest,
@@ -314,35 +393,68 @@ fn best_effort_verified(
 
     let before_value = focused_ax_value().ok();
 
-    // Prefer the focused control's selected-text range. This commits directly
-    // at the caret without touching the clipboard or launching a subprocess.
-    // Many native controls support it; browsers, terminals, and custom editors
-    // may not, so failure falls through to the proven clipboard paste path.
-    let native_ax_error = match macos_ax::insert_selected_text(&request.text) {
-        Ok(()) => {
-            let visible_ms = operation_started.elapsed().as_millis() as u64;
-            let verification_started = std::time::Instant::now();
-            let verified = focused_ax_value().ok().is_some_and(|after| {
-                before_value.as_ref() != Some(&after) && after.contains(&request.text)
-            });
-            let verification_ms = verification_started.elapsed().as_millis() as u64;
-            return TextInsertionResult {
-                outcome: InsertOutcome::Typed,
-                method: InsertMethod::NativeAx,
-                verified,
-                clipboard_restored: false,
-                target_context,
-                message: "Typed dictation into the active app.".into(),
-                timing: TextInsertionTiming {
-                    visible_ms: Some(visible_ms),
-                    clipboard_restore_ms: None,
-                    verification_ms: Some(verification_ms),
-                    total_ms: operation_started.elapsed().as_millis() as u64,
-                    diagnostic: None,
-                },
-            };
+    // Terminal accessibility trees can report a successful AXSelectedText
+    // write without delivering anything to the live prompt. Route known
+    // terminals through the proven clipboard-paste path instead. Other native
+    // controls may use the faster direct path, but only a verified change is
+    // allowed to claim `Typed`.
+    let native_ax_error = if target_prefers_clipboard_paste(target_context.as_ref()) {
+        "skipped for terminal target".to_string()
+    } else {
+        match macos_ax::insert_selected_text(&request.text) {
+            Ok(()) => {
+                let visible_ms = operation_started.elapsed().as_millis() as u64;
+                let verification_started = std::time::Instant::now();
+                let after_value = focused_ax_value().ok();
+                let verified = native_ax_delivery_verified(
+                    before_value.as_deref(),
+                    after_value.as_deref(),
+                    &request.text,
+                );
+                let verification_ms = verification_started.elapsed().as_millis() as u64;
+                if !verified {
+                    return copy_after_unverified_native_insert(
+                        request,
+                        target_context,
+                        operation_started,
+                        visible_ms,
+                        verification_ms,
+                    );
+                }
+
+                let clipboard_error = if request.restore_clipboard {
+                    None
+                } else {
+                    write_clipboard(&request.text).err()
+                };
+                if let Some(error) = clipboard_error.as_deref() {
+                    tracing::warn!(error, "dictation typed but clipboard copy failed");
+                    minutes_core::logging::log_error("dictation_clipboard", "", error);
+                }
+
+                return TextInsertionResult {
+                    outcome: InsertOutcome::Typed,
+                    method: InsertMethod::NativeAx,
+                    verified: true,
+                    clipboard_restored: false,
+                    target_context,
+                    message: if clipboard_error.is_some() {
+                        "Typed dictation into the active app, but could not copy it to the clipboard."
+                            .into()
+                    } else {
+                        "Typed dictation into the active app and copied it to the clipboard.".into()
+                    },
+                    timing: TextInsertionTiming {
+                        visible_ms: Some(visible_ms),
+                        clipboard_restore_ms: None,
+                        verification_ms: Some(verification_ms),
+                        total_ms: operation_started.elapsed().as_millis() as u64,
+                        diagnostic: clipboard_error.map(|error| format!("clipboard_copy: {error}")),
+                    },
+                };
+            }
+            Err(error) => error,
         }
-        Err(error) => error,
     };
 
     let paste_started_ms = operation_started.elapsed().as_millis() as u64;
@@ -1635,6 +1747,82 @@ mod tests {
             operations.into_inner(),
             vec!["write:dictated text", "paste"]
         );
+    }
+
+    #[test]
+    fn clipboard_paste_without_restore_leaves_dictation_on_clipboard() {
+        let operations = std::cell::RefCell::new(Vec::new());
+        let restored = clipboard_paste_restore_with(
+            "dictated text",
+            false,
+            Some("previous clipboard"),
+            |text| {
+                operations.borrow_mut().push(format!("write:{text}"));
+                Ok(())
+            },
+            || {
+                operations.borrow_mut().push("paste".into());
+                Ok(())
+            },
+            || operations.borrow_mut().push("wait".into()),
+        )
+        .expect("clipboard flow should succeed");
+
+        assert!(!restored);
+        assert_eq!(
+            operations.into_inner(),
+            vec!["write:dictated text", "paste"]
+        );
+    }
+
+    #[test]
+    fn terminal_targets_use_clipboard_paste_instead_of_native_ax() {
+        for (app_name, bundle_id) in [
+            ("Ghostty", "com.mitchellh.ghostty"),
+            ("Terminal", "com.apple.Terminal"),
+            ("iTerm2", "com.googlecode.iterm2"),
+            ("Warp", "dev.warp.Warp-Stable"),
+        ] {
+            let target = ActiveTargetContext {
+                platform: "macos".into(),
+                app_name: Some(app_name.into()),
+                bundle_id: Some(bundle_id.into()),
+                process_id: Some(42),
+            };
+            assert!(target_prefers_clipboard_paste(Some(&target)), "{app_name}");
+        }
+
+        let notes = ActiveTargetContext {
+            platform: "macos".into(),
+            app_name: Some("Notes".into()),
+            bundle_id: Some("com.apple.Notes".into()),
+            process_id: Some(42),
+        };
+        assert!(!target_prefers_clipboard_paste(Some(&notes)));
+    }
+
+    #[test]
+    fn native_ax_delivery_requires_observed_text_change() {
+        assert!(native_ax_delivery_verified(
+            Some("before"),
+            Some("before dictated text"),
+            "dictated text"
+        ));
+        assert!(!native_ax_delivery_verified(
+            Some("before"),
+            Some("before"),
+            "dictated text"
+        ));
+        assert!(!native_ax_delivery_verified(
+            None,
+            Some("dictated text"),
+            "dictated text"
+        ));
+        assert!(!native_ax_delivery_verified(
+            Some("before"),
+            None,
+            "dictated text"
+        ));
     }
 
     #[cfg(target_os = "macos")]
