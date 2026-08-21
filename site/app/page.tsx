@@ -28,7 +28,7 @@ const featureGrid = [
     label: "For meetings",
     title: "Capture what matters",
     description:
-      "One-click recording, streaming transcription, speaker separation, decisions, and action items without shipping your audio to a SaaS vendor.",
+      "One-click recording keeps voice and system audio failure-isolated, reports source dropouts and mostly-zero stems, and preserves the WAV for recovery.",
   },
   {
     label: "For voice memos",
@@ -116,7 +116,7 @@ const capabilityColumns = [
   },
 ] as const;
 
-// Competitor cells reflect public docs as of June 2026. Refresh quarterly.
+// Competitor cells reflect public docs spot-checked in August 2026. Refresh quarterly.
 const comparisons = [
   ["Local transcription", "No (cloud)", "No (cloud)", "Yes", "Yes"],
   ["Open source", "No", "No", "MIT", "MIT"],
@@ -383,9 +383,9 @@ export default function Home() {
         <p className="mx-auto mt-12 max-w-[620px] rounded-[5px] border border-[color:var(--border)] bg-[var(--bg-elevated)] px-4 py-3 font-mono text-[12px] leading-5 text-[var(--text-secondary)]">
           <span className="text-[var(--accent)]">v{MINUTES_RELEASE_VERSION}</span>{" "}
           adds{" "}
-          <span className="text-[var(--text)]">minutes resummarize</span> to
-          re-run the AI pass on an edited transcript, refreshes derived views
-          after an applied pass, and fixes a dictation double-paste.{" "}
+          reliable dual-source capture across mismatched mixer buffers and late
+          shutdown samples, prevents the desktop from stopping a separate CLI
+          recording, and surfaces source-dropout and mostly-zero-stem warnings.{" "}
           <a
             href={`https://github.com/silverstein/minutes/releases/tag/v${MINUTES_RELEASE_VERSION}`}
             className="text-[var(--text)] underline decoration-[color:var(--border-mid)] underline-offset-2 hover:text-[var(--accent)]"
