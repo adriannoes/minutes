@@ -1,9 +1,10 @@
 // Social-proof constants. Hand-refreshed at release time (see docs/release/procedure.md
-// step 12) from the GitHub and npm APIs. Coarse on purpose: better slightly
+// step 15) from the GitHub and npm APIs. Coarse on purpose: better slightly
 // stale and reliable than a flaky build-time fetch.
-// Last refreshed: 2026-07-23.
+// Contributors excludes anonymous entries and dependency automation.
+// Last refreshed: 2026-08-21.
 
-export const GITHUB_STARS = "1,374";
-export const GITHUB_FORKS = "144";
-export const GITHUB_CONTRIBUTORS = "24";
+export const GITHUB_STARS = "1,441";
+export const GITHUB_FORKS = "156";
+export const GITHUB_CONTRIBUTORS = "29";
 export const NPM_MONTHLY_DOWNLOADS = "4,400";
