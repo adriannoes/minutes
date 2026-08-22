@@ -555,6 +555,33 @@ pub fn write_assistant_context(workspace: &Path, config: &Config) -> Result<(), 
     Ok(())
 }
 
+/// Write the minimum instruction contract needed to start an interactive
+/// assistant before the user submits a meeting question.
+///
+/// Unlike [`write_assistant_context`], this deliberately does not search the
+/// meeting directory or summarize recent meetings. `Discuss with Agent` uses
+/// it while an interactive subscription-backed CLI is starting. The selected
+/// meeting is materialized into `CURRENT_MEETING.md` only after the user sends
+/// a non-slash question and the provider's authentication has been verified.
+pub fn write_deferred_assistant_context(workspace: &Path) -> Result<(), String> {
+    let content = format!(
+        "# Minutes Assistant\n\n\
+You are running inside Minutes Recall. No meeting context has been loaded yet.\n\n\
+## Deferred meeting context\n\n\
+Before answering every user question, check whether `{ACTIVE_MEETING_FILE}` exists in this directory. \
+If it exists, read it first and treat it as the current meeting focus. If it does not exist, explain \
+that Minutes has not shared a meeting with this session yet.\n\n\
+Slash commands such as `/login` are account controls, not meeting questions. Never claim a meeting \
+was loaded merely because an account command succeeded.\n\n\
+Do not attribute a statement to a named person unless the meeting context verifies that identity.\n"
+    );
+
+    for file_name in ASSISTANT_INSTRUCTION_FILES {
+        write_atomic(&workspace.join(file_name), &content)?;
+    }
+    Ok(())
+}
+
 pub fn write_active_meeting_context(
     workspace: &Path,
     meeting_path: &Path,
@@ -651,6 +678,21 @@ mod tests {
         assert!(content.contains("Do not assume the user always wants short bullet points"));
         assert!(content.contains("conversational, narrative, or report-style answer"));
         assert!(content.contains("Never attribute a statement to a named person"));
+    }
+
+    #[test]
+    fn deferred_assistant_context_does_not_collect_meeting_history() {
+        let workspace = tempfile::tempdir().unwrap();
+        write_deferred_assistant_context(workspace.path()).unwrap();
+
+        for file_name in ASSISTANT_INSTRUCTION_FILES {
+            let content = std::fs::read_to_string(workspace.path().join(file_name)).unwrap();
+            assert!(content.contains(ACTIVE_MEETING_FILE));
+            assert!(content.contains("No meeting context has been loaded yet"));
+            assert!(content.contains("/login"));
+            assert!(!content.contains("## Recent Meetings"));
+            assert!(!content.contains("## Open Action Items"));
+        }
     }
 
     #[test]

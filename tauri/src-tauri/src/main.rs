@@ -3009,6 +3009,8 @@ fn main() {
             commands::cmd_recall_chat_send,
             commands::cmd_recall_chat_cancel,
             commands::cmd_recall_chat_clear,
+            commands::cmd_recall_chat_readiness,
+            commands::cmd_prepare_recall_terminal_meeting,
             commands::cmd_spawn_terminal,
             commands::cmd_pty_input,
             commands::cmd_pty_resize,
