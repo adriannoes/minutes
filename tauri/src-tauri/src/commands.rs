@@ -9747,7 +9747,7 @@ fn recall_native_readiness_decision(
         _ if claude_cli_available && anthropic_api_key_set => (
             true,
             "claude-api-key",
-            "Using Claude in isolated Native chat with the app's explicit API key.",
+            "Claude is configured for isolated Native chat with the app's explicit API key. The key will be verified when you send a question.",
         ),
         _ => (
             false,
@@ -9775,7 +9775,7 @@ fn claude_auth_status_is_logged_in(stdout: &[u8]) -> bool {
         == Some(true)
 }
 
-fn claude_terminal_is_authenticated(agent_bin: &str) -> bool {
+fn claude_terminal_is_authenticated(agent_bin: &str, cwd: Option<&Path>) -> bool {
     #[cfg(target_os = "windows")]
     let mut command = {
         let ext = Path::new(agent_bin)
@@ -9794,6 +9794,13 @@ fn claude_terminal_is_authenticated(agent_bin: &str) -> bool {
 
     #[cfg(not(target_os = "windows"))]
     let mut command = Command::new(agent_bin);
+
+    for (name, value) in crate::pty::assistant_process_environment() {
+        command.env(name, value);
+    }
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
 
     let mut child = match command
         .args(["auth", "status", "--json"])
@@ -9872,7 +9879,7 @@ fn recall_chat_readiness() -> RecallChatReadiness {
     let terminal_available = terminal_agent.is_some();
     let terminal_authenticated = terminal_agent.as_ref().is_some_and(|path| {
         let command = path.to_string_lossy();
-        !command_is_claude(&command) || claude_terminal_is_authenticated(&command)
+        !command_is_claude(&command) || claude_terminal_is_authenticated(&command, None)
     });
 
     RecallChatReadiness {
@@ -10678,9 +10685,9 @@ fn recall_chat_stream_completed(
 }
 
 const RECALL_NATIVE_AUTH_GUIDANCE: &str =
-    "Native chat keeps meeting context isolated, so it cannot use Claude's subscription login. \
-     Switch to Terminal mode with the keyboard button and run /login there, or configure a local \
-     Ollama or LM Studio provider for native chat.";
+    "Claude rejected Native chat API-key authentication. Check or remove ANTHROPIC_API_KEY. \
+     To use a Claude subscription, switch to Terminal mode with the keyboard button and run \
+     /login there. No answer was saved.";
 
 const RECALL_NATIVE_SLASH_GUIDANCE: &str =
     "Slash commands are interactive agent commands and do not run in native chat. Switch to \
@@ -10700,11 +10707,19 @@ fn recall_claude_frame_is_auth_failure(frame: &serde_json::Value) -> bool {
         return true;
     }
 
-    frame.get("is_error").and_then(|value| value.as_bool()) == Some(true)
-        && frame
-            .get("result")
-            .and_then(|value| value.as_str())
-            .is_some_and(|result| result.contains("Not logged in") && result.contains("/login"))
+    if frame.get("is_error").and_then(|value| value.as_bool()) != Some(true) {
+        return false;
+    }
+    let Some(result) = frame.get("result").and_then(|value| value.as_str()) else {
+        return false;
+    };
+    let result = result.to_ascii_lowercase();
+    (result.contains("not logged in") && result.contains("/login"))
+        || result.contains("invalid api key")
+        || result.contains("invalid x-api-key")
+        || result.contains("authentication failed")
+        || result.contains("authentication error")
+        || result.contains("unauthorized")
 }
 
 /// Reap the child and report how it exited.
@@ -11587,7 +11602,7 @@ fn prepare_recall_terminal_meeting(
     pty_manager: &Arc<Mutex<crate::pty::PtyManager>>,
     meeting_path: String,
 ) -> Result<(), String> {
-    let agent_command = {
+    let (agent_command, agent_cwd) = {
         let manager = pty_manager
             .lock()
             .map_err(|_| "Recall terminal state is unavailable.".to_string())?;
@@ -11596,15 +11611,24 @@ fn prepare_recall_terminal_meeting(
                 "Recall has not started an assistant yet. No meeting context was read.".into(),
             );
         }
-        manager
+        let command = manager
             .session_command(crate::pty::ASSISTANT_SESSION_ID)
             .ok_or_else(|| {
                 "Recall could not verify the running assistant. No meeting context was read."
                     .to_string()
-            })?
+            })?;
+        let cwd = manager
+            .session_context_dir(crate::pty::ASSISTANT_SESSION_ID)
+            .ok_or_else(|| {
+                "Recall could not verify the running assistant environment. No meeting context was read."
+                    .to_string()
+            })?;
+        (command, cwd)
     };
 
-    if command_is_claude(&agent_command) && !claude_terminal_is_authenticated(&agent_command) {
+    if command_is_claude(&agent_command)
+        && !claude_terminal_is_authenticated(&agent_command, Some(&agent_cwd))
+    {
         return Err(
             "Sign in with /login in Terminal chat, then submit your question again. Minutes has not read or shared the selected meeting."
                 .into(),
@@ -13234,6 +13258,21 @@ mod tests {
 
         assert!(recall_claude_frame_is_auth_failure(&assistant));
         assert!(recall_claude_frame_is_auth_failure(&result));
+
+        for message in [
+            "Invalid API key",
+            "Invalid x-api-key header",
+            "Authentication failed",
+            "Authentication error",
+            "Unauthorized",
+        ] {
+            let api_key_error = serde_json::json!({
+                "type": "result",
+                "is_error": true,
+                "result": message,
+            });
+            assert!(recall_claude_frame_is_auth_failure(&api_key_error));
+        }
     }
 
     #[test]
@@ -13266,9 +13305,18 @@ mod tests {
     fn recall_readiness_keeps_isolated_native_providers_native() {
         assert!(recall_native_readiness_decision("ollama", true, false, false).0);
         assert!(recall_native_readiness_decision("openai-compatible", true, false, false).0);
-        assert!(recall_native_readiness_decision("agent", false, true, true).0);
+        let api_key = recall_native_readiness_decision("agent", false, true, true);
+        assert!(api_key.0);
+        assert!(api_key.2.contains("verified when you send a question"));
         assert!(!recall_native_readiness_decision("ollama", false, true, false).0);
         assert!(!recall_native_readiness_decision("ollama", false, true, true).0);
+    }
+
+    #[test]
+    fn native_recall_api_key_failure_is_actionable() {
+        assert!(RECALL_NATIVE_AUTH_GUIDANCE.contains("ANTHROPIC_API_KEY"));
+        assert!(RECALL_NATIVE_AUTH_GUIDANCE.contains("Claude subscription"));
+        assert!(RECALL_NATIVE_AUTH_GUIDANCE.contains("No answer was saved"));
     }
 
     #[test]
