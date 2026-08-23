@@ -243,12 +243,13 @@ retention, nothing is deleted automatically unless `auto_cleanup` is enabled.
 | key | default | meaning |
 |---|---|---|
 | `backend` | `"whisper"` | Final transcription backend. Retained `"apple-speech"` and `"parakeet"` values resolve to sealed Whisper while their secure private-audio release gates remain closed. |
-| `destination` | `"clipboard"` | `"clipboard"`, `"file"`, or `"command"` |
+| `destination` | `"insert"` | `"insert"` puts the final text in the active app and on the clipboard; `"clipboard"`, `"file"`, and `"command"` remain available for explicit delivery workflows |
 | `destination_file` | unset | Target file when `destination = "file"` |
 | `destination_command` | unset | Shell command when `destination = "command"` |
 | `accumulate` | `true` | Append successive utterances rather than replacing |
 | `daily_note_log` | `true` | Append every dictation to the daily note |
 | `auto_paste` | `false` | Paste the result immediately after dictation ends when the platform can do that honestly |
+| `auto_paste_restore` | `true` | Preserve the previous clipboard during explicit re-paste and reprocess actions. Routine insert-mode dictation always leaves the final transcript on the clipboard. |
 | `silence_timeout_ms` | `2000` | Silence threshold that ends a dictation session |
 | `max_utterance_secs` | `120` | Force-finalize an utterance at this length |
 | `model` | `"base"` | Whisper model for dictation |

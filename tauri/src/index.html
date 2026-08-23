@@ -11794,7 +11794,7 @@
           const insertionCapability = s.dictation.insert_capability || 'unavailable';
           if (insertionCapability === 'macos_native_or_paste') {
             insertOption.textContent = "Type at cursor — inserts into the app you're in";
-            destinationDetail.textContent = 'Minutes prefers native text insertion, with a verified paste fallback. If the target changes or macOS blocks insertion, your transcript stays on the clipboard.';
+            destinationDetail.textContent = 'Minutes inserts into the active app and keeps the final transcript on your clipboard. Terminal prompts use the reliable paste path; if direct typing cannot be verified, the transcript stays safely copied.';
           } else if (insertionCapability === 'linux_x11_paste') {
             insertOption.textContent = "Type at cursor — inserts into the app you're in";
             destinationDetail.textContent = 'On X11, Minutes uses the clipboard and xdotool after verifying the target. If insertion is unavailable, your transcript stays on the clipboard.';

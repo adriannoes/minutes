@@ -12585,6 +12585,18 @@ mod tests {
         assert_eq!(duration_between_ms(None, Some(later)), None);
     }
 
+    #[test]
+    fn routine_dictation_keeps_the_final_text_on_the_clipboard() {
+        let request = routine_dictation_insertion_request("dictated text".into(), None);
+
+        assert_eq!(
+            request.mode,
+            crate::text_insertion::TextInsertionMode::BestEffortVerified
+        );
+        assert!(!request.restore_clipboard);
+        assert!(request.clipboard_snapshot.is_none());
+    }
+
     /// Loopback enforcement must judge the destination, not the spelling.
     ///
     /// Both Recall chat guards previously accepted the literal string
@@ -20859,6 +20871,23 @@ pub fn start_dictation_session_public(
     start_dictation_session(app, capture_style).map(|_| ())
 }
 
+fn routine_dictation_insertion_request(
+    text: String,
+    expected_target: Option<crate::text_insertion::ActiveTargetContext>,
+) -> crate::text_insertion::TextInsertionRequest {
+    crate::text_insertion::TextInsertionRequest {
+        text,
+        mode: crate::text_insertion::TextInsertionMode::BestEffortVerified,
+        // Routine dictation has one predictable delivery contract: the final
+        // text stays in both the target app and the clipboard. Explicit
+        // re-paste and reprocess actions may still preserve the previous
+        // clipboard through auto_paste_restore.
+        restore_clipboard: false,
+        clipboard_snapshot: None,
+        expected_target,
+    }
+}
+
 fn start_dictation_session(
     app: &tauri::AppHandle,
     capture_style: Option<HotkeyCaptureStyle>,
@@ -21091,15 +21120,11 @@ fn start_dictation_session(
                         &app_for_results,
                         &dictation_target_context_for_results,
                     );
-                    let insertion = crate::text_insertion::insert_text(
-                        crate::text_insertion::TextInsertionRequest {
-                            text: result.text.clone(),
-                            mode: crate::text_insertion::TextInsertionMode::BestEffortVerified,
-                            restore_clipboard: config_for_results.dictation.auto_paste_restore,
-                            clipboard_snapshot: None,
-                            expected_target: dictation_target_context_for_results.clone(),
-                        },
-                    );
+                    let insertion =
+                        crate::text_insertion::insert_text(routine_dictation_insertion_request(
+                            result.text.clone(),
+                            dictation_target_context_for_results.clone(),
+                        ));
                     app_for_results.emit("dictation:insertion", &insertion).ok();
                     publish_dictation_overlay_state(&app_for_results, insertion.overlay_state());
                     log_dictation_insert(
