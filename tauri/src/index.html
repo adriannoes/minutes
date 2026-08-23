@@ -13625,6 +13625,7 @@
     let recallSelectedMeetingPath = null;
     let pendingRecallTerminalMeetingPath = null;
     let recallTerminalInputDraft = '';
+    let recallTerminalInputReliable = true;
     let recallTerminalInputQueue = Promise.resolve();
 
     function setRecallProviderNotice(message, tone = 'info') {
@@ -13673,6 +13674,7 @@
       recallDevMode = nextDevMode;
       pendingRecallTerminalMeetingPath = recallDevMode ? recallSelectedMeetingPath : null;
       recallTerminalInputDraft = '';
+      recallTerminalInputReliable = true;
       syncRecallModeControls();
       setRecallProviderNotice(
         recallDevMode && readiness
@@ -13711,6 +13713,8 @@
           'error'
         );
         pendingRecallTerminalMeetingPath = mode === 'meeting' ? meetingPath : null;
+        recallTerminalInputDraft = '';
+        recallTerminalInputReliable = true;
         return { mode: 'deferred', meetingPath: null };
       }
 
@@ -13722,6 +13726,7 @@
       if (recallDevMode) {
         pendingRecallTerminalMeetingPath = mode === 'meeting' ? meetingPath : null;
         recallTerminalInputDraft = '';
+        recallTerminalInputReliable = true;
         setRecallProviderNotice(
           terminalNoticeForReadiness(readiness),
           readiness.terminalAvailable ? 'info' : 'error'
@@ -14019,13 +14024,29 @@
     function updateRecallTerminalInputDraft(data) {
       // Strip bracketed-paste and cursor-control CSI sequences from the local
       // shadow copy; the PTY still receives the original bytes unchanged.
+      // Cursor movement or other terminal editing means we can no longer prove
+      // whether the submitted line is an account command or a real question.
+      // Bracketed-paste markers are safe because their payload stays linear.
+      const csiSequences = data.match(/\x1b\[[0-9;?]*[ -/]*[@-~]/g) || [];
+      if (csiSequences.some((sequence) => sequence !== '\x1b[200~' && sequence !== '\x1b[201~')) {
+        recallTerminalInputReliable = false;
+      }
       const plain = data.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '');
       for (const char of plain) {
         if (char === '\x7f' || char === '\b') {
           recallTerminalInputDraft = recallTerminalInputDraft.slice(0, -1);
-        } else if (char === '\x15') {
-          // Ctrl-U clears the current interactive input line.
+        } else if (char === '\x03' || char === '\x15') {
+          // Ctrl-C and Ctrl-U both restore a known-empty interactive line.
           recallTerminalInputDraft = '';
+          recallTerminalInputReliable = true;
+        } else if (char === '\x17') {
+          // Ctrl-W removes the word immediately before the cursor. This is
+          // exact while the shadow line is still known to be linear.
+          if (recallTerminalInputReliable) {
+            recallTerminalInputDraft = recallTerminalInputDraft.replace(/\s*\S+\s*$/, '');
+          }
+        } else if (char < ' ' && char !== '\n') {
+          recallTerminalInputReliable = false;
         } else if (char >= ' ' && char !== '\x7f') {
           recallTerminalInputDraft += char;
         }
@@ -14047,6 +14068,13 @@
         }
 
         const question = recallTerminalInputDraft.trim();
+        if (pendingRecallTerminalMeetingPath && question && !recallTerminalInputReliable) {
+          setRecallProviderNotice(
+            'For privacy, Minutes could not verify the edited input line. Press Ctrl-U, retype the command or question, and submit again; no meeting context was read.',
+            'error'
+          );
+          return;
+        }
         const isAccountCommand = question.startsWith('/');
         if (pendingRecallTerminalMeetingPath && question && !isAccountCommand) {
           try {
@@ -14067,6 +14095,7 @@
 
         await invoke('cmd_pty_input', { sessionId: SESSION_ID, data: char });
         recallTerminalInputDraft = '';
+        recallTerminalInputReliable = true;
         cursor = index + 1;
       }
 

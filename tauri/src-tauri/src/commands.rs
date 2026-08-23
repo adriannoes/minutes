@@ -13320,6 +13320,17 @@ mod tests {
     }
 
     #[test]
+    fn recall_terminal_input_editing_fails_closed_before_meeting_context() {
+        let html = include_str!("../../src/index.html");
+        assert!(html.contains("let recallTerminalInputReliable = true;"));
+        assert!(html.contains("recallTerminalInputReliable = false;"));
+        assert!(html.contains(
+            "pendingRecallTerminalMeetingPath && question && !recallTerminalInputReliable"
+        ));
+        assert!(html.contains("no meeting context was read"));
+    }
+
+    #[test]
     fn claude_auth_status_requires_explicit_logged_in_true() {
         assert!(command_is_claude("/usr/local/bin/claude"));
         assert!(command_is_claude("claude.cmd"));
