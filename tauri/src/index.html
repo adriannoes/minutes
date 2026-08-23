@@ -873,6 +873,26 @@
       height: 18px;
     }
 
+    .recall-provider-notice {
+      display: none;
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--border);
+      background: var(--bg-elevated);
+      color: var(--text-secondary);
+      font-family: 'Geist Mono', 'SF Mono', Menlo, monospace;
+      font-size: 11px;
+      line-height: 1.45;
+      flex-shrink: 0;
+    }
+
+    .recall-provider-notice.active {
+      display: block;
+    }
+
+    .recall-provider-notice.error {
+      color: var(--danger);
+    }
+
     .recall-exit-banner {
       display: none;
       padding: 10px 16px;
@@ -5684,6 +5704,7 @@
       <div class="processing-spinner" aria-hidden="true"></div>
       <span>Starting Recall...</span>
     </div>
+    <div class="recall-provider-notice" id="recall-provider-notice" role="status" aria-live="polite"></div>
     <div class="recall-weekly-view" id="recall-weekly-view">
       <pre id="recall-weekly-content">Loading weekly summary…</pre>
     </div>
@@ -12648,22 +12669,10 @@
     });
     document.getElementById('settings-agent-args').addEventListener('change', () => saveAgentArgs());
 
-    document.getElementById('settings-recall-dev-mode').addEventListener('click', () => {
+    document.getElementById('settings-recall-dev-mode').addEventListener('click', async () => {
       const btn = document.getElementById('settings-recall-dev-mode');
       const next = btn.textContent.trim() !== 'On';
-      recallDevMode = next;
-      localStorage.setItem('minutes.recallDevMode', String(next));
-      setSettingsToggle('settings-recall-dev-mode', next);
-      // Sync the in-panel mode toggle button state.
-      const modeToggleBtn = document.getElementById('btn-recall-mode-toggle');
-      if (modeToggleBtn) {
-        modeToggleBtn.classList.toggle('active', next);
-        modeToggleBtn.title = next
-          ? 'Switch to chat (native mode)'
-          : 'Switch to terminal (developer mode)';
-      }
-      // Apply the new mode immediately if the panel is currently open.
-      if (recallExpanded) applyRecallMode();
+      await requestRecallMode(next);
     });
 
     // ── In-panel mode toggle (developer mode shortcut in recall header) ──
@@ -12676,18 +12685,8 @@
       if (_initDevMode) {
         recallModeToggleBtn.title = 'Switch to chat (native mode)';
       }
-      recallModeToggleBtn.addEventListener('click', () => {
-        recallDevMode = !recallDevMode;
-        localStorage.setItem('minutes.recallDevMode', String(recallDevMode));
-        // Sync the Settings toggle.
-        setSettingsToggle('settings-recall-dev-mode', recallDevMode);
-        // Update button appearance.
-        recallModeToggleBtn.classList.toggle('active', recallDevMode);
-        recallModeToggleBtn.title = recallDevMode
-          ? 'Switch to chat (native mode)'
-          : 'Switch to terminal (developer mode)';
-        // Apply the new mode immediately if the panel is currently open.
-        if (recallExpanded) applyRecallMode();
+      recallModeToggleBtn.addEventListener('click', async () => {
+        await requestRecallMode(!recallDevMode);
       });
     }
 
@@ -13614,6 +13613,7 @@
     const recallChatMessages = document.getElementById('recall-chat-messages');
     const recallChatInput = document.getElementById('recall-chat-input');
     const recallChatSendBtn = document.getElementById('recall-chat-send');
+    const recallProviderNotice = document.getElementById('recall-provider-notice');
     let currentAssistantBubble = null;
     let currentAssistantRaw = '';
     // True once token-level deltas have rendered for the current turn, so the
@@ -13621,6 +13621,123 @@
     let currentAssistantStreamed = false;
     let chatListenersRegistered = false;
     let recallChatStreaming = false;
+    let recallReadiness = null;
+    let recallSelectedMeetingPath = null;
+    let pendingRecallTerminalMeetingPath = null;
+    let recallTerminalInputDraft = '';
+    let recallTerminalInputReliable = true;
+    let recallTerminalInputQueue = Promise.resolve();
+
+    function setRecallProviderNotice(message, tone = 'info') {
+      if (!recallProviderNotice) return;
+      recallProviderNotice.textContent = message || '';
+      recallProviderNotice.classList.toggle('active', Boolean(message));
+      recallProviderNotice.classList.toggle('error', tone === 'error');
+    }
+
+    function syncRecallModeControls() {
+      localStorage.setItem('minutes.recallDevMode', String(recallDevMode));
+      setSettingsToggle('settings-recall-dev-mode', recallDevMode);
+      const modeToggleBtn = document.getElementById('btn-recall-mode-toggle');
+      if (modeToggleBtn) {
+        modeToggleBtn.classList.toggle('active', recallDevMode);
+        modeToggleBtn.title = recallDevMode
+          ? 'Switch to chat (native mode)'
+          : 'Switch to terminal (subscription mode)';
+      }
+    }
+
+    async function refreshRecallReadiness() {
+      recallReadiness = await invoke('cmd_recall_chat_readiness');
+      return recallReadiness;
+    }
+
+    async function requestRecallMode(nextDevMode) {
+      let readiness;
+      try {
+        readiness = await refreshRecallReadiness();
+      } catch (error) {
+        console.error('Recall provider readiness:', error);
+      }
+
+      if (!nextDevMode && !readiness?.nativeAvailable) {
+        recallDevMode = true;
+        syncRecallModeControls();
+        setRecallProviderNotice(
+          readiness?.message || 'Native chat is unavailable until an isolated provider is configured.',
+          'error'
+        );
+        if (recallExpanded) await applyRecallMode();
+        return;
+      }
+
+      recallDevMode = nextDevMode;
+      pendingRecallTerminalMeetingPath = recallDevMode ? recallSelectedMeetingPath : null;
+      recallTerminalInputDraft = '';
+      recallTerminalInputReliable = true;
+      syncRecallModeControls();
+      setRecallProviderNotice(
+        recallDevMode && readiness
+          ? terminalNoticeForReadiness(readiness)
+          : readiness?.message || '',
+        recallDevMode && readiness && !readiness.terminalAvailable ? 'error' : 'info'
+      );
+      if (recallExpanded) await applyRecallMode();
+    }
+
+    function terminalNoticeForReadiness(readiness) {
+      if (!readiness.terminalAvailable) {
+        return `${readiness.message} Install or select an assistant in Settings before sharing a meeting.`;
+      }
+      const meeting = pendingRecallTerminalMeetingPath ? 'the selected meeting' : 'meeting context';
+      const auth = readiness.terminalAuthenticated
+        ? `Ask your question here; Minutes will load ${meeting} only when you submit it.`
+        : `Sign in with /login first. Minutes will not read ${meeting} for account commands.`;
+      return `${readiness.message} ${auth}`;
+    }
+
+    async function chooseRecallExperience(mode, meetingPath) {
+      if (mode !== 'assistant' && mode !== 'meeting') {
+        return { mode, meetingPath };
+      }
+      recallSelectedMeetingPath = mode === 'meeting' ? meetingPath : null;
+      let readiness;
+      try {
+        readiness = await refreshRecallReadiness();
+      } catch (error) {
+        console.error('Recall provider readiness:', error);
+        recallDevMode = true;
+        syncRecallModeControls();
+        setRecallProviderNotice(
+          'Minutes could not verify an isolated Native provider, so it opened Terminal chat without reading the meeting.',
+          'error'
+        );
+        pendingRecallTerminalMeetingPath = mode === 'meeting' ? meetingPath : null;
+        recallTerminalInputDraft = '';
+        recallTerminalInputReliable = true;
+        return { mode: 'deferred', meetingPath: null };
+      }
+
+      if (!readiness.nativeAvailable) {
+        recallDevMode = true;
+      }
+      syncRecallModeControls();
+
+      if (recallDevMode) {
+        pendingRecallTerminalMeetingPath = mode === 'meeting' ? meetingPath : null;
+        recallTerminalInputDraft = '';
+        recallTerminalInputReliable = true;
+        setRecallProviderNotice(
+          terminalNoticeForReadiness(readiness),
+          readiness.terminalAvailable ? 'info' : 'error'
+        );
+        return { mode: 'deferred', meetingPath: null };
+      }
+
+      pendingRecallTerminalMeetingPath = null;
+      setRecallProviderNotice(readiness.message);
+      return { mode, meetingPath };
+    }
 
     // Render a safe markdown subset for assistant replies (#404 follow-up).
     // XSS-safe by construction: fenced code is pulled out and escaped, the rest
@@ -13892,8 +14009,101 @@
 
       recallTerminal.onData((data) => {
         if (!recallPtyAlive) return;
-        invoke('cmd_pty_input', { sessionId: SESSION_ID, data }).catch(console.error);
+        // Serialize PTY writes so the context-preparation command completes
+        // before the Enter that submits the first real question. Normal typing
+        // still follows the same one-invoke-per-input path as before.
+        recallTerminalInputQueue = recallTerminalInputQueue
+          .then(() => forwardRecallTerminalInput(data))
+          .catch((error) => {
+            console.error('Recall terminal input:', error);
+            setRecallProviderNotice(String(error), 'error');
+          });
       });
+    }
+
+    function updateRecallTerminalInputDraft(data) {
+      // Strip bracketed-paste and cursor-control CSI sequences from the local
+      // shadow copy; the PTY still receives the original bytes unchanged.
+      // Cursor movement or other terminal editing means we can no longer prove
+      // whether the submitted line is an account command or a real question.
+      // Bracketed-paste markers are safe because their payload stays linear.
+      const csiSequences = data.match(/\x1b\[[0-9;?]*[ -/]*[@-~]/g) || [];
+      if (csiSequences.some((sequence) => sequence !== '\x1b[200~' && sequence !== '\x1b[201~')) {
+        recallTerminalInputReliable = false;
+      }
+      const plain = data.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '');
+      for (const char of plain) {
+        if (char === '\x7f' || char === '\b') {
+          recallTerminalInputDraft = recallTerminalInputDraft.slice(0, -1);
+        } else if (char === '\x03' || char === '\x15') {
+          // Ctrl-C and Ctrl-U both restore a known-empty interactive line.
+          recallTerminalInputDraft = '';
+          recallTerminalInputReliable = true;
+        } else if (char === '\x17') {
+          // Ctrl-W removes the word immediately before the cursor. This is
+          // exact while the shadow line is still known to be linear.
+          if (recallTerminalInputReliable) {
+            recallTerminalInputDraft = recallTerminalInputDraft.replace(/\s*\S+\s*$/, '');
+          }
+        } else if (char < ' ' && char !== '\n') {
+          recallTerminalInputReliable = false;
+        } else if (char >= ' ' && char !== '\x7f') {
+          recallTerminalInputDraft += char;
+        }
+      }
+    }
+
+    async function forwardRecallTerminalInput(data) {
+      let cursor = 0;
+      for (let index = 0; index < data.length; index += 1) {
+        const char = data[index];
+        // xterm sends Return as CR. LF can be part of bracketed paste or a
+        // multiline edit and must not be mistaken for question submission.
+        if (char !== '\r') continue;
+
+        const beforeEnter = data.slice(cursor, index);
+        if (beforeEnter) {
+          updateRecallTerminalInputDraft(beforeEnter);
+          await invoke('cmd_pty_input', { sessionId: SESSION_ID, data: beforeEnter });
+        }
+
+        const question = recallTerminalInputDraft.trim();
+        if (pendingRecallTerminalMeetingPath && question && !recallTerminalInputReliable) {
+          setRecallProviderNotice(
+            'For privacy, Minutes could not verify the edited input line. Press Ctrl-U, retype the command or question, and submit again; no meeting context was read.',
+            'error'
+          );
+          return;
+        }
+        const isAccountCommand = question.startsWith('/');
+        if (pendingRecallTerminalMeetingPath && question && !isAccountCommand) {
+          try {
+            await invoke('cmd_prepare_recall_terminal_meeting', {
+              meetingPath: pendingRecallTerminalMeetingPath,
+            });
+            pendingRecallTerminalMeetingPath = null;
+            setRecallProviderNotice(
+              'The selected meeting is ready for this question. Terminal chat remains under your agent subscription.'
+            );
+          } catch (error) {
+            // Do not forward Enter: the question remains in the terminal input,
+            // and no meeting bytes were read when authentication was absent.
+            setRecallProviderNotice(String(error), 'error');
+            return;
+          }
+        }
+
+        await invoke('cmd_pty_input', { sessionId: SESSION_ID, data: char });
+        recallTerminalInputDraft = '';
+        recallTerminalInputReliable = true;
+        cursor = index + 1;
+      }
+
+      const remainder = data.slice(cursor);
+      if (remainder) {
+        updateRecallTerminalInputDraft(remainder);
+        await invoke('cmd_pty_input', { sessionId: SESSION_ID, data: remainder });
+      }
     }
 
     // ── PTY event listeners (registered once) ──
@@ -13986,19 +14196,20 @@
         recallTerminalContainer.classList.remove('hidden');
         initRecallTerminal();
         await registerPtyListeners();
-        if (!recallPtyAlive) {
-          try {
-            await invoke('cmd_spawn_terminal', { mode: 'assistant' });
+        try {
+          // Always re-apply deferred mode, even to an existing PTY. This
+          // clears any stale CURRENT_MEETING.md before a new question while
+          // the backend keeps the already-running terminal session intact.
+          await invoke('cmd_spawn_terminal', { mode: 'deferred' });
+          recallPtyAlive = true;
+          recallEndBtn.classList.add('active');
+        } catch (e) {
+          const msg = typeof e === 'string' ? e : String(e);
+          if (msg.includes('already running') || msg.includes('Already')) {
             recallPtyAlive = true;
             recallEndBtn.classList.add('active');
-          } catch (e) {
-            const msg = typeof e === 'string' ? e : String(e);
-            if (msg.includes('already running') || msg.includes('Already')) {
-              recallPtyAlive = true;
-              recallEndBtn.classList.add('active');
-            } else {
-              console.error('Recall terminal spawn:', e);
-            }
+          } else {
+            console.error('Recall terminal spawn:', e);
           }
         }
         recallLoading.classList.remove('active');
@@ -14368,6 +14579,9 @@
 
     // ── Open Recall (spawn PTY if needed, then expand) ──
     async function openRecall(mode, meetingPath) {
+      const experience = await chooseRecallExperience(mode, meetingPath);
+      mode = experience.mode;
+      meetingPath = experience.meetingPath;
       recallLoading.classList.add('active');
       recallTerminalContainer.classList.add('hidden');
       recallExitBanner.classList.remove('active');

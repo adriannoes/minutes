@@ -9356,7 +9356,7 @@ fn meeting_title_from_path(path: &str) -> String {
 
 fn terminal_title_for_mode(mode: &str, meeting_path: Option<&str>) -> Result<String, String> {
     match mode {
-        "assistant" => Ok("Minutes Assistant".into()),
+        "assistant" | "deferred" => Ok("Minutes Assistant".into()),
         "meeting" => Ok(format!(
             "Discussing: {}",
             meeting_title_from_path(meeting_path.ok_or("meeting_path required for meeting mode")?)
@@ -9379,6 +9379,14 @@ fn sync_workspace_for_mode(
 
     match mode {
         "assistant" => crate::context::clear_active_meeting_context(workspace),
+        // Start an interactive provider without reading meeting history. The
+        // selected meeting is written only when the user submits a real
+        // question and `cmd_prepare_recall_terminal_meeting` has re-verified
+        // that the provider is authenticated.
+        "deferred" => {
+            crate::context::write_deferred_assistant_context(workspace)?;
+            crate::context::clear_active_meeting_context(workspace)
+        }
         "meeting" => {
             let path = meeting_path.ok_or("meeting_path required for meeting mode")?;
             let meeting = PathBuf::from(path);
@@ -9668,6 +9676,238 @@ pub fn spawn_terminal(
     }
 
     Ok((crate::pty::ASSISTANT_SESSION_ID.into(), title))
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecallChatReadiness {
+    native_available: bool,
+    terminal_available: bool,
+    terminal_authenticated: bool,
+    recommended_mode: &'static str,
+    provider: &'static str,
+    message: &'static str,
+}
+
+fn recall_local_endpoint_reachable(raw: &str) -> bool {
+    use std::net::{TcpStream, ToSocketAddrs};
+
+    let Ok(url) = reqwest::Url::parse(raw.trim()) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let port = url.port_or_known_default().unwrap_or(80);
+    let Ok(addresses) = (host, port).to_socket_addrs() else {
+        return false;
+    };
+    addresses
+        .filter(|address| address.ip().is_loopback())
+        .any(|address| TcpStream::connect_timeout(&address, Duration::from_millis(300)).is_ok())
+}
+
+fn recall_native_readiness_decision(
+    engine: &str,
+    local_endpoint_reachable: bool,
+    claude_cli_available: bool,
+    anthropic_api_key_set: bool,
+) -> (bool, &'static str, &'static str) {
+    match engine {
+        "ollama" => {
+            if local_endpoint_reachable {
+                (
+                    true,
+                    "ollama",
+                    "Using the configured local Ollama provider in isolated Native chat.",
+                )
+            } else {
+                (
+                    false,
+                    "local-unavailable",
+                    "The configured local Ollama provider is not reachable, so Recall opened Terminal chat without reading the meeting.",
+                )
+            }
+        }
+        "openai-compatible" | "openai_compatible" => {
+            if local_endpoint_reachable {
+                (
+                    true,
+                    "openai-compatible",
+                    "Using the configured local model in isolated Native chat.",
+                )
+            } else {
+                (
+                    false,
+                    "local-unavailable",
+                    "The configured local model is not reachable, so Recall opened Terminal chat without reading the meeting.",
+                )
+            }
+        }
+        _ if claude_cli_available && anthropic_api_key_set => (
+            true,
+            "claude-api-key",
+            "Claude is configured for isolated Native chat with the app's explicit API key. The key will be verified when you send a question.",
+        ),
+        _ => (
+            false,
+            "claude-subscription",
+            "Claude subscriptions open in Terminal chat so Native chat never inherits hooks, plugins, or account settings.",
+        ),
+    }
+}
+
+fn command_is_claude(command: &str) -> bool {
+    Path::new(command)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("claude"))
+}
+
+fn claude_auth_status_is_logged_in(stdout: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(stdout)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("loggedIn")
+                .and_then(|logged_in| logged_in.as_bool())
+        })
+        == Some(true)
+}
+
+fn claude_terminal_is_authenticated(agent_bin: &str, cwd: Option<&Path>) -> bool {
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let ext = Path::new(agent_bin)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if ext == "cmd" || ext == "bat" {
+            let mut command = Command::new("cmd");
+            command.arg("/C").arg(agent_bin);
+            command
+        } else {
+            Command::new(agent_bin)
+        }
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    let mut command = Command::new(agent_bin);
+
+    for (name, value) in crate::pty::assistant_process_environment() {
+        command.env(name, value);
+    }
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+
+    let mut child = match command
+        .args(["auth", "status", "--json"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return false,
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return child.wait_with_output().ok().is_some_and(|output| {
+                    output.status.success() && claude_auth_status_is_logged_in(&output.stdout)
+                });
+            }
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
+/// Decide which Recall surface can actually answer before any meeting is read.
+///
+/// Subscription-backed Claude is intentionally routed to the interactive PTY:
+/// `claude --bare` cannot read OAuth/keychain state, while modes that can read
+/// it also admit managed settings. A local provider or explicit API key stays
+/// in Native chat under its existing no-tools/no-settings contract.
+fn recall_chat_readiness() -> RecallChatReadiness {
+    let Ok(config) = Config::load_strict() else {
+        return RecallChatReadiness {
+            native_available: false,
+            terminal_available: false,
+            terminal_authenticated: false,
+            recommended_mode: "terminal",
+            provider: "unavailable",
+            message:
+                "Minutes could not verify its provider configuration. No meeting context was read.",
+        };
+    };
+    let engine = config.summarization.engine.as_str();
+    let local_endpoint_reachable = match engine {
+        "ollama" => {
+            recall_ollama_chat_url(&config.summarization.ollama_url).is_ok()
+                && recall_local_endpoint_reachable(&config.summarization.ollama_url)
+        }
+        "openai-compatible" | "openai_compatible" => {
+            recall_openai_compatible_chat_url(&config.summarization.openai_compatible_base_url)
+                .is_ok()
+                && recall_local_endpoint_reachable(&config.summarization.openai_compatible_base_url)
+        }
+        _ => false,
+    };
+    let claude_cli = minutes_core::summarize::detect_recall_chat_cli();
+    let anthropic_api_key_set =
+        std::env::var("ANTHROPIC_API_KEY").is_ok_and(|value| !value.trim().is_empty());
+    let (native_available, provider, message) = recall_native_readiness_decision(
+        engine,
+        local_endpoint_reachable,
+        claude_cli.is_some(),
+        anthropic_api_key_set,
+    );
+
+    let assistant_agent = config.assistant.agent.trim();
+    let terminal_agent = resolve_agent_binary(assistant_agent).ok();
+    let terminal_available = terminal_agent.is_some();
+    let terminal_authenticated = terminal_agent.as_ref().is_some_and(|path| {
+        let command = path.to_string_lossy();
+        !command_is_claude(&command) || claude_terminal_is_authenticated(&command, None)
+    });
+
+    RecallChatReadiness {
+        native_available,
+        terminal_available,
+        terminal_authenticated,
+        recommended_mode: if native_available {
+            "native"
+        } else {
+            "terminal"
+        },
+        provider,
+        message,
+    }
+}
+
+#[tauri::command]
+pub async fn cmd_recall_chat_readiness() -> RecallChatReadiness {
+    tauri::async_runtime::spawn_blocking(recall_chat_readiness)
+        .await
+        .unwrap_or(RecallChatReadiness {
+            native_available: false,
+            terminal_available: false,
+            terminal_authenticated: false,
+            recommended_mode: "terminal",
+            provider: "unavailable",
+            message: "Minutes could not verify an isolated provider. No meeting context was read.",
+        })
 }
 
 // ── Recall native chat ────────────────────────────────────────
@@ -10444,6 +10684,44 @@ fn recall_chat_stream_completed(
     !read_broke && matches!(exit_status, Some(status) if status.success())
 }
 
+const RECALL_NATIVE_AUTH_GUIDANCE: &str =
+    "Claude rejected Native chat API-key authentication. Check or remove ANTHROPIC_API_KEY. \
+     To use a Claude subscription, switch to Terminal mode with the keyboard button and run \
+     /login there. No answer was saved.";
+
+const RECALL_NATIVE_SLASH_GUIDANCE: &str =
+    "Slash commands are interactive agent commands and do not run in native chat. Switch to \
+     Terminal mode with the keyboard button, then run the command there.";
+
+fn recall_native_message_is_slash_command(message: &str) -> bool {
+    message.trim_start().starts_with('/')
+}
+
+/// Claude's `--bare` mode deliberately refuses OAuth and keychain access. Its
+/// stream currently reports that as an assistant frame followed by an
+/// `is_error` result, both telling the user to run `/login`. Forwarding those
+/// frames makes native chat look interactive and sends the user into a loop,
+/// even though slash commands are disabled for this isolated invocation.
+fn recall_claude_frame_is_auth_failure(frame: &serde_json::Value) -> bool {
+    if frame.get("error").and_then(|value| value.as_str()) == Some("authentication_failed") {
+        return true;
+    }
+
+    if frame.get("is_error").and_then(|value| value.as_bool()) != Some(true) {
+        return false;
+    }
+    let Some(result) = frame.get("result").and_then(|value| value.as_str()) else {
+        return false;
+    };
+    let result = result.to_ascii_lowercase();
+    (result.contains("not logged in") && result.contains("/login"))
+        || result.contains("invalid api key")
+        || result.contains("invalid x-api-key")
+        || result.contains("authentication failed")
+        || result.contains("authentication error")
+        || result.contains("unauthorized")
+}
+
 /// Reap the child and report how it exited.
 ///
 /// The status used to be discarded. For a subprocess it is better evidence of
@@ -10514,6 +10792,10 @@ pub async fn cmd_recall_chat_send(
     message: String,
 ) -> Result<(), String> {
     use std::io::{BufRead, BufReader, Read};
+
+    if recall_native_message_is_slash_command(&message) {
+        return Err(RECALL_NATIVE_SLASH_GUIDANCE.into());
+    }
 
     let workspace = crate::context::workspace_dir();
     if !workspace.exists() {
@@ -11168,6 +11450,7 @@ pub async fn cmd_recall_chat_send(
             let reader = BufReader::new(&mut limited);
             let mut full_response = String::new();
             let mut stream_failed = false;
+            let mut auth_failed = false;
             for line_result in reader.lines() {
                 if cancelled.load(Ordering::Relaxed) {
                     break;
@@ -11183,6 +11466,10 @@ pub async fn cmd_recall_chat_send(
                             break;
                         }
                         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
+                            if recall_claude_frame_is_auth_failure(&json) {
+                                auth_failed = true;
+                                continue;
+                            }
                             if json.get("type").and_then(|t| t.as_str()) == Some("assistant") {
                                 if let Some(arr) = json
                                     .get("message")
@@ -11240,12 +11527,15 @@ pub async fn cmd_recall_chat_send(
             // Reaped before the persistence decision, not after, because the
             // exit status is part of that decision.
             let exit_status = reap_recall_chat_child(&worker_turn, turn_id);
-            let stream_broke = !recall_chat_stream_completed(read_broke, exit_status);
+            let stream_broke =
+                auth_failed || !recall_chat_stream_completed(read_broke, exit_status);
 
             if !cancelled.load(Ordering::Relaxed) && stream_broke {
                 emit_recall_chat_stream_failure(
                     &app,
-                    if truncated {
+                    if auth_failed {
+                        RECALL_NATIVE_AUTH_GUIDANCE
+                    } else if truncated {
                         "The provider sent more than Recall will buffer, so the answer was cut \
                          off. Nothing was saved to this conversation."
                     } else if stream_failed {
@@ -11302,6 +11592,67 @@ pub fn cmd_recall_chat_cancel(
 pub fn cmd_recall_chat_clear(state: tauri::State<'_, AppState>) {
     let mut h = state.recall_chat_history.lock().unwrap();
     h.clear();
+}
+
+/// Materialize the selected meeting only at the terminal's first real user
+/// question. The PTY must already exist, and Claude subscription auth is
+/// checked before the meeting file is read. Slash commands bypass this command
+/// in the frontend, so `/login` never causes meeting context to be collected.
+fn prepare_recall_terminal_meeting(
+    pty_manager: &Arc<Mutex<crate::pty::PtyManager>>,
+    meeting_path: String,
+) -> Result<(), String> {
+    let (agent_command, agent_cwd) = {
+        let manager = pty_manager
+            .lock()
+            .map_err(|_| "Recall terminal state is unavailable.".to_string())?;
+        if manager.assistant_session_id().is_none() {
+            return Err(
+                "Recall has not started an assistant yet. No meeting context was read.".into(),
+            );
+        }
+        let command = manager
+            .session_command(crate::pty::ASSISTANT_SESSION_ID)
+            .ok_or_else(|| {
+                "Recall could not verify the running assistant. No meeting context was read."
+                    .to_string()
+            })?;
+        let cwd = manager
+            .session_context_dir(crate::pty::ASSISTANT_SESSION_ID)
+            .ok_or_else(|| {
+                "Recall could not verify the running assistant environment. No meeting context was read."
+                    .to_string()
+            })?;
+        (command, cwd)
+    };
+
+    if command_is_claude(&agent_command)
+        && !claude_terminal_is_authenticated(&agent_command, Some(&agent_cwd))
+    {
+        return Err(
+            "Sign in with /login in Terminal chat, then submit your question again. Minutes has not read or shared the selected meeting."
+                .into(),
+        );
+    }
+
+    let config = Config::load_strict()?;
+    let meeting = PathBuf::from(&meeting_path);
+    minutes_core::notes::validate_meeting_path(&meeting, &config.output_dir)?;
+    let workspace = crate::context::workspace_dir();
+    crate::context::write_active_meeting_context(&workspace, &meeting, &config)
+}
+
+#[tauri::command]
+pub async fn cmd_prepare_recall_terminal_meeting(
+    state: tauri::State<'_, AppState>,
+    meeting_path: String,
+) -> Result<(), String> {
+    let pty_manager = state.pty_manager.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        prepare_recall_terminal_meeting(&pty_manager, meeting_path)
+    })
+    .await
+    .map_err(|_| "Recall provider verification stopped unexpectedly.".to_string())?
 }
 
 #[tauri::command]
@@ -12893,6 +13244,118 @@ mod tests {
         assert!(!saw_terminator);
     }
 
+    #[test]
+    fn native_recall_recognizes_slash_commands_before_provider_launch() {
+        assert!(recall_native_message_is_slash_command("/login"));
+        assert!(recall_native_message_is_slash_command("  /model sonnet"));
+        assert!(!recall_native_message_is_slash_command(
+            "How do I use /login?"
+        ));
+        assert!(!recall_native_message_is_slash_command(""));
+    }
+
+    #[test]
+    fn native_recall_recognizes_claude_bare_auth_failure_frames() {
+        let assistant = serde_json::json!({
+            "type": "assistant",
+            "error": "authentication_failed",
+            "message": {"content": [{"type": "text", "text": "Not logged in · Please run /login"}]}
+        });
+        let result = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": true,
+            "result": "Not logged in · Please run /login"
+        });
+
+        assert!(recall_claude_frame_is_auth_failure(&assistant));
+        assert!(recall_claude_frame_is_auth_failure(&result));
+
+        for message in [
+            "Invalid API key",
+            "Invalid x-api-key header",
+            "Authentication failed",
+            "Authentication error",
+            "Unauthorized",
+        ] {
+            let api_key_error = serde_json::json!({
+                "type": "result",
+                "is_error": true,
+                "result": message,
+            });
+            assert!(recall_claude_frame_is_auth_failure(&api_key_error));
+        }
+    }
+
+    #[test]
+    fn native_recall_does_not_treat_model_login_discussion_as_auth_failure() {
+        let ordinary_answer = serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "Use /login in Terminal mode."}]}
+        });
+        let unrelated_error = serde_json::json!({
+            "type": "result",
+            "is_error": true,
+            "result": "Provider quota exceeded"
+        });
+
+        assert!(!recall_claude_frame_is_auth_failure(&ordinary_answer));
+        assert!(!recall_claude_frame_is_auth_failure(&unrelated_error));
+    }
+
+    #[test]
+    fn recall_readiness_routes_subscription_auth_to_terminal() {
+        let (native, provider, message) =
+            recall_native_readiness_decision("agent", false, true, false);
+        assert!(!native);
+        assert_eq!(provider, "claude-subscription");
+        assert!(message.contains("Terminal chat"));
+        assert!(message.contains("hooks"));
+    }
+
+    #[test]
+    fn recall_readiness_keeps_isolated_native_providers_native() {
+        assert!(recall_native_readiness_decision("ollama", true, false, false).0);
+        assert!(recall_native_readiness_decision("openai-compatible", true, false, false).0);
+        let api_key = recall_native_readiness_decision("agent", false, true, true);
+        assert!(api_key.0);
+        assert!(api_key.2.contains("verified when you send a question"));
+        assert!(!recall_native_readiness_decision("ollama", false, true, false).0);
+        assert!(!recall_native_readiness_decision("ollama", false, true, true).0);
+    }
+
+    #[test]
+    fn native_recall_api_key_failure_is_actionable() {
+        assert!(RECALL_NATIVE_AUTH_GUIDANCE.contains("ANTHROPIC_API_KEY"));
+        assert!(RECALL_NATIVE_AUTH_GUIDANCE.contains("Claude subscription"));
+        assert!(RECALL_NATIVE_AUTH_GUIDANCE.contains("No answer was saved"));
+    }
+
+    #[test]
+    fn recall_terminal_input_editing_fails_closed_before_meeting_context() {
+        let html = include_str!("../../src/index.html");
+        assert!(html.contains("let recallTerminalInputReliable = true;"));
+        assert!(html.contains("recallTerminalInputReliable = false;"));
+        assert!(html.contains(
+            "pendingRecallTerminalMeetingPath && question && !recallTerminalInputReliable"
+        ));
+        assert!(html.contains("no meeting context was read"));
+    }
+
+    #[test]
+    fn claude_auth_status_requires_explicit_logged_in_true() {
+        assert!(command_is_claude("/usr/local/bin/claude"));
+        assert!(command_is_claude("claude.cmd"));
+        assert!(!command_is_claude("codex"));
+        assert!(claude_auth_status_is_logged_in(
+            br#"{"loggedIn":true,"authMethod":"claude.ai"}"#
+        ));
+        assert!(!claude_auth_status_is_logged_in(
+            br#"{"loggedIn":false,"authMethod":"none"}"#
+        ));
+        assert!(!claude_auth_status_is_logged_in(b"not json"));
+    }
+
     /// The storage rule, exercised through the function the worker actually
     /// calls. `None` is the case that matters: it covers both a child already
     /// taken by cancellation and a `wait()` that failed, so treating it as a
@@ -14181,6 +14644,10 @@ mod tests {
 
     #[test]
     fn assistant_switch_prompts_are_instruction_file_agnostic() {
+        assert_eq!(
+            terminal_title_for_mode("deferred", None).unwrap(),
+            "Minutes Assistant"
+        );
         let meeting_prompt = context_switch_prompt("opencode", "meeting", "Discussing: Demo");
         assert!(meeting_prompt.contains("CURRENT_MEETING.md"));
         assert!(meeting_prompt.contains("CLAUDE.md or AGENTS.md"));
@@ -14192,6 +14659,26 @@ mod tests {
         let artifact_prompt = artifact_switch_prompt("opencode", Some("draft.md"));
         assert!(artifact_prompt.contains("CURRENT_ARTIFACT.md"));
         assert!(artifact_prompt.contains("CLAUDE.md or AGENTS.md"));
+    }
+
+    #[test]
+    fn deferred_terminal_mode_clears_stale_meeting_without_reading_another() {
+        let workspace = TempDir::new().unwrap();
+        std::fs::write(
+            workspace.path().join(crate::context::ACTIVE_MEETING_FILE),
+            "stale private context",
+        )
+        .unwrap();
+
+        sync_workspace_for_mode(workspace.path(), &Config::default(), "deferred", None).unwrap();
+
+        assert!(!workspace
+            .path()
+            .join(crate::context::ACTIVE_MEETING_FILE)
+            .exists());
+        let instructions = std::fs::read_to_string(workspace.path().join("CLAUDE.md")).unwrap();
+        assert!(instructions.contains("No meeting context has been loaded yet"));
+        assert!(!instructions.contains("stale private context"));
     }
 
     #[test]

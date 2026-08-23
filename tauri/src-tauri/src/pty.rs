@@ -8,6 +8,48 @@ use tauri::Emitter;
 pub const ASSISTANT_SESSION_ID: &str = "assistant";
 const MAX_SESSIONS: usize = 1;
 
+/// Environment overrides shared by the interactive assistant PTY and any
+/// bounded probe that must describe that exact session. GUI apps on macOS get
+/// a stripped PATH, so probing with the ambient process environment can report
+/// "not authenticated" even while the PTY can launch the same agent normally.
+pub fn assistant_process_environment() -> Vec<(String, String)> {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+    let mut path_dirs: Vec<String> = vec![
+        format!("{}/.cargo/bin", home.display()),
+        format!(
+            "{}/Library/Application Support/fnm/node-versions/default/bin",
+            home.display()
+        ),
+        format!("{}/.local/bin", home.display()),
+        "/opt/homebrew/bin".into(),
+        "/opt/homebrew/sbin".into(),
+        "/usr/local/bin".into(),
+        "/usr/bin".into(),
+        "/bin".into(),
+        "/usr/sbin".into(),
+        "/sbin".into(),
+    ];
+    if let Ok(existing) = std::env::var("PATH") {
+        for path in existing.split(':') {
+            if !path_dirs.contains(&path.to_string()) {
+                path_dirs.push(path.to_string());
+            }
+        }
+    }
+    let npm_global = home.join(".npm-global/bin");
+    if npm_global.exists() {
+        path_dirs.insert(0, npm_global.display().to_string());
+    }
+
+    vec![
+        ("PATH".into(), path_dirs.join(":")),
+        ("HOME".into(), home.display().to_string()),
+        ("TERM".into(), "xterm-256color".into()),
+        ("COLORTERM".into(), "truecolor".into()),
+        ("LANG".into(), "en_US.UTF-8".into()),
+    ]
+}
+
 #[cfg(windows)]
 fn terminate_process_tree(process_id: Option<u32>) {
     let Some(process_id) = process_id else {
@@ -69,6 +111,12 @@ impl PtyManager {
             .map(|session| session.command.clone())
     }
 
+    pub fn session_context_dir(&self, session_id: &str) -> Option<PathBuf> {
+        self.sessions
+            .get(session_id)
+            .map(|session| session.context_dir.clone())
+    }
+
     pub fn set_session_title(
         &mut self,
         session_id: &str,
@@ -109,43 +157,9 @@ impl PtyManager {
         }
         cmd.cwd(&cfg.cwd);
 
-        // Build a rich PATH so agent CLIs are found from a GUI app.
-        // macOS GUI processes get a stripped PATH by default.
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
-        let mut path_dirs: Vec<String> = vec![
-            format!("{}/.cargo/bin", home.display()),
-            format!(
-                "{}/Library/Application Support/fnm/node-versions/default/bin",
-                home.display()
-            ),
-            format!("{}/.local/bin", home.display()),
-            "/opt/homebrew/bin".into(),
-            "/opt/homebrew/sbin".into(),
-            "/usr/local/bin".into(),
-            "/usr/bin".into(),
-            "/bin".into(),
-            "/usr/sbin".into(),
-            "/sbin".into(),
-        ];
-        // Append existing PATH entries that aren't already in our list
-        if let Ok(existing) = std::env::var("PATH") {
-            for p in existing.split(':') {
-                if !path_dirs.contains(&p.to_string()) {
-                    path_dirs.push(p.to_string());
-                }
-            }
+        for (name, value) in assistant_process_environment() {
+            cmd.env(name, value);
         }
-        // Also check for npm global bin
-        let npm_global = home.join(".npm-global/bin");
-        if npm_global.exists() {
-            path_dirs.insert(0, npm_global.display().to_string());
-        }
-
-        cmd.env("PATH", path_dirs.join(":"));
-        cmd.env("HOME", home.display().to_string());
-        cmd.env("TERM", "xterm-256color");
-        cmd.env("COLORTERM", "truecolor");
-        cmd.env("LANG", "en_US.UTF-8");
 
         let child = pair
             .slave
