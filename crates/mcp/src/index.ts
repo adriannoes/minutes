@@ -84,7 +84,7 @@ import {
   validatePathInDirectories,
   validatePathInDirectory,
 } from "./paths.js";
-import { isCliCompatible } from "./version.js";
+import { isCliCompatible, parseVersion } from "./version.js";
 import {
   hasFeature,
   probeCapabilitiesSync,
@@ -3388,8 +3388,62 @@ export type AgentTrustReadiness = {
   remediation?: string;
 };
 
+const AGENT_READINESS_MIN_CLI_VERSION = "0.25.0";
+
+function isOlderVersion(installed: string, minimum: string): boolean {
+  const found = parseVersion(installed);
+  const required = parseVersion(minimum);
+  if (!found || !required) return false;
+  if (found.major !== required.major) return found.major < required.major;
+  if (found.minor !== required.minor) return found.minor < required.minor;
+  return found.patch < required.patch;
+}
+
+function rejectedUnknownSubcommand(error: any, subcommand: string): boolean {
+  const diagnostic = [error?.stderr, error?.message]
+    .filter((value): value is string => typeof value === "string")
+    .join("\n")
+    .toLowerCase();
+  return (
+    diagnostic.includes(subcommand.toLowerCase()) &&
+    /(?:unrecognized|unknown|invalid) subcommand/.test(diagnostic)
+  );
+}
+
+export function cliTooOldGuidance(
+  installedVersion: string,
+  minimumVersion: string = AGENT_READINESS_MIN_CLI_VERSION,
+  platform: NodeJS.Platform = process.platform
+): string {
+  const update =
+    platform === "darwin" || platform === "win32"
+      ? "Install the latest free Minutes desktop app from https://useminutes.app"
+      : "Update the Minutes CLI from https://useminutes.app, or run `cargo install minutes-cli`";
+  return (
+    `The Minutes engine is too old for this extension (found v${installedVersion}; ` +
+    `needs v${minimumVersion} or newer). ${update}, then restart this app.`
+  );
+}
+
+async function oldCliReadinessGuidance(
+  runner: MinutesRunner,
+  platform: NodeJS.Platform
+): Promise<string | null> {
+  try {
+    const { stdout } = await runner(["--version"], 5000);
+    const match = stdout.match(/\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?/);
+    if (!match || !isOlderVersion(match[0], AGENT_READINESS_MIN_CLI_VERSION)) {
+      return null;
+    }
+    return cliTooOldGuidance(match[0], AGENT_READINESS_MIN_CLI_VERSION, platform);
+  } catch {
+    return null;
+  }
+}
+
 export async function readAgentTrustReadiness(
-  runner: MinutesRunner = runMinutes
+  runner: MinutesRunner = runMinutes,
+  platform: NodeJS.Platform = process.platform
 ): Promise<AgentTrustReadiness> {
   let stdout: string;
   try {
@@ -3401,6 +3455,10 @@ export async function readAgentTrustReadiness(
     // the capture tools, and withholding it leaves a Claude Desktop user with
     // "could not be verified safely" and nothing to do about it (#774).
     if (error?.cliMissing) throw error;
+    if (rejectedUnknownSubcommand(error, "agent-readiness")) {
+      const guidance = await oldCliReadinessGuidance(runner, platform);
+      if (guidance) throw new Error(guidance);
+    }
     throw new Error("Minutes agent readiness could not be verified safely.");
   }
   let result: any;
