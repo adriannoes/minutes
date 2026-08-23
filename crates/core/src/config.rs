@@ -1766,6 +1766,62 @@ impl Config {
         Ok(())
     }
 
+    /// Create or update one string setting without rewriting the rest of the
+    /// user's TOML. Setup commands use this instead of serializing the full
+    /// [`Config`], which would discard comments and unknown forward-compatible
+    /// keys from a hand-edited file.
+    ///
+    /// An existing config must first pass the same strict parse used by the
+    /// privacy-sensitive bridges. A malformed file is left byte-for-byte
+    /// untouched rather than being replaced with defaults.
+    pub fn upsert_string_setting_at(
+        path: &Path,
+        section: &str,
+        key: &str,
+        value: &str,
+    ) -> std::io::Result<()> {
+        let mut document = if path.exists() {
+            let raw = std::fs::read_to_string(path)?;
+            Self::load_strict_from(path)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            raw.parse::<toml_edit::DocumentMut>().map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Minutes config could not be edited safely: {error}"),
+                )
+            })?
+        } else {
+            toml_edit::DocumentMut::new()
+        };
+
+        let item = document
+            .entry(section)
+            .or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
+        let table = item.as_table_mut().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Minutes config [{section}] value is not a table."),
+            )
+        })?;
+        let existing_decor = table
+            .get(key)
+            .and_then(toml_edit::Item::as_value)
+            .map(|value| value.decor().clone());
+        let mut replacement = toml_edit::value(value);
+        if let (Some(decor), Some(replacement_value)) = (existing_decor, replacement.as_value_mut())
+        {
+            *replacement_value.decor_mut() = decor;
+        }
+        table.insert(key, replacement);
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, document.to_string())?;
+        tracing::info!(path = %path.display(), section, key, "config setting saved");
+        Ok(())
+    }
+
     /// Ensure required directories exist.
     pub fn ensure_dirs(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.output_dir)?;
@@ -2229,6 +2285,68 @@ mod tests {
         assert!(error.contains("malformed"));
         assert!(!error.contains("PRIVATE-CONFIG-CANARY"));
         assert!(!Config::load_from(&path).knowledge.enabled);
+    }
+
+    #[test]
+    fn string_setting_upsert_creates_a_fresh_minimal_config() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("nested/minutes/config.toml");
+
+        Config::upsert_string_setting_at(&path, "transcription", "model", "base").unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("[transcription]"));
+        assert!(raw.contains("model = \"base\""));
+        assert_eq!(
+            Config::load_strict_from(&path).unwrap().transcription.model,
+            "base"
+        );
+    }
+
+    #[test]
+    fn string_setting_upsert_preserves_comments_and_unknown_sections() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"# Keep this founder note.
+[transcription]
+model = "tiny" # Keep this model note.
+language = "es"
+
+[future_product]
+launch_mode = "careful"
+"#,
+        )
+        .unwrap();
+
+        Config::upsert_string_setting_at(&path, "transcription", "model", "small").unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("# Keep this founder note."));
+        assert!(raw.contains("# Keep this model note."));
+        assert!(raw.contains("language = \"es\""));
+        assert!(raw.contains("[future_product]"));
+        assert!(raw.contains("launch_mode = \"careful\""));
+        assert_eq!(
+            Config::load_strict_from(&path).unwrap().transcription.model,
+            "small"
+        );
+    }
+
+    #[test]
+    fn string_setting_upsert_leaves_a_malformed_config_untouched() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("config.toml");
+        let original = b"[transcription\nPRIVATE-CONFIG-CANARY";
+        std::fs::write(&path, original).unwrap();
+
+        let error =
+            Config::upsert_string_setting_at(&path, "transcription", "model", "small").unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(!error.to_string().contains("PRIVATE-CONFIG-CANARY"));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
     }
 
     #[test]
