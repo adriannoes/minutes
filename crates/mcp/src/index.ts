@@ -85,6 +85,7 @@ import {
   validatePathInDirectory,
 } from "./paths.js";
 import { isCliCompatible, parseVersion } from "./version.js";
+import { nodeChildEnvironment } from "./node-child.js";
 import {
   hasFeature,
   probeCapabilitiesSync,
@@ -6514,7 +6515,7 @@ export async function runIsolatedMcpProcessAudio(
         child = spawn(helper.binary, helper.args, {
           detached: true,
           stdio: ["pipe", "pipe", "pipe", "pipe"],
-          env: mcpCliChildEnv(),
+          env: nodeChildEnvironment(mcpCliChildEnv()),
         });
       } catch {
         rejectRun(new Error("process_audio helper could not be started safely"));
@@ -7532,7 +7533,7 @@ registerTool(
 
 registerTool(
   "list_voices",
-  "List enrolled voice profiles for speaker identification. Shows who has been enrolled, sample count, and model version.",
+  "List active voice enrollments for speaker identification. Shows who has been enrolled, sample count, and model version.",
   {},
   { title: "Voice Profiles", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   async () => {
@@ -7545,7 +7546,7 @@ registerTool(
 
     if (!Array.isArray(profiles) || profiles.length === 0) {
       return {
-        content: [{ type: "text" as const, text: "No voice profiles enrolled. The user can enroll with: minutes enroll" }],
+        content: [{ type: "text" as const, text: "No voice profiles enrolled. The user can enroll with: minutes voice enroll" }],
       };
     }
 

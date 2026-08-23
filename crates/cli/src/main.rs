@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{Local, TimeZone};
 use clap::{Parser, Subcommand};
 use minutes_core::apple_speech::{
@@ -7316,7 +7316,7 @@ fn cmd_setup(model: &str, list: bool, diarization: bool) -> Result<()> {
         );
     }
 
-    let config = Config::default();
+    let config = Config::load_strict().map_err(anyhow::Error::msg)?;
     let model_dir = &config.transcription.model_path;
     std::fs::create_dir_all(model_dir)?;
 
@@ -7385,12 +7385,22 @@ fn cmd_setup(model: &str, list: bool, diarization: bool) -> Result<()> {
                 );
             }
         }
-
-        // Update config hint
-        eprintln!("\nTo use this model, add to ~/.config/minutes/config.toml:");
-        eprintln!("  [transcription]");
-        eprintln!("  model = \"{}\"", model);
     }
+
+    let config_path = Config::config_path();
+    Config::upsert_string_setting_at(&config_path, "transcription", "model", model).with_context(
+        || {
+            format!(
+                "failed to save the selected model in {}",
+                config_path.display()
+            )
+        },
+    )?;
+    eprintln!(
+        "Configured transcription.model = \"{}\" in {}",
+        model,
+        config_path.display()
+    );
 
     // Auto-download Silero VAD model (prevents transcription loops on non-English audio)
     let vad_dest = model_dir.join("ggml-silero-v6.2.0.bin");
@@ -17002,8 +17012,10 @@ fn cmd_voices(delete: bool, json: bool) -> Result<()> {
         anyhow::bail!("voice deletion is unavailable under the active assistant policy");
     }
     let conn = voice::open_db().map_err(|e| anyhow::anyhow!("{}", e))?;
+    voice::migrate_legacy_profiles(&conn).map_err(|e| anyhow::anyhow!("{}", e))?;
     if delete {
-        let profiles = voice::list_profiles(&conn).map_err(|e| anyhow::anyhow!("{}", e))?;
+        let profiles =
+            voice::list_profiles_for_display(&conn).map_err(|e| anyhow::anyhow!("{}", e))?;
         if profiles.is_empty() {
             eprintln!("No voice profiles enrolled.");
             return Ok(());
@@ -17014,7 +17026,7 @@ fn cmd_voices(delete: bool, json: bool) -> Result<()> {
         }
         return Ok(());
     }
-    let profiles = voice::list_profiles(&conn).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let profiles = voice::list_profiles_for_display(&conn).map_err(|e| anyhow::anyhow!("{}", e))?;
     if json {
         println!("{}", serde_json::to_string_pretty(&profiles)?);
         return Ok(());
