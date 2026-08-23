@@ -5428,6 +5428,59 @@ describe("agent trust readiness bridge", () => {
     ).rejects.toThrow(/run minutes qmd cleanup/i);
   });
 
+  it("turns an old engine missing agent-readiness into actionable upgrade guidance", async () => {
+    const calls: string[][] = [];
+    const error = await readAgentTrustReadiness(async (args) => {
+      calls.push(args);
+      if (args[0] === "--version") {
+        return { stdout: "minutes 0.24.0", stderr: "" };
+      }
+      const failure = new Error(
+        "error: unrecognized subcommand 'agent-readiness'\nPRIVATE-PATH-CANARY"
+      );
+      (failure as any).stderr = failure.message;
+      throw failure;
+    }, "win32").catch((failure: unknown) => failure);
+
+    expect(calls).toEqual([
+      ["agent-readiness", "--json"],
+      ["--version"],
+    ]);
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain("found v0.24.0");
+    expect((error as Error).message).toContain("needs v0.25.0 or newer");
+    expect((error as Error).message).toContain("Minutes desktop app");
+    expect((error as Error).message).not.toContain("PRIVATE");
+  });
+
+  it("keeps unexpected readiness failures opaque even when version probing would be possible", async () => {
+    const calls: string[][] = [];
+    const error = await readAgentTrustReadiness(async (args) => {
+      calls.push(args);
+      throw new Error("PRIVATE-CONFIG-CANARY");
+    }).catch((failure: unknown) => failure);
+
+    expect(calls).toEqual([["agent-readiness", "--json"]]);
+    expect((error as Error).message).toBe(
+      "Minutes agent readiness could not be verified safely."
+    );
+  });
+
+  it("does not mislabel a current custom engine as old", async () => {
+    const error = await readAgentTrustReadiness(async (args) => {
+      if (args[0] === "--version") {
+        return { stdout: "minutes 0.25.0", stderr: "" };
+      }
+      const failure = new Error("error: unknown subcommand 'agent-readiness'");
+      (failure as any).stderr = failure.message;
+      throw failure;
+    }).catch((failure: unknown) => failure);
+
+    expect((error as Error).message).toBe(
+      "Minutes agent readiness could not be verified safely."
+    );
+  });
+
   it("fails closed on malformed or inconsistent readiness responses", async () => {
     for (const stdout of [
       "",
