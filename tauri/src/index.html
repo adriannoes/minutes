@@ -722,7 +722,7 @@
     }
 
     /* Rendered-markdown code in assistant replies (#404 follow-up). */
-    .chat-bubble-assistant .chat-code {
+    .chat-bubble-assistant pre {
       font-family: 'Geist Mono', 'SF Mono', Menlo, monospace;
       font-size: 11px;
       background: var(--bg-elevated);
@@ -734,11 +734,76 @@
       white-space: pre;
     }
 
-    .chat-bubble-assistant .chat-code-inline {
+    .chat-bubble-assistant code {
       font-family: 'Geist Mono', 'SF Mono', Menlo, monospace;
       background: var(--bg-elevated);
       border-radius: 3px;
       padding: 0 3px;
+    }
+
+    /* Inside a <pre> the code element is the block itself — drop the inline
+       chrome so fenced blocks don't render as a chip inside a card. */
+    .chat-bubble-assistant pre code {
+      background: none;
+      border-radius: 0;
+      padding: 0;
+    }
+
+    /* Block structure the old regex renderer could not produce at all. Margins
+       are tight because these sit inside a chat bubble, not a document. */
+    .chat-bubble-assistant p { margin: 4px 0; }
+    .chat-bubble-assistant p:first-child { margin-top: 0; }
+    .chat-bubble-assistant p:last-child { margin-bottom: 0; }
+
+    .chat-bubble-assistant ul,
+    .chat-bubble-assistant ol {
+      margin: 4px 0;
+      padding-left: 20px;
+    }
+
+    .chat-bubble-assistant li { margin: 2px 0; }
+
+    .chat-bubble-assistant h1,
+    .chat-bubble-assistant h2,
+    .chat-bubble-assistant h3,
+    .chat-bubble-assistant h4 {
+      font-family: 'Instrument Serif', Georgia, serif;
+      font-weight: 400;
+      margin: 8px 0 4px;
+      line-height: 1.25;
+    }
+
+    .chat-bubble-assistant h1 { font-size: 18px; }
+    .chat-bubble-assistant h2 { font-size: 16px; }
+    .chat-bubble-assistant h3,
+    .chat-bubble-assistant h4 { font-size: 14px; }
+
+    .chat-bubble-assistant blockquote {
+      margin: 4px 0;
+      padding-left: 8px;
+      border-left: 2px solid var(--border);
+      color: var(--text-secondary);
+    }
+
+    .chat-bubble-assistant table {
+      border-collapse: collapse;
+      margin: 4px 0;
+      font-size: 11px;
+      display: block;
+      overflow-x: auto;
+    }
+
+    .chat-bubble-assistant th,
+    .chat-bubble-assistant td {
+      border: 1px solid var(--border);
+      padding: 3px 6px;
+      text-align: left;
+    }
+
+    .chat-bubble-assistant hr {
+      border: none;
+      border-top: 1px solid var(--border);
+      margin: 8px 0;
     }
 
     .chat-input-row {
@@ -2004,6 +2069,53 @@
     .md-viewer-content::-webkit-scrollbar-thumb {
       background: var(--surface-fill-strong);
       border-radius: 999px;
+    }
+
+    /* Clickable rendered blocks. The hover tint is the only affordance — a
+       border or handle would put chrome on every paragraph of a document
+       that is usually just being read, not edited. */
+    .md-viewer-content .md-block {
+      border-radius: 4px;
+      /* Pull the padding back out so hover tint reads as a block without
+         shifting the text on render. */
+      margin-left: -6px;
+      margin-right: -6px;
+      padding-left: 6px;
+      padding-right: 6px;
+    }
+
+    .md-viewer.is-editable .md-viewer-content .md-block:hover {
+      background: var(--bg-hover);
+      cursor: text;
+    }
+
+    .md-block-editor {
+      display: block;
+      width: 100%;
+      box-sizing: border-box;
+      resize: none;
+      overflow: hidden;
+      background: var(--bg-hover);
+      color: var(--text);
+      border: 1px solid var(--accent);
+      border-radius: 4px;
+      outline: none;
+      margin: 0 -6px;
+      padding: 5px;
+      font: 13px/1.7 var(--font-mono);
+      white-space: pre-wrap;
+    }
+
+    /* An image the renderer declined to load. Reads as content, not an error:
+       the note said a picture was here, so say so rather than show nothing. */
+    .md-image-placeholder {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--text-secondary);
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 1px 5px;
     }
 
     .md-viewer-editor {
@@ -13765,24 +13877,49 @@
       if (pill) pill.style.display = 'block';
     }
 
-    function renderChatMarkdown(src) {
-      const esc = (s) => s
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;');
-      const blocks = [];
-      // Fenced code blocks first, so their contents aren't formatted.
-      let s = String(src).replace(/```[^\n]*\n?([\s\S]*?)```/g, (_, code) => {
-        blocks.push('<pre class="chat-code">' + esc(code.replace(/\n$/, '')) + '</pre>');
-        return '\x00B' + (blocks.length - 1) + '\x00';
+    // Assistant replies render through renderMarkdownToElement — the same
+    // escape-before-parse path the artifact viewer uses. The hand-rolled regex
+    // renderer this replaced only understood code/bold/italic, so every list
+    // and heading the model produced arrived as literal "- " and "## " text.
+    //
+    // Streaming arrives token-by-token, and each chunk would otherwise reparse
+    // and rebuild the entire accumulated reply — quadratic in the length of the
+    // answer, and it collapses any text selection the user has made mid-stream.
+    // Coalesce to at most one render per animation frame.
+    let assistantRenderFrame = null;
+    function scheduleAssistantBubbleRender(bubble) {
+      if (assistantRenderFrame !== null) return;
+      assistantRenderFrame = requestAnimationFrame(() => {
+        assistantRenderFrame = null;
+        if (!bubble.isConnected) return;
+        renderMarkdownToElement(bubble, currentAssistantRaw);
       });
-      s = esc(s);
-      s = s.replace(/`([^`\n]+)`/g, (_, c) => '<code class="chat-code-inline">' + c + '</code>');
-      s = s.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
-      s = s.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>');
-      s = s.replace(/\x00B(\d+)\x00/g, (_, i) => blocks[Number(i)]);
-      return s;
     }
+
+    function flushAssistantBubbleRender(bubble) {
+      if (assistantRenderFrame !== null) {
+        cancelAnimationFrame(assistantRenderFrame);
+        assistantRenderFrame = null;
+      }
+      if (bubble?.isConnected) renderMarkdownToElement(bubble, currentAssistantRaw);
+    }
+
+    // That renderer also produces real anchors, which the regex one never did.
+    // An un-intercepted click would navigate this webview away from the app
+    // shell — there is no back button and no CSP to land on — so chat links
+    // are routed out to the OS the same way the artifact viewer routes them.
+    recallChatMessages?.addEventListener('click', async (event) => {
+      const anchor = event.target?.closest?.('a[href]');
+      if (!anchor) return;
+      event.preventDefault();
+      const href = anchor.getAttribute('href');
+      if (!href || href === '#') return;
+      try {
+        await invoke('cmd_open_file', { path: href });
+      } catch (e) {
+        console.error('Open chat link:', e);
+      }
+    });
     // Tracks which meeting the *currently displayed* native chat conversation
     // belongs to. Deliberately separate from currentMeetingPath: other flows
     // (e.g. closeDetailView()) null out currentMeetingPath transiently before
@@ -14162,6 +14299,10 @@
     /// are responsible for confirming the meeting actually changed before
     /// calling this — it unconditionally wipes the current conversation.
     async function resetRecallChat() {
+      if (assistantRenderFrame !== null) {
+        cancelAnimationFrame(assistantRenderFrame);
+        assistantRenderFrame = null;
+      }
       if (recallChatMessages) recallChatMessages.replaceChildren();
       currentAssistantBubble = null;
       currentAssistantRaw = '';
@@ -14294,6 +14435,9 @@
 
     function finishRecallChatUi() {
       if (currentAssistantBubble) {
+        // A throttled render may still be queued; without this the last chunk
+        // of the reply never reaches the DOM.
+        flushAssistantBubbleRender(currentAssistantBubble);
         currentAssistantBubble.classList.remove('streaming');
         currentAssistantBubble = null;
       }
@@ -14336,11 +14480,16 @@
           // renders nothing at all, even though the model answered correctly.
           text = chunk.text;
         } else if (chunk && chunk.type === 'result' && typeof chunk.result === 'string') {
-          // Final result event — use as fallback if the assistant bubble is still empty.
-          if (currentAssistantBubble && !currentAssistantBubble.textContent.trim()) {
+          // Final result event — use as fallback if the assistant bubble is
+          // still empty. Emptiness is measured by whether anything was
+          // streamed, NOT by textContent: a reply that is only an image
+          // renders to an <img> with no text, and a textContent check would
+          // read that as empty and append the whole reply a second time.
+          const bubbleIsEmpty = !currentAssistantRaw;
+          if (currentAssistantBubble && bubbleIsEmpty) {
             text = chunk.result;
           }
-          if (chunk.subtype !== 'success' && currentAssistantBubble && !currentAssistantBubble.textContent.trim()) {
+          if (chunk.subtype !== 'success' && currentAssistantBubble && bubbleIsEmpty) {
             text = chunk.error || chunk.result || 'Claude returned an error.';
           }
         }
@@ -14348,10 +14497,11 @@
           // Capture BEFORE the content grows: was the user already at the bottom?
           const atBottom = recallChatNearBottom();
           // Accumulate raw text and re-render markdown each chunk (cheap at
-          // chat length). renderChatMarkdown escapes first, so the model's
+          // chat length). renderMarkdownToElement escapes before parsing and
+          // builds nodes rather than assigning innerHTML, so the model's
           // output can never inject HTML (#404 follow-up).
           currentAssistantRaw += text;
-          currentAssistantBubble.innerHTML = renderChatMarkdown(currentAssistantRaw);
+          scheduleAssistantBubbleRender(currentAssistantBubble);
           // Only auto-scroll if they were at the bottom — never yank someone off
           // a paragraph they've scrolled up to read aloud in coach mode. When
           // scrolled up, surface a "jump to latest" pill instead (#404 follow-up).
@@ -16176,8 +16326,43 @@
         .replace(/>/g, '&gt;');
     }
 
+    // Inline image data only. Remote schemes are deliberately absent: a note
+    // body is untrusted content, and auto-fetching https: would turn a tracking
+    // pixel pasted into a meeting note into a beacon that reports when the note
+    // was read. That is the one thing a privacy-first notes app must not do.
+    // Local files (file:, relative) need Tauri's asset protocol, which is not
+    // enabled on this app — until it is, they cannot load either.
+    const LOADABLE_IMAGE_SRC = /^\s*data:image\/(png|jpe?g|gif|webp|avif);base64,/i;
+
+    // A data: URI is decoded by the webview with no network round trip to
+    // bound it, so the document itself is the only limit. Cap it: ~1.3 MB of
+    // base64 is a generous inline screenshot and a poor DoS payload. Oversized
+    // images fall through to alt text like any other image we decline.
+    const MAX_INLINE_IMAGE_CHARS = 1_400_000;
+
+    // Above this, skip source annotation. The map allocates one array entry
+    // per code unit of the escaped text, and escaping multiplies '&' fivefold,
+    // so a pathological file can allocate tens of millions of numbers and
+    // wedge the webview. Large files still render and still edit — they just
+    // fall back to whole-document source mode instead of click-to-edit.
+    const MAX_ANNOTATED_SOURCE_CHARS = 500_000;
+
+    // An image we will not load becomes its alt text rather than disappearing.
+    // Silent removal was the old behavior and it made authored content vanish
+    // with no indication that anything had been there.
+    function replaceImageWithAltText(img) {
+      const alt = (img.getAttribute('alt') || '').trim();
+      const src = (img.getAttribute('src') || '').trim();
+      const placeholder = img.ownerDocument.createElement('span');
+      placeholder.className = 'md-image-placeholder';
+      placeholder.textContent = alt ? `🖼 ${alt}` : `🖼 ${src || 'image'}`;
+      if (src) placeholder.setAttribute('title', src);
+      img.replaceWith(placeholder);
+    }
+
     function sanitizeDom(root) {
-      const dangerous = 'script,iframe,object,embed,form,input,textarea,select,button,base,meta,link,style,img,picture,source,video,audio,svg,math';
+      // <img> is no longer blanket-removed; it is filtered by src below.
+      const dangerous = 'script,iframe,object,embed,form,input,textarea,select,button,base,meta,link,style,picture,source,video,audio,svg,math';
       root.querySelectorAll(dangerous).forEach(n => n.remove());
       root.querySelectorAll('*').forEach(el => {
         for (const attr of [...el.attributes]) {
@@ -16194,6 +16379,14 @@
             el.setAttribute('href', '#');
           }
         }
+        if (el.tagName === 'IMG') {
+          el.removeAttribute('srcset');
+          const imgSrc = el.getAttribute('src') || '';
+          if (!LOADABLE_IMAGE_SRC.test(imgSrc) || imgSrc.length > MAX_INLINE_IMAGE_CHARS) {
+            replaceImageWithAltText(el);
+            return;
+          }
+        }
         if (el.hasAttribute('src') && /^\s*javascript:/i.test(el.getAttribute('src'))) {
           el.removeAttribute('src');
         }
@@ -16203,10 +16396,85 @@
       });
     }
 
-    function renderMarkdownToElement(el, markdownText) {
-      const html = marked.parse(escapeHtmlForMarkdown(markdownText));
-      const doc = new DOMParser().parseFromString(html, 'text/html');
+    // Maps every code unit of the string marked actually lexes back to its
+    // index in the original source, so a rendered block can be traced to the
+    // exact bytes that produced it. Two transforms sit between them:
+    //
+    //   1. escapeHtmlForMarkdown expands & < > (to 5, 4, 4 chars).
+    //   2. marked normalizes CRLF to LF before lexing, so token.raw is
+    //      measured against a string with every \r removed.
+    //
+    // (2) is why a CRLF file cannot be annotated from escaped offsets alone:
+    // token.raw lengths sum to less than the escaped text, so every block
+    // after the first line break is off by the number of \r seen so far.
+    // The \n of a CRLF pair anchors at the \r's index, so a block ending at a
+    // line break stops before the \r instead of swallowing it.
+    //
+    // Keep in lockstep with escapeHtmlForMarkdown and with marked's
+    // normalization; the caller's length assertion catches drift in either.
+    function buildSourceOffsetMap(text) {
+      const map = [];
+      for (let i = 0; i < text.length; i++) {
+        const code = text.charCodeAt(i);
+        if (code === 13 && text.charCodeAt(i + 1) === 10) {
+          map.push(i);
+          i++;
+          continue;
+        }
+        const width = code === 38 ? 5 : (code === 60 || code === 62) ? 4 : 1;
+        for (let k = 0; k < width; k++) map.push(i);
+      }
+      map.push(text.length);
+      return map;
+    }
+
+    // Tokens the parser turns into no element at all. `def` is the non-obvious
+    // one: a link reference definition ([1]: http://x) occupies source text but
+    // renders nothing, so it must not consume a rendered block.
+    const INVISIBLE_MARKDOWN_TOKENS = new Set(['space', 'def']);
+
+    // Tag each top-level rendered element with the source range that produced
+    // it, so a click in the preview can open exactly that block for editing.
+    function annotateBlocksWithSource(body, tokens, source) {
+      const offsets = buildSourceOffsetMap(source);
+      const ranges = [];
+      let cursor = 0;
+      for (const token of tokens) {
+        const start = cursor;
+        cursor += token.raw.length;
+        if (!INVISIBLE_MARKDOWN_TOKENS.has(token.type)) ranges.push([start, cursor]);
+      }
+      // Length assertion FIRST, and it is the load-bearing one. The token
+      // stream must account for every code unit the offset map knows about;
+      // if marked normalized something the map did not model, the offsets are
+      // silently wrong while the block count still matches — which is exactly
+      // how CRLF corrupted edits before this check existed. Bail instead.
+      if (cursor !== offsets.length - 1) return false;
+
+      const blocks = [...body.children];
+      // One rendered element per visible token holds across marked's block
+      // grammar, but it is an observation, not a contract it promises to keep.
+      // If a future version breaks it, ship the document unannotated rather
+      // than wiring every click to the wrong line.
+      if (blocks.length !== ranges.length) return false;
+      blocks.forEach((block, i) => {
+        block.classList.add('md-block');
+        block.dataset.srcStart = String(offsets[ranges[i][0]]);
+        block.dataset.srcEnd = String(offsets[ranges[i][1]]);
+      });
+      return true;
+    }
+
+    function renderMarkdownToElement(el, markdownText, { annotateSource = false } = {}) {
+      const source = markdownText || '';
+      // Escape BEFORE parsing so marked can never emit raw HTML; sanitizeDom
+      // is defense in depth, not the only barrier (#404).
+      const tokens = marked.lexer(escapeHtmlForMarkdown(source));
+      const doc = new DOMParser().parseFromString(marked.parser(tokens), 'text/html');
       sanitizeDom(doc.body);
+      if (annotateSource && source.length <= MAX_ANNOTATED_SOURCE_CHARS) {
+        annotateBlocksWithSource(doc.body, tokens, source);
+      }
       el.textContent = '';
       while (doc.body.firstChild) {
         el.appendChild(doc.body.firstChild);
@@ -16300,7 +16568,8 @@
       if (openArtifactKind === 'json') {
         renderJsonToElement(el, text);
       } else if (openArtifactKind === 'markdown') {
-        renderMarkdownToElement(el, text);
+        // Source annotation only matters when the blocks are clickable.
+        renderMarkdownToElement(el, text, { annotateSource: openArtifactEditable });
       } else {
         renderTextToElement(el, text);
       }
@@ -16317,7 +16586,11 @@
     }
 
     function currentArtifactBuffer() {
-      return mdViewerMode === 'source' ? mdViewerEditor.value : (openArtifactContent || '');
+      // In preview mode the editor textarea is normally stale, but inline block
+      // edits write through it so the existing save path stays the single
+      // writer. Once dirty, it is the live buffer in either mode.
+      if (mdViewerMode === 'source' || openArtifactDirty) return mdViewerEditor.value;
+      return openArtifactContent || '';
     }
 
     function formatJsonSource(text) {
@@ -16352,6 +16625,9 @@
       mdViewerPromoteBtn.hidden = !openArtifactPath || openArtifactEditable;
       mdViewerReviewBtn.disabled = !mdViewerReviewData?.available;
       mdViewerContent.style.display = sourceMode ? 'none' : 'block';
+      // Gates the block hover affordance: read-only artifacts should not
+      // advertise an edit that clicking cannot start.
+      mdViewer.classList.toggle('is-editable', openArtifactEditable && openArtifactKind === 'markdown');
       mdViewerEditor.classList.toggle('active', sourceMode);
       mdViewerEditor.readOnly = !openArtifactEditable;
       mdViewerSaveBtn.disabled =
@@ -16378,7 +16654,8 @@
       }
     }
 
-    async function setMdViewerMode(mode) {
+    async function setMdViewerMode(mode, { caret = null } = {}) {
+      commitInlineBlockEditor();
       if (mode === 'source' && !openArtifactEditable) {
         mdViewerMode = 'preview';
       } else {
@@ -16390,7 +16667,16 @@
             ? formatJsonSource(openArtifactContent || '')
             : (openArtifactContent || '');
         }
-        requestAnimationFrame(() => mdViewerEditor.focus());
+        requestAnimationFrame(() => {
+          mdViewerEditor.focus();
+          // Land on the block that was clicked instead of the top of the file.
+          // Without this, opening source on a long document means scrolling to
+          // find the line you were just looking at in the preview.
+          if (caret !== null && caret <= mdViewerEditor.value.length) {
+            mdViewerEditor.setSelectionRange(caret, caret);
+            scrollTextareaToCaret(mdViewerEditor, caret);
+          }
+        });
       } else {
         await flushOpenArtifactSave();
         rerenderOpenArtifact(currentArtifactBuffer(), { preserveScroll: true });
@@ -16426,6 +16712,133 @@
       refreshMdViewerChrome();
     }
 
+    // ──────────────────────────────────────────────────────────────
+    // Inline block editing.
+    // Clicking a rendered block swaps just that block for a textarea holding
+    // its exact source range, so a typo fix in prep notes never means leaving
+    // the rendered view, hunting the line in a full-document source pane, and
+    // switching back. The rest of the document stays rendered around it.
+    // ──────────────────────────────────────────────────────────────
+    let activeBlockEdit = null;
+
+    function autosizeBlockEditor(editor) {
+      editor.style.height = 'auto';
+      editor.style.height = `${editor.scrollHeight}px`;
+    }
+
+    // Setting selectionStart does not scroll a textarea, so a caret restored
+    // deep in a long file lands off-screen. Approximate by hard-line count:
+    // soft-wrapped lines make this an underestimate, which errs toward
+    // scrolling too little and leaving the target visible below the fold.
+    function scrollTextareaToCaret(textarea, caret) {
+      const line = textarea.value.slice(0, caret).split('\n').length - 1;
+      const styles = getComputedStyle(textarea);
+      let lineHeight = parseFloat(styles.lineHeight);
+      if (!Number.isFinite(lineHeight)) lineHeight = parseFloat(styles.fontSize) * 1.7;
+      textarea.scrollTop = Math.max(0, line * lineHeight - textarea.clientHeight / 3);
+    }
+
+    function isInlineBlockEditing() {
+      return activeBlockEdit !== null;
+    }
+
+    function openInlineBlockEditor(block) {
+      if (!openArtifactEditable || openArtifactKind !== 'markdown') return false;
+      const start = Number(block.dataset.srcStart);
+      const end = Number(block.dataset.srcEnd);
+      if (!Number.isInteger(start) || !Number.isInteger(end) || end < start) return false;
+
+      commitInlineBlockEditor();
+
+      const source = currentArtifactBuffer();
+      if (end > source.length) return false;
+      const raw = source.slice(start, end);
+      // Trailing blank lines belong to the document's block separation, not to
+      // the block's text. Hold them aside and restore them verbatim on commit
+      // so editing a paragraph never welds it to the next one. Matches CRLF as
+      // one unit: stripping only \n would leave a stray \r in the editor and
+      // write it back into the middle of the document.
+      const trailing = (raw.match(/(?:\r?\n)*$/) || [''])[0];
+      const body = raw.slice(0, raw.length - trailing.length);
+
+      const editor = document.createElement('textarea');
+      editor.className = 'md-block-editor';
+      editor.spellcheck = false;
+      editor.value = body;
+      editor.addEventListener('input', () => autosizeBlockEditor(editor));
+      editor.addEventListener('blur', () => commitInlineBlockEditor());
+      editor.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          event.stopPropagation();
+          cancelInlineBlockEditor();
+        } else if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
+          event.preventDefault();
+          commitInlineBlockEditor();
+        }
+      });
+      block.replaceWith(editor);
+      activeBlockEdit = {
+        editor, start, end, trailing,
+        original: body,
+        sourceSnapshot: source,
+        // Bytes alone do not identify the document. Two artifacts with
+        // identical contents would pass a bytes-only guard, letting an edit
+        // started in one file commit into the other.
+        path: openArtifactPath,
+      };
+      autosizeBlockEditor(editor);
+      editor.focus();
+      editor.setSelectionRange(body.length, body.length);
+      setMdViewerStatus('Editing block — Esc to cancel', 'unsaved');
+      return true;
+    }
+
+    function commitInlineBlockEditor() {
+      const state = activeBlockEdit;
+      if (!state) return;
+      activeBlockEdit = null;
+      const next = state.editor.value;
+
+      if (next === state.original) {
+        rerenderOpenArtifact(currentArtifactBuffer(), { preserveScroll: true });
+        refreshMdViewerChrome();
+        return;
+      }
+      // The offsets were computed against sourceSnapshot. If anything else
+      // rewrote the buffer while the editor was open, splicing by those offsets
+      // would corrupt the file — drop the edit rather than write at the wrong
+      // index. refreshOpenArtifactIfChanged also holds off while editing, so
+      // this is a backstop, not the primary guard.
+      if (state.path !== openArtifactPath) {
+        setMdViewerStatus('Different document open — inline edit discarded', 'danger');
+        return;
+      }
+      if (currentArtifactBuffer() !== state.sourceSnapshot) {
+        setMdViewerStatus('Document changed — inline edit discarded', 'danger');
+        rerenderOpenArtifact(currentArtifactBuffer(), { preserveScroll: true });
+        return;
+      }
+
+      const updated = state.sourceSnapshot.slice(0, state.start)
+        + next + state.trailing
+        + state.sourceSnapshot.slice(state.end);
+
+      mdViewerEditor.value = updated;
+      openArtifactDirty = updated !== (openArtifactContent || '');
+      if (openArtifactDirty) openArtifactExternalNotice = null;
+      rerenderOpenArtifact(updated, { preserveScroll: true });
+      refreshMdViewerChrome();
+      scheduleOpenArtifactSave();
+    }
+
+    function cancelInlineBlockEditor() {
+      if (!activeBlockEdit) return;
+      activeBlockEdit = null;
+      rerenderOpenArtifact(currentArtifactBuffer(), { preserveScroll: true });
+      refreshMdViewerChrome();
+    }
+
     function rerenderOpenArtifact(markdownText, { preserveScroll = false } = {}) {
       const previousScrollTop = preserveScroll ? mdViewerContent.scrollTop : 0;
       renderArtifactPreview(mdViewerContent, markdownText);
@@ -16439,6 +16852,9 @@
     async function refreshOpenArtifactIfChanged() {
       if (!openArtifactPath || !mdViewer.classList.contains('active')) return;
       if (openArtifactSaving) return;
+      // An open inline editor holds source offsets into the current buffer.
+      // Swapping the document underneath it would invalidate them mid-edit.
+      if (isInlineBlockEditing()) return;
       try {
         const content = await invoke('cmd_read_text_file', { path: openArtifactPath });
         openArtifactLastError = null;
@@ -16482,6 +16898,12 @@
     }
 
     async function flushOpenArtifactSave() {
+      // An open inline editor holds text that has not reached the buffer yet,
+      // and typing in it deliberately does not set openArtifactDirty (the
+      // commit needs an unchanged snapshot to splice against). Without this,
+      // Cmd+S on a clean document is a no-op that silently discards the block
+      // the user just typed.
+      commitInlineBlockEditor();
       if (mdViewerSaveTimer) {
         clearTimeout(mdViewerSaveTimer);
         mdViewerSaveTimer = null;
@@ -16508,7 +16930,11 @@
           openArtifactDirty = currentContent !== savedContent;
           openArtifactExternalNotice = null;
           mdViewerLastSavedAt = new Date();
-          if (mdViewerMode === 'preview') {
+          // Never rerender under a live inline editor: the debounced save can
+          // land while a second block is open, and rerendering would detach
+          // that focused textarea while activeBlockEdit still pointed at it —
+          // the typed text disappears and editing jams.
+          if (mdViewerMode === 'preview' && !isInlineBlockEditing()) {
             rerenderOpenArtifact(currentContent, { preserveScroll: true });
           }
           if (openArtifactDirty) {
@@ -16756,7 +17182,7 @@
     mdViewerPreviewBtn.addEventListener('click', () => setMdViewerMode('preview'));
     mdViewerSourceBtn.addEventListener('click', () => setMdViewerMode('source'));
     mdViewerPromoteBtn.addEventListener('click', promoteOpenArtifact);
-    mdViewerSaveBtn.addEventListener('click', saveOpenArtifact);
+    mdViewerSaveBtn.addEventListener('click', flushOpenArtifactSave);
     mdViewerReviewBtn.addEventListener('click', () => {
       if (!mdViewerReviewData?.available) return;
       mdViewerReviewVisible = !mdViewerReviewVisible;
@@ -16815,9 +17241,16 @@
         return;
       }
       if (window.getSelection?.().toString()) return;
-      if (openArtifactEditable && mdViewerMode !== 'source') {
-        await setMdViewerMode('source');
-      }
+      if (event.target?.closest?.('.md-block-editor')) return;
+      if (!openArtifactEditable || mdViewerMode === 'source') return;
+
+      // Prefer editing just the clicked block. Falling through to whole-file
+      // source mode is the path for anything unannotated — a JSON/text
+      // artifact, or a document where the block/token zip did not hold.
+      const block = clickedElement?.closest?.('.md-block[data-src-start]');
+      if (block && openInlineBlockEditor(block)) return;
+      const caret = block ? Number(block.dataset.srcStart) : null;
+      await setMdViewerMode('source', { caret: Number.isInteger(caret) ? caret : null });
     });
 
     // Cmd+O shortcut — only when focus is not inside an editable context or the terminal
