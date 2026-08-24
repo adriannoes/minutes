@@ -806,46 +806,6 @@ pub fn detect_agent_cli() -> Option<String> {
     detect_agent_cli_from_candidates(&["claude", "codex", "gemini", "opencode", "agent"])
 }
 
-/// Detect only the CLI whose no-tools/no-MCP/no-settings contract is verified
-/// for Native Recall. General summarization retains the broader agent list.
-pub fn detect_recall_chat_cli() -> Option<String> {
-    let resolved = resolve_agent_path("claude");
-    if resolved == "claude" && !std::path::Path::new(&resolved).exists() {
-        return None;
-    }
-    let output = crate::engine_process::command(&resolved)
-        .arg("--version")
-        .env_clear()
-        .env("LANG", "C.UTF-8")
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() || !recall_claude_version_is_known(&output.stdout) {
-        return None;
-    }
-    Some(resolved)
-}
-
-/// Accept the stable native Claude Code version contract and nothing else.
-/// Native Recall repeats this probe through its held executable capability;
-/// this discovery-time check is only an early fail-closed filter.
-pub fn recall_claude_version_is_known(stdout: &[u8]) -> bool {
-    let Ok(version) = std::str::from_utf8(stdout) else {
-        return false;
-    };
-    let mut fields = version.split_whitespace();
-    let Some(number) = fields.next() else {
-        return false;
-    };
-    let numeric = number.split('.').collect::<Vec<_>>();
-    numeric.len() >= 3
-        && numeric
-            .iter()
-            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
-        && version.trim_end().ends_with("(Claude Code)")
-}
-
 fn detect_agent_cli_from_candidates(candidates: &[&str]) -> Option<String> {
     for cmd in candidates {
         let resolved = resolve_agent_path(cmd);
@@ -961,36 +921,60 @@ pub struct ChatInvocation {
     pub cleanup_path: Option<std::path::PathBuf>,
 }
 
+/// The credential and isolation contract used for a native Recall CLI turn.
+///
+/// Keep these variants explicit. Claude's API-key-only `--bare` mode and its
+/// subscription-aware `--safe-mode` have different authentication behavior,
+/// while Codex requires a restricted filesystem profile rather than Claude's
+/// no-tools switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecallChatIsolation {
+    ClaudeApiKey,
+    ClaudeSubscription,
+    CodexSubscription,
+}
+
 /// Build a [`ChatInvocation`] for the given agent CLI and prompt.
 ///
-/// Native Recall currently accepts only Claude because its installed CLI has
-/// a verified, tested no-tools/no-MCP/no-settings mode. Other agent CLIs fail
-/// closed until an equivalent launch contract is proven. Claude gets its own
-/// arg-building path — [`prepare_claude_chat_invocation`] — which is
-/// deliberately *not* the shared `lean = true` claude branch because chat has
-/// different streaming arguments. It now shares that branch's security
-/// posture—strictly empty MCP and tools—so only the desktop's verified inline
-/// context can reach the model.
+/// Native Recall accepts only CLI and isolation combinations whose launch
+/// contract has been verified explicitly. Claude gets a no-tools path for API
+/// keys and a safe-mode path for subscriptions. Codex gets a separate named
+/// permission profile that exposes only the neutral chat workspace and the
+/// installed executable. Every other combination fails closed.
 ///
-/// When `stream_json` is set and the agent is claude, the `--output-format
-/// text` produced by the branch above is upgraded to `--output-format
-/// stream-json` (with the `--verbose` that claude's `--print` mode requires
-/// for that format) so the panel can render tokens incrementally. Other CLIs
-/// ignore `stream_json`: their stdout is captured as a single blob and the
-/// flag has no bearing on their arguments.
+/// When `stream_json` is set for Claude, its text output is upgraded to
+/// `stream-json` so the panel can render tokens incrementally. Codex always
+/// emits JSONL from `exec --json`; its final message is collected by the
+/// desktop before it is shown.
 pub fn build_chat_invocation(
     agent_cmd: &str,
     prompt: &str,
     stream_json: bool,
+    isolation: RecallChatIsolation,
+    executable_read_roots: &[std::path::PathBuf],
 ) -> Result<ChatInvocation, Box<dyn std::error::Error>> {
-    if !matches_agent_binary(agent_cmd, "claude") {
-        return Err(format!(
-            "Native Recall cannot safely launch {}; only Claude has a verified no-tools mode",
-            agent_label(agent_cmd)
-        )
-        .into());
-    }
-    let inner = prepare_claude_chat_invocation(agent_cmd, prompt);
+    let inner = match isolation {
+        RecallChatIsolation::ClaudeApiKey | RecallChatIsolation::ClaudeSubscription => {
+            if !matches_agent_binary(agent_cmd, "claude") {
+                return Err(format!(
+                    "Native Recall cannot use the Claude isolation contract with {}",
+                    agent_label(agent_cmd)
+                )
+                .into());
+            }
+            prepare_claude_chat_invocation(agent_cmd, prompt, isolation)
+        }
+        RecallChatIsolation::CodexSubscription => {
+            if !matches_agent_binary(agent_cmd, "codex") {
+                return Err(format!(
+                    "Native Recall cannot use the Codex isolation contract with {}",
+                    agent_label(agent_cmd)
+                )
+                .into());
+            }
+            prepare_codex_chat_invocation(agent_cmd, prompt, executable_read_roots)?
+        }
+    };
     let mut args = inner.args;
     if stream_json && matches_agent_binary(agent_cmd, "claude") {
         if let Some(pos) = args.iter().position(|a| a == "--output-format") {
@@ -1021,23 +1005,31 @@ pub fn build_chat_invocation(
 /// native security contract is independent of every external MCP runtime.
 const CHAT_MCP_CONFIG: &str = "{\"mcpServers\":{}}";
 
-const CHAT_SYSTEM_PROMPT: &str = "You are answering one message inside the Minutes app's Recall chat panel. This is a fresh, non-interactive, single-shot session with no tools, MCP servers, shell, file access, plugins, hooks, skills, or persistent session. The user message already contains all policy-verified meeting context and recent conversation turns available to you. Ground the answer only in that inline context. If it is insufficient, say so briefly and suggest selecting the relevant meeting. Never request or suggest an include_restricted override. Native Recall receives no screen image. Screen-state metadata is not sight; never claim to see or describe screen pixels.";
+const CHAT_SYSTEM_PROMPT: &str = "You are answering one message inside the Minutes app's Recall chat panel. This is a fresh, non-interactive, single-shot session. Personal configuration, external tools, MCP servers, web access, and access to files outside the empty chat workspace are disabled. Do not invoke tools or inspect files. The user message already contains all policy-verified meeting context and recent conversation turns available to you. Ground the answer only in that inline context. If it is insufficient, say so briefly and suggest selecting the relevant meeting. Never request or suggest an include_restricted override. Native Recall receives no screen image. Screen-state metadata is not sight; never claim to see or describe screen pixels.";
 
 /// Claude-specific chat invocation (see [`build_chat_invocation`] for why
 /// streaming stays separate from the shared lean branch). The strict empty
 /// MCP config blocks user-global servers, and `--tools ""` blocks built-ins.
-fn prepare_claude_chat_invocation(agent_cmd: &str, prompt: &str) -> AgentInvocation {
+fn prepare_claude_chat_invocation(
+    agent_cmd: &str,
+    prompt: &str,
+    isolation: RecallChatIsolation,
+) -> AgentInvocation {
+    let isolation_flag = match isolation {
+        RecallChatIsolation::ClaudeApiKey => "--bare",
+        RecallChatIsolation::ClaudeSubscription => "--safe-mode",
+        RecallChatIsolation::CodexSubscription => unreachable!("Claude invocation contract"),
+    };
     AgentInvocation {
         cmd: agent_cmd.to_string(),
         args: vec![
             "-p".into(),
-            // `--bare` is the only installed Claude mode that skips managed
-            // settings-file hooks as well as user/project plugins and memory.
-            // It deliberately refuses OAuth/keychain auth; Recall would
-            // rather fail locally than expose a meeting prompt to an
-            // enterprise UserPromptSubmit hook. API-key/explicit provider
-            // credentials remain supported by Claude itself.
-            "--bare".into(),
+            // `--bare` is the strongest API-key-only path. Newer Claude Code
+            // builds also provide `--safe-mode`, which keeps subscription auth
+            // while disabling CLAUDE.md, skills, plugins, hooks, MCP servers,
+            // commands, agents, and other customizations. The flags below keep
+            // the shared no-tools/no-settings contract explicit in both modes.
+            isolation_flag.into(),
             "--setting-sources".into(),
             "".into(),
             "--no-session-persistence".into(),
@@ -1059,6 +1051,96 @@ fn prepare_claude_chat_invocation(agent_cmd: &str, prompt: &str) -> AgentInvocat
         stdin_payload: Some(prompt.as_bytes().to_vec()),
         cleanup_path: None,
     }
+}
+
+fn toml_basic_string(value: &str) -> Result<String, Box<dyn std::error::Error>> {
+    // JSON and TOML basic strings share the escaping needed here (quotes,
+    // backslashes, controls, and Unicode). `serde_json` gives us a reviewed
+    // encoder rather than hand-rolling Windows-path escaping.
+    Ok(serde_json::to_string(value)?)
+}
+
+fn codex_recall_permissions_override(
+    executable_read_roots: &[std::path::PathBuf],
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut filesystem_entries = vec![
+        "\":minimal\" = \"read\"".to_string(),
+        "\":root\" = \"deny\"".to_string(),
+        "\":workspace_roots\" = { \".\" = \"read\" }".to_string(),
+    ];
+    for root in executable_read_roots {
+        let root = root.to_str().ok_or("Codex executable path is not UTF-8")?;
+        filesystem_entries.push(format!("{} = \"read\"", toml_basic_string(root)?));
+    }
+    Ok(format!(
+        "permissions.minutes_recall={{ extends = \":read-only\", filesystem = {{ {} }}, network = {{ enabled = false }} }}",
+        filesystem_entries.join(", ")
+    ))
+}
+
+/// Codex has no Claude-style `--tools ""` switch. Its verified Recall path
+/// therefore uses the newer named permissions profile to deny ambient root
+/// reads and expose only the neutral chat workspace. Personal config, project
+/// instructions, rules, plugins, hooks, MCP, memories, web access, and session
+/// persistence are disabled independently so the inline prompt is the only
+/// meeting-bearing input.
+fn prepare_codex_chat_invocation(
+    agent_cmd: &str,
+    prompt: &str,
+    executable_read_roots: &[std::path::PathBuf],
+) -> Result<AgentInvocation, Box<dyn std::error::Error>> {
+    if executable_read_roots.is_empty() {
+        return Err("Codex Recall requires a verified executable read root".into());
+    }
+    let permissions = codex_recall_permissions_override(executable_read_roots)?;
+    let inline_prompt = format!("{CHAT_SYSTEM_PROMPT}\n\n{prompt}");
+    let mut args = vec![
+        "exec".into(),
+        "--strict-config".into(),
+        "--ignore-user-config".into(),
+        "--ignore-rules".into(),
+        "--ephemeral".into(),
+        "--json".into(),
+        "-c".into(),
+        "default_permissions=\"minutes_recall\"".into(),
+        "-c".into(),
+        permissions,
+        "-c".into(),
+        "approval_policy=\"never\"".into(),
+        "-c".into(),
+        "mcp_servers={}".into(),
+        "-c".into(),
+        "web_search=\"disabled\"".into(),
+        "-c".into(),
+        "project_doc_max_bytes=0".into(),
+        "-c".into(),
+        "project_doc_fallback_filenames=[]".into(),
+        "-c".into(),
+        "project_root_markers=[]".into(),
+        "-c".into(),
+        "shell_environment_policy.inherit=\"none\"".into(),
+    ];
+    for feature in [
+        "apps",
+        "plugins",
+        "hooks",
+        "memories",
+        "skill_search",
+        "computer_use",
+        "browser_use",
+        "image_generation",
+    ] {
+        args.push("--disable".into());
+        args.push(feature.into());
+    }
+    args.extend(["--skip-git-repo-check".into(), "-".into()]);
+
+    Ok(AgentInvocation {
+        cmd: agent_cmd.to_string(),
+        args,
+        stdin_payload: Some(inline_prompt.into_bytes()),
+        cleanup_path: None,
+    })
 }
 
 fn write_agent_prompt_file(
@@ -3710,7 +3792,14 @@ PARTICIPANTS:
     fn build_chat_invocation_claude_streams_json_without_mcp_or_tools() {
         // Recall context crosses one fail-closed constructor. Claude must not
         // inherit an external/cached MCP server or any tool while streaming.
-        let inv = build_chat_invocation("claude", "hola", true).unwrap();
+        let inv = build_chat_invocation(
+            "claude",
+            "hola",
+            true,
+            RecallChatIsolation::ClaudeApiKey,
+            &[],
+        )
+        .unwrap();
         assert_eq!(inv.cmd, "claude");
         // Strictly empty MCP configuration, regardless of user-global config.
         assert!(inv.args.iter().any(|a| a == "--strict-mcp-config"));
@@ -3759,7 +3848,14 @@ PARTICIPANTS:
 
     #[test]
     fn build_chat_invocation_claude_without_stream_uses_text() {
-        let inv = build_chat_invocation("claude", "hola", false).unwrap();
+        let inv = build_chat_invocation(
+            "claude",
+            "hola",
+            false,
+            RecallChatIsolation::ClaudeApiKey,
+            &[],
+        )
+        .unwrap();
         assert!(inv
             .args
             .windows(2)
@@ -3769,13 +3865,115 @@ PARTICIPANTS:
     }
 
     #[test]
-    fn build_chat_invocation_rejects_unverified_agent_clis() {
-        for agent in ["codex", "gemini", "opencode", "pi"] {
-            let error = build_chat_invocation(agent, "hola", false)
-                .err()
-                .expect("unverified Recall CLI must fail closed");
-            assert!(error.to_string().contains("verified no-tools mode"));
+    fn build_chat_invocation_claude_subscription_uses_safe_mode() {
+        let inv = build_chat_invocation(
+            "claude",
+            "hola",
+            true,
+            RecallChatIsolation::ClaudeSubscription,
+            &[],
+        )
+        .unwrap();
+        assert!(inv.args.iter().any(|arg| arg == "--safe-mode"));
+        assert!(!inv.args.iter().any(|arg| arg == "--bare"));
+        assert!(inv
+            .args
+            .windows(2)
+            .any(|args| args[0] == "--tools" && args[1].is_empty()));
+        assert!(inv
+            .args
+            .windows(2)
+            .any(|args| args[0] == "--setting-sources" && args[1].is_empty()));
+    }
+
+    #[test]
+    fn build_chat_invocation_codex_denies_ambient_context() {
+        let root = std::path::PathBuf::from(r#"C:\Program Files\Codex "Preview""#);
+        let inv = build_chat_invocation(
+            "codex",
+            "hola",
+            true,
+            RecallChatIsolation::CodexSubscription,
+            std::slice::from_ref(&root),
+        )
+        .unwrap();
+        assert_eq!(inv.args.first().map(String::as_str), Some("exec"));
+        for required in [
+            "--strict-config",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--ephemeral",
+            "--json",
+            "--skip-git-repo-check",
+        ] {
+            assert!(inv.args.iter().any(|arg| arg == required));
         }
+        for setting in [
+            "default_permissions=\"minutes_recall\"",
+            "approval_policy=\"never\"",
+            "mcp_servers={}",
+            "web_search=\"disabled\"",
+            "project_doc_max_bytes=0",
+            "project_doc_fallback_filenames=[]",
+            "project_root_markers=[]",
+            "shell_environment_policy.inherit=\"none\"",
+        ] {
+            assert!(inv.args.iter().any(|arg| arg == setting), "{setting}");
+        }
+        let permission_override = inv
+            .args
+            .iter()
+            .find(|arg| arg.starts_with("permissions.minutes_recall="))
+            .expect("restricted permission profile");
+        assert!(permission_override.contains("\":root\" = \"deny\""));
+        assert!(permission_override.contains("\":workspace_roots\""));
+        assert!(permission_override.contains(r#"C:\\Program Files\\Codex \"Preview\""#));
+        for disabled in [
+            "apps",
+            "plugins",
+            "hooks",
+            "memories",
+            "skill_search",
+            "computer_use",
+            "browser_use",
+            "image_generation",
+        ] {
+            assert!(inv
+                .args
+                .windows(2)
+                .any(|args| args[0] == "--disable" && args[1] == disabled));
+        }
+        let payload = String::from_utf8(inv.stdin_payload.unwrap()).unwrap();
+        assert!(payload.contains("policy-verified meeting context"));
+        assert!(payload.ends_with("hola"));
+    }
+
+    #[test]
+    fn build_chat_invocation_rejects_mismatched_isolation_contracts() {
+        assert!(build_chat_invocation(
+            "codex",
+            "hola",
+            false,
+            RecallChatIsolation::ClaudeSubscription,
+            &[],
+        )
+        .is_err());
+        assert!(build_chat_invocation(
+            "claude",
+            "hola",
+            false,
+            RecallChatIsolation::CodexSubscription,
+            &[std::path::PathBuf::from("/tmp/claude")],
+        )
+        .is_err());
+        assert!(build_chat_invocation(
+            "codex",
+            "hola",
+            false,
+            RecallChatIsolation::CodexSubscription,
+            &[],
+        )
+        .is_err());
     }
 
     #[test]

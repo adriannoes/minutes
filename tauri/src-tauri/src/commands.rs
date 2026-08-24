@@ -9685,8 +9685,23 @@ pub struct RecallChatReadiness {
     terminal_available: bool,
     terminal_authenticated: bool,
     recommended_mode: &'static str,
-    provider: &'static str,
-    message: &'static str,
+    provider: String,
+    assistant_name: String,
+    message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecallNativeCliKind {
+    ClaudeApiKey,
+    ClaudeSubscription,
+    CodexSubscription,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecallNativeCli {
+    kind: RecallNativeCliKind,
+    path: PathBuf,
+    executable_read_roots: Vec<PathBuf>,
 }
 
 fn recall_local_endpoint_reachable(raw: &str) -> bool {
@@ -9710,22 +9725,22 @@ fn recall_local_endpoint_reachable(raw: &str) -> bool {
 fn recall_native_readiness_decision(
     engine: &str,
     local_endpoint_reachable: bool,
-    claude_cli_available: bool,
-    anthropic_api_key_set: bool,
-) -> (bool, &'static str, &'static str) {
+    assistant_name: &str,
+    native_cli: Option<RecallNativeCliKind>,
+) -> (bool, String, String) {
     match engine {
         "ollama" => {
             if local_endpoint_reachable {
                 (
                     true,
-                    "ollama",
-                    "Using the configured local Ollama provider in isolated Native chat.",
+                    "ollama".into(),
+                    "Using your local Ollama model in private Chat.".into(),
                 )
             } else {
                 (
                     false,
-                    "local-unavailable",
-                    "The configured local Ollama provider is not reachable, so Recall opened Terminal chat without reading the meeting.",
+                    "local-unavailable".into(),
+                    "Your local Ollama model is not reachable. Minutes opened your assistant in Terminal without reading the meeting.".into(),
                 )
             }
         }
@@ -9733,26 +9748,38 @@ fn recall_native_readiness_decision(
             if local_endpoint_reachable {
                 (
                     true,
-                    "openai-compatible",
-                    "Using the configured local model in isolated Native chat.",
+                    "openai-compatible".into(),
+                    "Using your configured local model in private Chat.".into(),
                 )
             } else {
                 (
                     false,
-                    "local-unavailable",
-                    "The configured local model is not reachable, so Recall opened Terminal chat without reading the meeting.",
+                    "local-unavailable".into(),
+                    "Your configured local model is not reachable. Minutes opened your assistant in Terminal without reading the meeting.".into(),
                 )
             }
         }
-        _ if claude_cli_available && anthropic_api_key_set => (
+        _ if native_cli == Some(RecallNativeCliKind::ClaudeApiKey) => (
             true,
-            "claude-api-key",
-            "Claude is configured for isolated Native chat with the app's explicit API key. The key will be verified when you send a question.",
+            "claude-api-key".into(),
+            "Using Claude in private Chat. The configured API key will be verified when you send a question.".into(),
+        ),
+        _ if native_cli == Some(RecallNativeCliKind::ClaudeSubscription) => (
+            true,
+            "claude-subscription".into(),
+            "Using your Claude subscription in private Chat.".into(),
+        ),
+        _ if native_cli == Some(RecallNativeCliKind::CodexSubscription) => (
+            true,
+            "codex-subscription".into(),
+            "Using your Codex subscription in private Chat.".into(),
         ),
         _ => (
             false,
-            "claude-subscription",
-            "Claude subscriptions open in Terminal chat so Native chat never inherits hooks, plugins, or account settings.",
+            "terminal-only".into(),
+            format!(
+                "{assistant_name} is available in Terminal. Private Chat is not available for this assistant yet."
+            ),
         ),
     }
 }
@@ -9762,6 +9789,96 @@ fn command_is_claude(command: &str) -> bool {
         .file_stem()
         .and_then(|stem| stem.to_str())
         .is_some_and(|stem| stem.eq_ignore_ascii_case("claude"))
+}
+
+fn command_is_codex(command: &str) -> bool {
+    Path::new(command)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("codex"))
+}
+
+fn assistant_display_name(command: &str) -> String {
+    let stem = Path::new(command)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or(command)
+        .trim()
+        .to_ascii_lowercase();
+    match stem.as_str() {
+        "claude" => "Claude".into(),
+        "codex" => "Codex".into(),
+        "gemini" => "Gemini".into(),
+        "opencode" => "OpenCode".into(),
+        "pi" => "Pi".into(),
+        "agent" => "Cursor Agent".into(),
+        _ if stem.is_empty() => "Your assistant".into(),
+        _ => stem
+            .split(['-', '_'])
+            .filter(|part| !part.is_empty())
+            .map(|part| {
+                let mut chars = part.chars();
+                chars
+                    .next()
+                    .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
+fn recall_agent_command(agent_bin: &str) -> Command {
+    #[cfg(target_os = "windows")]
+    {
+        let ext = Path::new(agent_bin)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if ext == "cmd" || ext == "bat" {
+            let mut command = Command::new("cmd");
+            command.arg("/C").arg(agent_bin);
+            return command;
+        }
+    }
+    Command::new(agent_bin)
+}
+
+fn recall_agent_probe(
+    agent_bin: &str,
+    args: &[&str],
+    cwd: Option<&Path>,
+) -> Option<std::process::Output> {
+    let mut command = recall_agent_command(agent_bin);
+    for (name, value) in crate::pty::assistant_process_environment() {
+        command.env(name, value);
+    }
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    let mut child = command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
 }
 
 fn claude_auth_status_is_logged_in(stdout: &[u8]) -> bool {
@@ -9776,69 +9893,208 @@ fn claude_auth_status_is_logged_in(stdout: &[u8]) -> bool {
 }
 
 fn claude_terminal_is_authenticated(agent_bin: &str, cwd: Option<&Path>) -> bool {
-    #[cfg(target_os = "windows")]
-    let mut command = {
-        let ext = Path::new(agent_bin)
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        if ext == "cmd" || ext == "bat" {
-            let mut command = Command::new("cmd");
-            command.arg("/C").arg(agent_bin);
-            command
-        } else {
-            Command::new(agent_bin)
-        }
+    recall_agent_probe(agent_bin, &["auth", "status", "--json"], cwd).is_some_and(|output| {
+        output.status.success() && claude_auth_status_is_logged_in(&output.stdout)
+    })
+}
+
+fn claude_safe_mode_help_has_isolation_contract(help: &str) -> bool {
+    let help = help.to_ascii_lowercase();
+    [
+        "--safe-mode",
+        "--setting-sources",
+        "--tools",
+        "hooks",
+        "mcp servers",
+        "disabled",
+        "auth",
+    ]
+    .iter()
+    .all(|required| help.contains(required))
+}
+
+fn claude_safe_mode_is_available(agent_bin: &str) -> bool {
+    recall_agent_probe(agent_bin, &["--help"], None).is_some_and(|output| {
+        let help = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.status.success() && claude_safe_mode_help_has_isolation_contract(&help)
+    })
+}
+
+fn claude_bare_mode_is_available(agent_bin: &str) -> bool {
+    recall_agent_probe(agent_bin, &["--help"], None).is_some_and(|output| {
+        let help = String::from_utf8_lossy(&output.stdout);
+        output.status.success()
+            && help.contains("--bare")
+            && help.contains("--setting-sources")
+            && help.contains("--tools")
+    })
+}
+
+fn codex_auth_status_is_logged_in(stdout: &[u8], stderr: &[u8]) -> bool {
+    let stdout = String::from_utf8_lossy(stdout);
+    let stderr = String::from_utf8_lossy(stderr);
+    stdout
+        .lines()
+        .chain(stderr.lines())
+        .map(|line| line.trim().to_ascii_lowercase())
+        .any(|line| line == "logged in" || line.starts_with("logged in using "))
+}
+
+fn codex_terminal_is_authenticated(agent_bin: &str, cwd: Option<&Path>) -> bool {
+    recall_agent_probe(agent_bin, &["login", "status"], cwd).is_some_and(|output| {
+        output.status.success() && codex_auth_status_is_logged_in(&output.stdout, &output.stderr)
+    })
+}
+
+fn codex_recall_contract_is_available(agent_bin: &str) -> bool {
+    if !cfg!(unix) {
+        return false;
+    }
+    let Some(version) = recall_agent_probe(agent_bin, &["--version"], None) else {
+        return false;
     };
-
-    #[cfg(not(target_os = "windows"))]
-    let mut command = Command::new(agent_bin);
-
-    for (name, value) in crate::pty::assistant_process_environment() {
-        command.env(name, value);
+    let version = String::from_utf8_lossy(&version.stdout);
+    let known_release = version.split_whitespace().find_map(|field| {
+        let mut parts = field.split('.');
+        Some((
+            parts.next()?.parse::<u64>().ok()?,
+            parts.next()?.parse::<u64>().ok()?,
+        ))
+    }) == Some((0, 149));
+    if !known_release {
+        return false;
     }
-    if let Some(cwd) = cwd {
-        command.current_dir(cwd);
-    }
+    recall_agent_probe(agent_bin, &["exec", "--help"], None).is_some_and(|output| {
+        let help = String::from_utf8_lossy(&output.stdout);
+        output.status.success()
+            && [
+                "--strict-config",
+                "--ignore-user-config",
+                "--ignore-rules",
+                "--ephemeral",
+                "--json",
+            ]
+            .iter()
+            .all(|flag| help.contains(flag))
+    })
+}
 
-    let mut child = match command
-        .args(["auth", "status", "--json"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
+fn codex_executable_read_roots(agent_bin: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(parent) = agent_bin.parent() {
+        roots.push(parent.to_path_buf());
+    }
+    let canonical = agent_bin
+        .canonicalize()
+        .unwrap_or_else(|_| agent_bin.to_path_buf());
+    if let Some(parent) = canonical.parent() {
+        if !roots.iter().any(|root| root == parent) {
+            roots.push(parent.to_path_buf());
+        }
+    }
+    for ancestor in canonical.ancestors() {
+        let name = ancestor.file_name().and_then(|value| value.to_str());
+        let parent_name = ancestor
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|value| value.to_str());
+        if name == Some("codex") && parent_name == Some("@openai") {
+            if !roots.iter().any(|root| root == ancestor) {
+                roots.push(ancestor.to_path_buf());
+            }
+            break;
+        }
+        if parent_name == Some("codex")
+            && ancestor
+                .parent()
+                .and_then(Path::parent)
+                .and_then(Path::file_name)
+                .and_then(|value| value.to_str())
+                == Some("Caskroom")
+        {
+            if !roots.iter().any(|root| root == ancestor) {
+                roots.push(ancestor.to_path_buf());
+            }
+            break;
+        }
+    }
+    roots
+}
+
+fn recall_chat_cwd() -> PathBuf {
+    let workspace = crate::context::workspace_dir();
+    workspace
+        .parent()
+        .map(|parent| parent.join("chat"))
+        .unwrap_or(workspace)
+}
+
+fn prepare_recall_chat_cwd() -> Result<PathBuf, String> {
+    let chat_cwd = recall_chat_cwd();
+    std::fs::create_dir_all(&chat_cwd)
+        .map_err(|error| format!("Minutes could not prepare private Chat: {error}"))?;
+    for instruction_file in ["CLAUDE.md", "AGENTS.md"] {
+        match std::fs::remove_file(chat_cwd.join(instruction_file)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "Minutes could not clear private Chat instructions: {error}"
+                ));
+            }
+        }
+    }
+    Ok(chat_cwd)
+}
+
+fn configured_recall_native_cli(config: &Config, chat_cwd: &Path) -> Option<RecallNativeCli> {
+    let agent = resolve_agent_binary(config.assistant.agent.trim()).ok()?;
+    let command = agent.to_string_lossy();
+    if command_is_claude(&command) {
+        let api_key_set =
+            std::env::var("ANTHROPIC_API_KEY").is_ok_and(|value| !value.trim().is_empty());
+        if api_key_set && claude_bare_mode_is_available(&command) {
+            return Some(RecallNativeCli {
+                kind: RecallNativeCliKind::ClaudeApiKey,
+                path: agent,
+                executable_read_roots: Vec::new(),
+            });
+        }
+        if claude_safe_mode_is_available(&command)
+            && claude_terminal_is_authenticated(&command, Some(chat_cwd))
+        {
+            return Some(RecallNativeCli {
+                kind: RecallNativeCliKind::ClaudeSubscription,
+                path: agent,
+                executable_read_roots: Vec::new(),
+            });
+        }
+    } else if command_is_codex(&command)
+        && codex_recall_contract_is_available(&command)
+        && codex_terminal_is_authenticated(&command, Some(chat_cwd))
     {
-        Ok(child) => child,
-        Err(_) => return false,
-    };
-
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                return child.wait_with_output().ok().is_some_and(|output| {
-                    output.status.success() && claude_auth_status_is_logged_in(&output.stdout)
-                });
-            }
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            Ok(None) | Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return false;
-            }
+        let executable_read_roots = codex_executable_read_roots(&agent);
+        if !executable_read_roots.is_empty() {
+            return Some(RecallNativeCli {
+                kind: RecallNativeCliKind::CodexSubscription,
+                path: agent,
+                executable_read_roots,
+            });
         }
     }
+    None
 }
 
 /// Decide which Recall surface can actually answer before any meeting is read.
 ///
-/// Subscription-backed Claude is intentionally routed to the interactive PTY:
-/// `claude --bare` cannot read OAuth/keychain state, while modes that can read
-/// it also admit managed settings. A local provider or explicit API key stays
-/// in Native chat under its existing no-tools/no-settings contract.
+/// Local providers and verified subscription CLI isolation contracts open the
+/// simple Chat surface. Every other configured assistant stays in Terminal,
+/// and the frontend hides the unavailable Chat toggle rather than advertising
+/// a setup path the user cannot complete from the panel.
 fn recall_chat_readiness() -> RecallChatReadiness {
     let Ok(config) = Config::load_strict() else {
         return RecallChatReadiness {
@@ -9846,9 +10102,11 @@ fn recall_chat_readiness() -> RecallChatReadiness {
             terminal_available: false,
             terminal_authenticated: false,
             recommended_mode: "terminal",
-            provider: "unavailable",
+            provider: "unavailable".into(),
+            assistant_name: "Your assistant".into(),
             message:
-                "Minutes could not verify its provider configuration. No meeting context was read.",
+                "Minutes could not verify its provider configuration. No meeting context was read."
+                    .into(),
         };
     };
     let engine = config.summarization.engine.as_str();
@@ -9864,14 +10122,20 @@ fn recall_chat_readiness() -> RecallChatReadiness {
         }
         _ => false,
     };
-    let claude_cli = minutes_core::summarize::detect_recall_chat_cli();
-    let anthropic_api_key_set =
-        std::env::var("ANTHROPIC_API_KEY").is_ok_and(|value| !value.trim().is_empty());
+    let native_cli = if matches!(engine, "ollama" | "openai-compatible" | "openai_compatible") {
+        None
+    } else {
+        prepare_recall_chat_cwd()
+            .ok()
+            .as_deref()
+            .and_then(|chat_cwd| configured_recall_native_cli(&config, chat_cwd))
+    };
+    let assistant_name = assistant_display_name(&config.assistant.agent);
     let (native_available, provider, message) = recall_native_readiness_decision(
         engine,
         local_endpoint_reachable,
-        claude_cli.is_some(),
-        anthropic_api_key_set,
+        &assistant_name,
+        native_cli.as_ref().map(|provider| provider.kind),
     );
 
     let assistant_agent = config.assistant.agent.trim();
@@ -9879,7 +10143,13 @@ fn recall_chat_readiness() -> RecallChatReadiness {
     let terminal_available = terminal_agent.is_some();
     let terminal_authenticated = terminal_agent.as_ref().is_some_and(|path| {
         let command = path.to_string_lossy();
-        !command_is_claude(&command) || claude_terminal_is_authenticated(&command, None)
+        if command_is_claude(&command) {
+            claude_terminal_is_authenticated(&command, None)
+        } else if command_is_codex(&command) {
+            codex_terminal_is_authenticated(&command, None)
+        } else {
+            true
+        }
     });
 
     RecallChatReadiness {
@@ -9892,6 +10162,7 @@ fn recall_chat_readiness() -> RecallChatReadiness {
             "terminal"
         },
         provider,
+        assistant_name,
         message,
     }
 }
@@ -9905,8 +10176,10 @@ pub async fn cmd_recall_chat_readiness() -> RecallChatReadiness {
             terminal_available: false,
             terminal_authenticated: false,
             recommended_mode: "terminal",
-            provider: "unavailable",
-            message: "Minutes could not verify an isolated provider. No meeting context was read.",
+            provider: "unavailable".into(),
+            assistant_name: "Your assistant".into(),
+            message: "Minutes could not verify an isolated provider. No meeting context was read."
+                .into(),
         })
 }
 
@@ -10161,12 +10434,17 @@ fn reauthorize_recall_openai_compatible_egress(
     reauthorize_recall_sources(sources, config)
 }
 
-fn reauthorize_recall_claude_egress(
+fn reauthorize_recall_cli_egress(
     expected_engine: &str,
+    expected_cli: &RecallNativeCli,
     sources: &[RecallSourceBinding],
     config: &Config,
+    chat_cwd: &Path,
 ) -> Result<(), String> {
-    if config.summarization.engine != expected_engine || config.summarization.engine == "ollama" {
+    if config.summarization.engine != expected_engine
+        || config.summarization.engine == "ollama"
+        || configured_recall_native_cli(config, chat_cwd).as_ref() != Some(expected_cli)
+    {
         return Err("Recall provider changed before use.".into());
     }
     reauthorize_recall_sources(sources, config)
@@ -10686,8 +10964,7 @@ fn recall_chat_stream_completed(
 
 const RECALL_NATIVE_AUTH_GUIDANCE: &str =
     "Claude rejected Native chat API-key authentication. Check or remove ANTHROPIC_API_KEY. \
-     To use a Claude subscription, switch to Terminal mode with the keyboard button and run \
-     /login there. No answer was saved.";
+     After removing it, a signed-in Claude subscription can use private Chat. No answer was saved.";
 
 const RECALL_NATIVE_SLASH_GUIDANCE: &str =
     "Slash commands are interactive agent commands and do not run in native chat. Switch to \
@@ -10720,6 +10997,39 @@ fn recall_claude_frame_is_auth_failure(frame: &serde_json::Value) -> bool {
         || result.contains("authentication failed")
         || result.contains("authentication error")
         || result.contains("unauthorized")
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RecallCodexFrame<'a> {
+    AgentMessage(&'a str),
+    TurnCompleted,
+    Failure,
+    Ignore,
+}
+
+/// Interpret only the stable JSONL events Recall needs from `codex exec`.
+/// Tool traces and progress frames are ignored. A turn is usable only after a
+/// terminal success frame, and any explicit error fails the whole turn closed.
+fn recall_codex_frame(frame: &serde_json::Value) -> RecallCodexFrame<'_> {
+    match frame.get("type").and_then(|value| value.as_str()) {
+        Some("item.completed") => {
+            let Some(item) = frame.get("item") else {
+                return RecallCodexFrame::Ignore;
+            };
+            match item.get("type").and_then(|value| value.as_str()) {
+                Some("agent_message") => item
+                    .get("text")
+                    .and_then(|value| value.as_str())
+                    .map(RecallCodexFrame::AgentMessage)
+                    .unwrap_or(RecallCodexFrame::Failure),
+                Some("error") => RecallCodexFrame::Failure,
+                _ => RecallCodexFrame::Ignore,
+            }
+        }
+        Some("turn.completed") => RecallCodexFrame::TurnCompleted,
+        Some("turn.failed") | Some("error") => RecallCodexFrame::Failure,
+        _ => RecallCodexFrame::Ignore,
+    }
 }
 
 /// Reap the child and report how it exited.
@@ -10769,11 +11079,10 @@ fn cancel_recall_chat_turn(current_turn: &Arc<Mutex<Option<RecallChatTurn>>>) ->
 ///
 /// Provider priority:
 ///   1. `config.summarization.engine == "ollama"` — HTTP to Ollama (localhost:11434)
-///   2. hardened Claude CLI — stream-json with empty settings, MCP, and tools
-///   3. Nothing found — descriptive error returned to frontend, pointing the
-///      user at installing Claude Code. Minutes intentionally has no direct
-///      cloud-API fallback for chat: no-API-key-required is core to the
-///      product, so an installed agent CLI (or Ollama) is the only path.
+///   2. loopback OpenAI-compatible provider — for LM Studio and similar apps
+///   3. verified Claude or Codex subscription CLI isolation contract
+///   4. Nothing verified — fail before reading meeting context and keep the
+///      configured assistant in Terminal.
 ///
 /// Before invoking the AI, context is injected in two layers (capped at
 /// 12 000 chars total): (1) the full content of the meeting currently
@@ -10808,15 +11117,23 @@ pub async fn cmd_recall_chat_send(
     // tools, MCP, plugins, hooks, and session persistence. Remove the obsolete
     // chat memory file written by older builds so the on-disk contract is honest
     // even though the hardened launch would ignore it.
-    let chat_cwd = workspace
-        .parent()
-        .map(|p| p.join("chat"))
-        .unwrap_or_else(|| workspace.clone());
-    let _ = std::fs::create_dir_all(&chat_cwd);
-    let _ = std::fs::remove_file(chat_cwd.join("CLAUDE.md"));
+    let chat_cwd = prepare_recall_chat_cwd()?;
+
+    // Resolve and authenticate the exact native provider before reading any
+    // meeting. Local engines are reauthorized in their own branches below;
+    // agent engines must prove a supported isolation contract up front.
+    let config = Config::load_strict()?;
+    let engine = config.summarization.engine.as_str();
+    let native_cli = if matches!(engine, "ollama" | "openai-compatible" | "openai_compatible") {
+        None
+    } else {
+        Some(configured_recall_native_cli(&config, &chat_cwd).ok_or_else(|| {
+            "Private Chat is not ready for the configured assistant. Continue in Terminal; no meeting context was read."
+                .to_string()
+        })?)
+    };
 
     // ── Step 1: inject meeting context ────────────────────────────────────────
-    let config = Config::load_strict()?;
     let safe_context = collect_recall_agent_safe_context(&message, &config)?;
     let screen_context = current_screen_context_prompt();
     let enriched_message = format!(
@@ -11306,36 +11623,45 @@ pub async fn cmd_recall_chat_send(
     }
 
     // ── CLI agent path ─────────────────────────────────────────────────────────
-    let agent_bin = minutes_core::summarize::detect_recall_chat_cli().ok_or_else(|| {
-        "No safely isolated AI provider found for Recall chat. Install Claude Code (npm install -g \
-         @anthropic-ai/claude-code), or configure a local model in config.toml: \
-         [summarization] engine = \"ollama\", or engine = \"openai-compatible\" with \
-         openai_compatible_base_url pointing at a loopback server such as LM Studio \
-         (http://localhost:1234/v1). Both are fully local and loopback-only. \
-         Other agent CLIs stay disabled until their no-tools mode is verified."
+    let native_cli = native_cli.ok_or_else(|| {
+        "Private Chat is not ready for the configured assistant. Continue in Terminal; no meeting context was read."
             .to_string()
     })?;
-
-    let is_claude_cli = std::path::Path::new(&agent_bin)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .map(|s| s.eq_ignore_ascii_case("claude"))
-        .unwrap_or(false);
-    if !is_claude_cli {
-        return Err("Native Recall refused an unverified agent CLI.".into());
-    }
+    let agent_bin = native_cli.path.to_string_lossy().into_owned();
+    let is_claude_cli = matches!(
+        native_cli.kind,
+        RecallNativeCliKind::ClaudeApiKey | RecallNativeCliKind::ClaudeSubscription
+    );
+    let is_codex_cli = native_cli.kind == RecallNativeCliKind::CodexSubscription;
 
     let history_arc = state.recall_chat_history.clone();
     let message_clone = message.clone();
     let expected_engine = config.summarization.engine.clone();
 
-    if is_claude_cli {
-        // Claude CLI: incremental stream-json output, prompt via stdin, with
-        // empty settings sources, MCP, and tools. Passing the prompt on stdin
-        // also avoids the Windows command-line length limit on long transcripts.
-        let invocation =
-            minutes_core::summarize::build_chat_invocation(&agent_bin, &full_prompt, true)
-                .map_err(|e| format!("Failed to prepare claude invocation: {}", e))?;
+    if is_claude_cli || is_codex_cli {
+        // Both verified CLI paths receive the prompt on stdin. Claude streams
+        // token deltas with every customization and tool disabled. Codex uses
+        // an ephemeral restricted permission profile whose only readable user
+        // directory is this neutral chat workspace.
+        let isolation = match native_cli.kind {
+            RecallNativeCliKind::ClaudeApiKey => {
+                minutes_core::summarize::RecallChatIsolation::ClaudeApiKey
+            }
+            RecallNativeCliKind::ClaudeSubscription => {
+                minutes_core::summarize::RecallChatIsolation::ClaudeSubscription
+            }
+            RecallNativeCliKind::CodexSubscription => {
+                minutes_core::summarize::RecallChatIsolation::CodexSubscription
+            }
+        };
+        let invocation = minutes_core::summarize::build_chat_invocation(
+            &agent_bin,
+            &full_prompt,
+            true,
+            isolation,
+            &native_cli.executable_read_roots,
+        )
+        .map_err(|e| format!("Failed to prepare private chat invocation: {e}"))?;
         let args = invocation.args.clone();
 
         #[cfg(target_os = "windows")]
@@ -11376,8 +11702,14 @@ pub async fn cmd_recall_chat_send(
             "Recall context could not be reauthorized safely. The conversation was cleared; retry the question."
                 .to_string()
         })?;
-        if reauthorize_recall_claude_egress(&expected_engine, &egress_sources, &fresh_config)
-            .is_err()
+        if reauthorize_recall_cli_egress(
+            &expected_engine,
+            &native_cli,
+            &egress_sources,
+            &fresh_config,
+            &chat_cwd,
+        )
+        .is_err()
         {
             state.recall_chat_history.lock().unwrap().clear();
             return Err(
@@ -11431,7 +11763,7 @@ pub async fn cmd_recall_chat_send(
                         reported_error = true;
                     }
                 }
-                if !stderr_cancelled.load(Ordering::Relaxed) && reported_error {
+                if !is_codex_cli && !stderr_cancelled.load(Ordering::Relaxed) && reported_error {
                     app_stderr
                         .emit_to(
                             "main",
@@ -11451,6 +11783,8 @@ pub async fn cmd_recall_chat_send(
             let mut full_response = String::new();
             let mut stream_failed = false;
             let mut auth_failed = false;
+            let mut codex_last_response = String::new();
+            let mut codex_saw_terminator = false;
             for line_result in reader.lines() {
                 if cancelled.load(Ordering::Relaxed) {
                     break;
@@ -11466,6 +11800,23 @@ pub async fn cmd_recall_chat_send(
                             break;
                         }
                         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
+                            if is_codex_cli {
+                                match recall_codex_frame(&json) {
+                                    RecallCodexFrame::AgentMessage(text) => {
+                                        codex_last_response.clear();
+                                        codex_last_response.push_str(text);
+                                    }
+                                    RecallCodexFrame::TurnCompleted => {
+                                        codex_saw_terminator = true;
+                                    }
+                                    RecallCodexFrame::Failure => {
+                                        stream_failed = true;
+                                        break;
+                                    }
+                                    RecallCodexFrame::Ignore => {}
+                                }
+                                continue;
+                            }
                             if recall_claude_frame_is_auth_failure(&json) {
                                 auth_failed = true;
                                 continue;
@@ -11499,6 +11850,19 @@ pub async fn cmd_recall_chat_send(
                 }
             }
             let truncated = limited.limit() == 0;
+            if is_codex_cli && !stream_failed && !truncated {
+                if codex_saw_terminator && !codex_last_response.trim().is_empty() {
+                    full_response = codex_last_response;
+                    app.emit_to(
+                        "main",
+                        "recall-chat-chunk",
+                        serde_json::json!({"type": "text", "text": &full_response}),
+                    )
+                    .ok();
+                } else {
+                    stream_failed = true;
+                }
+            }
             let read_broke = stream_failed || truncated;
 
             // Stopping early leaves the child writing into a pipe nobody
@@ -13304,24 +13668,86 @@ mod tests {
     }
 
     #[test]
-    fn recall_readiness_routes_subscription_auth_to_terminal() {
+    fn native_recall_collects_only_completed_codex_answers() {
+        let message = serde_json::json!({
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": "The answer"}
+        });
+        let completed = serde_json::json!({"type": "turn.completed"});
+        let progress = serde_json::json!({
+            "type": "item.started",
+            "item": {"type": "command_execution"}
+        });
+
+        assert_eq!(
+            recall_codex_frame(&message),
+            RecallCodexFrame::AgentMessage("The answer")
+        );
+        assert_eq!(
+            recall_codex_frame(&completed),
+            RecallCodexFrame::TurnCompleted
+        );
+        assert_eq!(recall_codex_frame(&progress), RecallCodexFrame::Ignore);
+    }
+
+    #[test]
+    fn native_recall_fails_closed_on_codex_error_frames() {
+        for frame in [
+            serde_json::json!({"type": "turn.failed", "error": {"message": "nope"}}),
+            serde_json::json!({"type": "error", "message": "nope"}),
+            serde_json::json!({
+                "type": "item.completed",
+                "item": {"type": "error", "message": "nope"}
+            }),
+            serde_json::json!({
+                "type": "item.completed",
+                "item": {"type": "agent_message"}
+            }),
+        ] {
+            assert_eq!(recall_codex_frame(&frame), RecallCodexFrame::Failure);
+        }
+    }
+
+    #[test]
+    fn recall_readiness_routes_unsupported_assistant_to_honest_terminal() {
         let (native, provider, message) =
-            recall_native_readiness_decision("agent", false, true, false);
+            recall_native_readiness_decision("agent", false, "Gemini", None);
         assert!(!native);
-        assert_eq!(provider, "claude-subscription");
-        assert!(message.contains("Terminal chat"));
-        assert!(message.contains("hooks"));
+        assert_eq!(provider, "terminal-only");
+        assert!(message.contains("Gemini"));
+        assert!(message.contains("Terminal"));
+        assert!(!message.contains("Claude"));
     }
 
     #[test]
     fn recall_readiness_keeps_isolated_native_providers_native() {
-        assert!(recall_native_readiness_decision("ollama", true, false, false).0);
-        assert!(recall_native_readiness_decision("openai-compatible", true, false, false).0);
-        let api_key = recall_native_readiness_decision("agent", false, true, true);
+        assert!(recall_native_readiness_decision("ollama", true, "Codex", None).0);
+        assert!(recall_native_readiness_decision("openai-compatible", true, "Codex", None).0);
+        let api_key = recall_native_readiness_decision(
+            "agent",
+            false,
+            "Claude",
+            Some(RecallNativeCliKind::ClaudeApiKey),
+        );
         assert!(api_key.0);
         assert!(api_key.2.contains("verified when you send a question"));
-        assert!(!recall_native_readiness_decision("ollama", false, true, false).0);
-        assert!(!recall_native_readiness_decision("ollama", false, true, true).0);
+        let claude_subscription = recall_native_readiness_decision(
+            "agent",
+            false,
+            "Claude",
+            Some(RecallNativeCliKind::ClaudeSubscription),
+        );
+        assert!(claude_subscription.0);
+        assert!(claude_subscription.2.contains("Claude subscription"));
+        let codex_subscription = recall_native_readiness_decision(
+            "agent",
+            false,
+            "Codex",
+            Some(RecallNativeCliKind::CodexSubscription),
+        );
+        assert!(codex_subscription.0);
+        assert!(codex_subscription.2.contains("Codex subscription"));
+        assert!(!recall_native_readiness_decision("ollama", false, "Codex", None).0);
     }
 
     #[test]
@@ -13343,6 +13769,15 @@ mod tests {
     }
 
     #[test]
+    fn recall_ui_hides_unavailable_chat_and_uses_the_configured_assistant_name() {
+        let html = include_str!("../../src/index.html");
+        assert!(html.contains("modeToggleBtn.hidden = !nativeAvailable"));
+        assert!(html.contains("readiness.assistantName"));
+        assert!(html.contains("Use Terminal instead"));
+        assert!(!html.contains("Claude subscriptions open in Terminal"));
+    }
+
+    #[test]
     fn claude_auth_status_requires_explicit_logged_in_true() {
         assert!(command_is_claude("/usr/local/bin/claude"));
         assert!(command_is_claude("claude.cmd"));
@@ -13354,6 +13789,26 @@ mod tests {
             br#"{"loggedIn":false,"authMethod":"none"}"#
         ));
         assert!(!claude_auth_status_is_logged_in(b"not json"));
+    }
+
+    #[test]
+    fn claude_safe_mode_requires_help_to_state_the_isolation_contract() {
+        let verified = "--safe-mode Start with all customizations including hooks and MCP servers disabled. Auth works normally. --setting-sources --tools";
+        assert!(claude_safe_mode_help_has_isolation_contract(verified));
+        assert!(!claude_safe_mode_help_has_isolation_contract(
+            "--safe-mode --setting-sources --tools Auth works normally"
+        ));
+    }
+
+    #[test]
+    fn codex_auth_status_accepts_its_stderr_success_message_only() {
+        assert!(codex_auth_status_is_logged_in(
+            b"",
+            b"Logged in using ChatGPT\n"
+        ));
+        assert!(codex_auth_status_is_logged_in(b"Logged in\n", b""));
+        assert!(!codex_auth_status_is_logged_in(b"", b"Not logged in\n"));
+        assert!(!codex_auth_status_is_logged_in(b"", b"You must log in\n"));
     }
 
     /// The storage rule, exercised through the function the worker actually
@@ -14241,12 +14696,6 @@ mod tests {
             reauthorize_recall_ollama_egress(&endpoint, "trusted-model", &[], &changed_url)
                 .is_err()
         );
-
-        let mut claude = Config::default();
-        claude.summarization.engine = "agent".into();
-        assert!(reauthorize_recall_claude_egress("agent", &[], &claude).is_ok());
-        claude.summarization.engine = "auto".into();
-        assert!(reauthorize_recall_claude_egress("agent", &[], &claude).is_err());
     }
 
     fn recall_test_markdown(sensitivity: Option<&str>, body: &str) -> String {
