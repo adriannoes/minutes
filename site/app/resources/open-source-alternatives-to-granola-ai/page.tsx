@@ -21,10 +21,10 @@ const alternatives = [
       "Best if you want local conversation memory, inspectable markdown, MCP, CLI, desktop, and plugin workflows.",
   },
   {
-    name: "Hyprnote (now Char)",
+    name: "Hyprnote",
     bestFor: "Open-source private AI notepad",
     summary:
-      "Best if you want a local-first AI notepad experience oriented around private meetings and hosted/open-source hybrid options.",
+      "Best if you want a local-first AI notepad for private meetings, with offline models and optional approved third-party APIs.",
   },
   {
     name: "Meetily",
@@ -40,14 +40,14 @@ const sources = [
   { label: "Minutes for agents", href: "https://useminutes.app/for-agents" },
   { label: "Minutes MCP reference", href: "https://useminutes.app/docs/mcp/tools" },
   { label: "Hyprnote open source", href: "https://hyprnote.com/opensource" },
-  { label: "Hyprnote GitHub", href: "https://github.com/fastrepl/hyprnote" },
+  { label: "Hyprnote GitHub", href: "https://github.com/bahodirr/hyprnote" },
   { label: "Hyprnote docs", href: "https://hyprnote.com/docs/about/what-is-hyprnote/" },
-  { label: "Meetily website", href: "https://meetily.ai/de/" },
-  { label: "Meetily GitHub", href: "https://github.com/Zackriya-Solutions/meeting-minutes" },
+  { label: "Meetily website", href: "https://meetily.ai/" },
+  { label: "Meetily GitHub", href: "https://github.com/Zackriya-Solutions/meetily" },
 ] as const;
 
 
-const LAST_REVIEWED = "2026-04-09";
+const LAST_REVIEWED = "2026-08-24";
 
 export default function OpenSourceAlternativesToGranolaPage() {
   return (
@@ -108,7 +108,7 @@ export default function OpenSourceAlternativesToGranolaPage() {
           </p>
           <p>
             If you want an open-source private AI notepad that feels closer to the “AI notepad”
-            concept, <span className="font-medium text-[var(--text)]">Hyprnote (now Char)</span>{" "}
+            concept, <span className="font-medium text-[var(--text)]">Hyprnote</span>{" "}
             is a closer conceptual match. If you want a privacy-first open-source meeting assistant
             centered on local transcription and summary workflows,{" "}
             <span className="font-medium text-[var(--text)]">Meetily</span> is also worth a look.
@@ -145,7 +145,7 @@ export default function OpenSourceAlternativesToGranolaPage() {
             workflows.
           </p>
           <p>
-            Pick <span className="font-medium text-[var(--text)]">Hyprnote (now Char)</span> if you
+            Pick <span className="font-medium text-[var(--text)]">Hyprnote</span> if you
             want a more classic “private AI notepad” shape but still care about open-source and
             local-first principles.
           </p>

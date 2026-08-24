@@ -40,7 +40,7 @@ const featureGrid = [
     label: "For daily work",
     title: "Dictation that stays useful",
     description:
-      "Hold the hotkey, speak, release. Minutes sends the text to the clipboard and your daily note without changing tools.",
+      "Hold the hotkey, speak, release. Minutes inserts the text where you are working, keeps a clipboard copy, and saves it to your daily note.",
   },
   {
     label: "For recall",
@@ -119,7 +119,7 @@ const capabilityColumns = [
 // Competitor cells reflect public docs spot-checked in August 2026. Refresh quarterly.
 const comparisons = [
   ["Local transcription", "No (cloud)", "No (cloud)", "Yes", "Yes"],
-  ["Open source", "No", "No", "MIT", "MIT"],
+  ["Open source", "No", "No", "GPL-3.0", "MIT"],
   ["Free", "Freemium", "Freemium", "Free", "Free"],
   ["Agent surface", "Hosted MCP", "Hosted integrations", "Local app", `Files + ${MINUTES_MCP_TOOL_COUNT} MCP tools`],
   ["Cross-meeting intelligence", "Cloud chat", "Cloud chat", "No", "Policy-safe search"],
@@ -383,9 +383,9 @@ export default function Home() {
         <p className="mx-auto mt-12 max-w-[620px] rounded-[5px] border border-[color:var(--border)] bg-[var(--bg-elevated)] px-4 py-3 font-mono text-[12px] leading-5 text-[var(--text-secondary)]">
           <span className="text-[var(--accent)]">v{MINUTES_RELEASE_VERSION}</span>{" "}
           adds{" "}
-          reliable dual-source capture across mismatched mixer buffers and late
-          shutdown samples, prevents the desktop from stopping a separate CLI
-          recording, and surfaces source-dropout and mostly-zero-stem warnings.{" "}
+          a Windows setup path for modern Intel CPUs, dictation that reaches
+          terminal prompts while keeping a clipboard copy, and Claude
+          subscription sign-in before Recall reads meeting context.{" "}
           <a
             href={`https://github.com/silverstein/minutes/releases/tag/v${MINUTES_RELEASE_VERSION}`}
             className="text-[var(--text)] underline decoration-[color:var(--border-mid)] underline-offset-2 hover:text-[var(--accent)]"
