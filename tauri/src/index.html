@@ -1912,6 +1912,10 @@
     /* ── Meeting list ── */
     .meetings-scroll {
       flex: 1;
+      /* Without this a flex child refuses to shrink below its content, so a
+         footer that wraps to a second button row pushes the column past the
+         window edge and the last row renders half-clipped. */
+      min-height: 0;
       overflow-y: auto;
       padding: 0 16px 18px;
       scroll-padding-bottom: 18px;
@@ -13815,6 +13819,7 @@
     let recallInitialized = false;
     let recallResizeObserver = null;
     let recallThemeHandler = null;
+    let recallThemeObserver = null;
     let expandAnimating = false;
 
     // ── Recall native chat state ──
@@ -14201,8 +14206,19 @@
       if (recallInitialized) return;
       recallInitialized = true;
 
+      // The app theme can be forced via data-theme (settings/localStorage),
+      // in which case the OS media query is the wrong authority — following
+      // it painted a dark terminal slab into a light UI whenever the two
+      // disagreed.
+      const effectiveTerminalDark = () => {
+        const forced = document.documentElement.getAttribute('data-theme');
+        if (forced === 'dark') return true;
+        if (forced === 'light') return false;
+        return window.MINUTES_XTERM_THEME_QUERY.matches;
+      };
+
       recallTerminal = new Terminal({
-        theme: window.MINUTES_XTERM_THEME,
+        theme: window.getMinutesTheme(effectiveTerminalDark()),
         fontFamily: "'Geist Mono', 'SF Mono', Menlo, monospace",
         fontSize: getTerminalFontSize(),
         lineHeight: 1.2,
@@ -14212,9 +14228,12 @@
         allowProposedApi: true,
       });
 
-      recallThemeHandler = (event) => {
-        if (recallTerminal) recallTerminal.options.theme = window.getMinutesTheme(event.matches);
+      recallThemeHandler = () => {
+        if (recallTerminal) recallTerminal.options.theme = window.getMinutesTheme(effectiveTerminalDark());
       };
+      // Re-theme when the app's own override flips, not only when the OS does.
+      recallThemeObserver = new MutationObserver(recallThemeHandler);
+      recallThemeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
 
       recallFitAddon = new FitAddon.FitAddon();
       recallTerminal.loadAddon(recallFitAddon);
@@ -16184,6 +16203,10 @@
       if (recallThemeHandler) {
         window.MINUTES_XTERM_THEME_QUERY.removeEventListener('change', recallThemeHandler);
         recallThemeHandler = null;
+        if (recallThemeObserver) {
+          recallThemeObserver.disconnect();
+          recallThemeObserver = null;
+        }
       }
       if (recallTerminal) {
         try { recallTerminal.dispose(); } catch (_) { }
