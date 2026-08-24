@@ -322,6 +322,29 @@
       flex: 1 1 auto;
     }
 
+    /* Three panes: list · chat · document.
+       Chat becomes the flexible middle so the document can hold a real width
+       without squeezing the list below its 260px floor. Without this, an
+       explicitly-sized chat (50%) plus an explicitly-sized document (34%)
+       leaves the list 16% and it overflows its own minimum. */
+    body.doc-open .app-left {
+      flex: 0 0 var(--list-width, 22%);
+    }
+
+    body.doc-open .recall-panel.expanded {
+      width: auto;
+      flex: 1 1 auto;
+      min-width: 280px;
+    }
+
+    /* Cmd+O and the Documents browser can open a document while chat is
+       closed. With the list pinned and the doc at a fixed 34%, nothing left
+       had flex-grow — 44% of the window sat empty. Two panes: doc takes the
+       remainder. (.recall-panel precedes .md-viewer in the DOM, so ~ works.) */
+    body.doc-open .recall-panel:not(.expanded) ~ .md-viewer.active {
+      flex: 1 1 auto;
+    }
+
     .window-drag-strip {
       display: none;
     }
@@ -722,7 +745,7 @@
     }
 
     /* Rendered-markdown code in assistant replies (#404 follow-up). */
-    .chat-bubble-assistant .chat-code {
+    .chat-bubble-assistant pre {
       font-family: 'Geist Mono', 'SF Mono', Menlo, monospace;
       font-size: 11px;
       background: var(--bg-elevated);
@@ -734,11 +757,76 @@
       white-space: pre;
     }
 
-    .chat-bubble-assistant .chat-code-inline {
+    .chat-bubble-assistant code {
       font-family: 'Geist Mono', 'SF Mono', Menlo, monospace;
       background: var(--bg-elevated);
       border-radius: 3px;
       padding: 0 3px;
+    }
+
+    /* Inside a <pre> the code element is the block itself — drop the inline
+       chrome so fenced blocks don't render as a chip inside a card. */
+    .chat-bubble-assistant pre code {
+      background: none;
+      border-radius: 0;
+      padding: 0;
+    }
+
+    /* Block structure the old regex renderer could not produce at all. Margins
+       are tight because these sit inside a chat bubble, not a document. */
+    .chat-bubble-assistant p { margin: 4px 0; }
+    .chat-bubble-assistant p:first-child { margin-top: 0; }
+    .chat-bubble-assistant p:last-child { margin-bottom: 0; }
+
+    .chat-bubble-assistant ul,
+    .chat-bubble-assistant ol {
+      margin: 4px 0;
+      padding-left: 20px;
+    }
+
+    .chat-bubble-assistant li { margin: 2px 0; }
+
+    .chat-bubble-assistant h1,
+    .chat-bubble-assistant h2,
+    .chat-bubble-assistant h3,
+    .chat-bubble-assistant h4 {
+      font-family: var(--font-display);
+      font-weight: 400;
+      margin: 8px 0 4px;
+      line-height: 1.25;
+    }
+
+    .chat-bubble-assistant h1 { font-size: 18px; }
+    .chat-bubble-assistant h2 { font-size: 16px; }
+    .chat-bubble-assistant h3,
+    .chat-bubble-assistant h4 { font-size: 14px; }
+
+    .chat-bubble-assistant blockquote {
+      margin: 4px 0;
+      padding-left: 8px;
+      border-left: 2px solid var(--border);
+      color: var(--text-secondary);
+    }
+
+    .chat-bubble-assistant table {
+      border-collapse: collapse;
+      margin: 4px 0;
+      font-size: 11px;
+      display: block;
+      overflow-x: auto;
+    }
+
+    .chat-bubble-assistant th,
+    .chat-bubble-assistant td {
+      border: 1px solid var(--border);
+      padding: 3px 6px;
+      text-align: left;
+    }
+
+    .chat-bubble-assistant hr {
+      border: none;
+      border-top: 1px solid var(--border);
+      margin: 8px 0;
     }
 
     .chat-input-row {
@@ -1824,6 +1912,10 @@
     /* ── Meeting list ── */
     .meetings-scroll {
       flex: 1;
+      /* Without this a flex child refuses to shrink below its content, so a
+         footer that wraps to a second button row pushes the column past the
+         window edge and the last row renders half-clipped. */
+      min-height: 0;
       overflow-y: auto;
       padding: 0 16px 18px;
       scroll-padding-bottom: 18px;
@@ -1849,15 +1941,42 @@
     }
 
     /* ── Markdown viewer (replaces meeting list) ── */
+    /* Row feedback while the two open IPC calls run — without it a slow open
+       reads as a dead click and gets clicked again. */
+    .document-item.is-opening {
+      opacity: 0.55;
+      pointer-events: none;
+      cursor: progress;
+    }
+
+    /* A top-level pane now, not a child of the list pane. `flex: 1` was right
+       when it filled a flex COLUMN; as a row sibling it needs a width basis,
+       and zero width when closed so the app renders exactly as before until a
+       document is actually opened. */
     .md-viewer {
       display: none;
       flex-direction: column;
-      flex: 1;
+      flex: 0 0 0;
+      width: 0;
+      min-width: 0;
       min-height: 0;
+      overflow: hidden;
+      background: var(--bg);
     }
 
     .md-viewer.active {
       display: flex;
+      flex: 0 0 var(--doc-width, 34%);
+      width: auto;
+      min-width: 280px;
+      border-left: 1px solid var(--border);
+    }
+
+    /* Collapsing the list must not shrink the document — that pairing is the
+       whole point of the live-meeting layout. Let it reclaim the freed space
+       the same way the chat panel does. */
+    body.sidebar-collapsed .md-viewer.active {
+      flex-basis: var(--doc-width, 40%);
     }
 
     .md-viewer-header {
@@ -1867,6 +1986,20 @@
       padding: 8px 16px;
       border-bottom: 1px solid var(--border);
       flex-shrink: 0;
+      /* The pane now reaches the window's top edge, which puts this header
+         under the fixed 32px .window-drag-strip (z-index 5) on macOS — an
+         invisible drag region that swallows clicks, so ×/Review/Revert felt
+         dead. Lift the header above it, keep its background draggable like
+         .recall-header, and opt the controls out. */
+      position: relative;
+      z-index: 6;
+      -webkit-app-region: drag;
+    }
+
+    .md-viewer-header button,
+    .md-viewer-header .md-viewer-toolbar,
+    .md-viewer-header .md-viewer-status {
+      -webkit-app-region: no-drag;
     }
 
     .md-viewer-header-main {
@@ -1982,7 +2115,11 @@
     .md-viewer-content {
       flex: 1;
       overflow-y: auto;
-      padding: 16px 20px;
+      /* Mirror the source editor's centered 70ch column. The old 16/20px was
+         sized for the narrow list pane; in a wide pane it ran text nearly
+         edge to edge. Symmetric max() padding centers the measure and never
+         drops below 28px at narrow widths. */
+      padding: 24px max(28px, calc((100% - 70ch) / 2)) 32px;
       -webkit-user-select: text;
       user-select: text;
     }
@@ -2004,6 +2141,53 @@
     .md-viewer-content::-webkit-scrollbar-thumb {
       background: var(--surface-fill-strong);
       border-radius: 999px;
+    }
+
+    /* Clickable rendered blocks. The hover tint is the only affordance — a
+       border or handle would put chrome on every paragraph of a document
+       that is usually just being read, not edited. */
+    .md-viewer-content .md-block {
+      border-radius: 4px;
+      /* Pull the padding back out so hover tint reads as a block without
+         shifting the text on render. */
+      margin-left: -6px;
+      margin-right: -6px;
+      padding-left: 6px;
+      padding-right: 6px;
+    }
+
+    .md-viewer.is-editable .md-viewer-content .md-block:hover {
+      background: var(--bg-hover);
+      cursor: text;
+    }
+
+    .md-block-editor {
+      display: block;
+      width: 100%;
+      box-sizing: border-box;
+      resize: none;
+      overflow: hidden;
+      background: var(--bg-hover);
+      color: var(--text);
+      border: 1px solid var(--accent);
+      border-radius: 4px;
+      outline: none;
+      margin: 0 -6px;
+      padding: 5px;
+      font: 13px/1.7 var(--font-mono);
+      white-space: pre-wrap;
+    }
+
+    /* An image the renderer declined to load. Reads as content, not an error:
+       the note said a picture was here, so say so rather than show nothing. */
+    .md-image-placeholder {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--text-secondary);
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 1px 5px;
     }
 
     .md-viewer-editor {
@@ -2081,7 +2265,10 @@
       display: none;
       gap: 10px;
       overflow-x: auto;
-      padding: 10px 18px 0;
+      /* Bottom padding is not decorative: with 0 the active card's ring sits
+         flush against the scroll container and gets clipped along its lower
+         edge. */
+      padding: 10px 18px 10px;
     }
 
     .md-viewer-history.active {
@@ -3829,7 +4016,12 @@
 
     .footer-action-secondary {
       display: grid;
-      grid-template-columns: minmax(0, 0.72fr) minmax(0, 1.55fr) minmax(0, 1fr);
+      /* Whole buttons wrap to a second row instead of labels breaking
+         mid-word. Sized by the pane, not the viewport: the old ≥540px media
+         override re-imposed three rigid columns whenever the WINDOW was wide,
+         but with a document open the list pane pins to 22%, so a wide window
+         and a 320px pane coexist — exactly when it broke. */
+      grid-template-columns: repeat(auto-fit, minmax(96px, 1fr));
       gap: 4px;
     }
 
@@ -3869,9 +4061,6 @@
         grid-template-columns: 1fr;
       }
 
-      .footer-action-secondary {
-        grid-template-columns: minmax(0, 0.72fr) minmax(0, 1.55fr) minmax(0, 1fr);
-      }
     }
 
     /* ── Buttons ── */
@@ -5600,44 +5789,6 @@
     </div>
 
     <!-- Markdown viewer (replaces meeting list when a file is open) -->
-    <div class="md-viewer" id="md-viewer">
-      <div class="md-viewer-header">
-        <div class="md-viewer-header-main">
-          <button class="md-viewer-back" id="md-viewer-back" title="Back to meetings">←</button>
-          <span class="md-viewer-filename" id="md-viewer-filename"></span>
-          <span class="md-viewer-kind" id="md-viewer-kind">MD</span>
-        </div>
-        <div class="md-viewer-toolbar">
-          <button class="btn md-viewer-mode-btn active" id="md-viewer-preview-btn">Preview</button>
-          <button class="btn md-viewer-mode-btn" id="md-viewer-source-btn">Source</button>
-          <span class="md-viewer-toolbar-sep"></span>
-          <button class="btn" id="md-viewer-promote-btn" hidden>Make Editable Copy</button>
-          <button class="btn" id="md-viewer-save-btn" disabled>Save</button>
-          <button class="btn" id="md-viewer-review-btn" disabled>Review</button>
-          <button class="btn" id="md-viewer-revert-btn" disabled>Revert</button>
-          <span class="md-viewer-status" id="md-viewer-status">Viewing</span>
-        </div>
-      </div>
-      <div class="md-viewer-history" id="md-viewer-history"></div>
-      <div class="md-viewer-review" id="md-viewer-review">
-        <div class="md-viewer-review-head">
-          <div class="md-viewer-review-title">Last Change Review</div>
-          <div class="md-viewer-review-meta" id="md-viewer-review-meta"></div>
-        </div>
-        <div class="md-viewer-review-grid">
-          <div class="md-viewer-review-col">
-            <div class="md-viewer-review-label">Before</div>
-            <pre class="md-viewer-review-pre" id="md-viewer-review-before"></pre>
-          </div>
-          <div class="md-viewer-review-col">
-            <div class="md-viewer-review-label">Current</div>
-            <pre class="md-viewer-review-pre" id="md-viewer-review-current"></pre>
-          </div>
-        </div>
-      </div>
-      <div class="md-viewer-content" id="md-viewer-content"></div>
-      <textarea class="md-viewer-editor" id="md-viewer-editor" spellcheck="false"></textarea>
-    </div>
 
     <!-- Meeting list -->
     <div class="meetings-scroll" id="meetings-scroll">
@@ -5690,7 +5841,8 @@
       <div class="recall-header-actions">
         <button class="btn btn-secondary btn-sm" id="btn-recall-weekly">Weekly</button>
         <button class="btn btn-secondary btn-sm recall-end-btn" id="btn-recall-end">End Session</button>
-        <button class="recall-mode-toggle" id="btn-recall-mode-toggle" title="Switch to terminal (developer mode)"></button>
+        <button class="recall-mode-toggle" id="btn-recall-mode-toggle" title="Switch to Terminal"
+          hidden aria-hidden="true"></button>
         <button class="recall-close" id="btn-recall-close" title="Close panel">&times;</button>
       </div>
     </div>
@@ -5709,7 +5861,7 @@
       <pre id="recall-weekly-content">Loading weekly summary…</pre>
     </div>
     <div class="recall-terminal hidden" id="recall-terminal-container"></div>
-    <!-- Recall native chat panel — shown when developer mode is OFF -->
+    <!-- Recall private Chat panel, shown only when a verified provider is available -->
     <div class="recall-chat-container" id="recall-chat-panel" style="display:none;">
       <div class="chat-messages" id="recall-chat-messages"></div>
       <button class="chat-jump-latest" id="recall-chat-jump" style="display:none;" aria-label="Jump to latest message">↓ new messages</button>
@@ -5722,6 +5874,52 @@
       Session ended.
       <button class="btn btn-secondary btn-sm" id="btn-recall-restart">Restart</button>
     </div>
+  </div>
+
+  <!-- ── Document pane ──
+       Sibling of .app-left and .recall-panel, not a child of the list pane.
+       Living inside .app-left meant `body.sidebar-collapsed .app-left > *
+       { visibility: hidden }` hid an open document whenever the list was
+       collapsed — so the one gesture that would give notes more room during
+       a meeting destroyed the view instead. Ordered after the chat panel to
+       match where every assistant surface puts its artifact panel. ── -->
+  <div class="md-viewer" id="md-viewer">
+    <div class="md-viewer-header">
+      <div class="md-viewer-header-main">
+        <button class="md-viewer-back" id="md-viewer-back" title="Close document">×</button>
+        <span class="md-viewer-filename" id="md-viewer-filename"></span>
+        <span class="md-viewer-kind" id="md-viewer-kind">MD</span>
+      </div>
+      <div class="md-viewer-toolbar">
+        <button class="btn md-viewer-mode-btn active" id="md-viewer-preview-btn">Preview</button>
+        <button class="btn md-viewer-mode-btn" id="md-viewer-source-btn">Source</button>
+        <span class="md-viewer-toolbar-sep"></span>
+        <button class="btn" id="md-viewer-promote-btn" hidden>Make Editable Copy</button>
+        <button class="btn" id="md-viewer-save-btn" disabled>Save</button>
+        <button class="btn" id="md-viewer-review-btn" disabled>Review</button>
+        <button class="btn" id="md-viewer-revert-btn" disabled>Revert</button>
+        <span class="md-viewer-status" id="md-viewer-status">Viewing</span>
+      </div>
+    </div>
+    <div class="md-viewer-history" id="md-viewer-history"></div>
+    <div class="md-viewer-review" id="md-viewer-review">
+      <div class="md-viewer-review-head">
+        <div class="md-viewer-review-title">Last Change Review</div>
+        <div class="md-viewer-review-meta" id="md-viewer-review-meta"></div>
+      </div>
+      <div class="md-viewer-review-grid">
+        <div class="md-viewer-review-col">
+          <div class="md-viewer-review-label">Before</div>
+          <pre class="md-viewer-review-pre" id="md-viewer-review-before"></pre>
+        </div>
+        <div class="md-viewer-review-col">
+          <div class="md-viewer-review-label">Current</div>
+          <pre class="md-viewer-review-pre" id="md-viewer-review-current"></pre>
+        </div>
+      </div>
+    </div>
+    <div class="md-viewer-content" id="md-viewer-content"></div>
+    <textarea class="md-viewer-editor" id="md-viewer-editor" spellcheck="false"></textarea>
   </div>
 
   <!-- In-app meeting detail view -->
@@ -6731,11 +6929,11 @@
             <div class="about-controls-meta" id="settings-agent-args-help"></div>
           </div>
         </div>
-        <div class="about-controls">
-          <div class="about-controls-copy">Developer mode (terminal)</div>
+        <div class="about-controls is-hidden" id="settings-recall-mode-row">
+          <div class="about-controls-copy">Use Terminal instead</div>
           <button class="btn btn-secondary btn-sm toggle-btn" id="settings-recall-dev-mode">Off</button>
         </div>
-        <div class="about-controls-meta settings-compact-meta">Off: native chat bubbles — On: embedded terminal for power users</div>
+        <div class="about-controls-meta settings-compact-meta is-hidden" id="settings-recall-mode-hint">Chat is the simpler experience. Terminal keeps the assistant's full controls for power users.</div>
       </div>
 
       </div><!-- /panel-ai -->
@@ -10675,15 +10873,33 @@
         badge.textContent = doc.kind || 'text';
 
         const openDocument = async () => {
+          if (item.classList.contains('is-opening')) return;
+          item.classList.add('is-opening');
+          item.setAttribute('aria-busy', 'true');
+          const t0 = performance.now();
+          let tAccess = 0, tRead = 0;
           try {
             const access = await invoke('cmd_get_text_file_access', { path: doc.path });
+            tAccess = performance.now() - t0;
             const content = await invoke('cmd_read_text_file', { path: doc.path });
+            tRead = performance.now() - t0 - tAccess;
             await showMdViewer(doc.path, doc.filename || doc.path.split(/[\\/]/).pop() || doc.path, content, {
               editable: !!access.editable,
               kind: access.kind || doc.kind || 'text',
             });
           } catch (e) {
             console.error('Open document:', e);
+          } finally {
+            item.classList.remove('is-opening');
+            item.removeAttribute('aria-busy');
+            const total = performance.now() - t0;
+            const tShow = total - tAccess - tRead;
+            console.log(`[md-open] access ${Math.round(tAccess)}ms · read ${Math.round(tRead)}ms · show ${Math.round(tShow)}ms · ${doc.path}`);
+            if (total > 800) {
+              const phases = [['access check', tAccess], ['file read', tRead], ['viewer setup', tShow]];
+              phases.sort((a, b) => b[1] - a[1]);
+              setMdViewerStatus(`Slow open — ${phases[0][0]} ${(phases[0][1] / 1000).toFixed(1)}s`, 'warning');
+            }
           }
         };
 
@@ -11793,8 +12009,17 @@
             : 'The agent will ask before running tools like file edits and shell commands.';
           updateAssistantAgentUi(s.assistant.agent, extraArgs);
         } catch (e) { console.error('agent flags:', e); }
-        // Recall developer mode toggle (localStorage-only, not in config)
-        setSettingsToggle('settings-recall-dev-mode', recallDevMode);
+        // Recall Chat/Terminal preference (localStorage-only, not in config)
+        try {
+          await refreshRecallReadiness();
+          if (!recallReadiness.nativeAvailable) recallDevMode = true;
+          else if (!recallModePreferenceExplicit) recallDevMode = false;
+          syncRecallModeControls({ persist: recallReadiness.nativeAvailable });
+        } catch (e) {
+          console.error('Recall provider readiness:', e);
+          recallDevMode = true;
+          syncRecallModeControls({ persist: false });
+        }
         // Call detection settings
         if (s.call_detection) {
           setSettingsToggle('settings-call-detection', s.call_detection.enabled);
@@ -12641,6 +12866,14 @@
     document.getElementById('settings-agent').addEventListener('change', async (e) => {
       await invoke('cmd_set_setting', { section: 'assistant', key: 'agent', value: e.target.value });
       await saveAgentArgs();
+      try {
+        await refreshRecallReadiness();
+        if (!recallReadiness.nativeAvailable) recallDevMode = true;
+        else if (!recallModePreferenceExplicit) recallDevMode = false;
+        syncRecallModeControls({ persist: recallReadiness.nativeAvailable });
+      } catch (error) {
+        console.error('Recall provider readiness:', error);
+      }
     });
     // Helper: rebuild agent_args from toggle + text field and save
     async function saveAgentArgs() {
@@ -12675,16 +12908,13 @@
       await requestRecallMode(next);
     });
 
-    // ── In-panel mode toggle (developer mode shortcut in recall header) ──
+    // ── In-panel Chat/Terminal toggle ──
     // NOTE: recallDevMode (let) is declared later in the recall section.
     // Read localStorage directly here to avoid a Temporal Dead Zone crash.
     const recallModeToggleBtn = document.getElementById('btn-recall-mode-toggle');
     if (recallModeToggleBtn) {
       const _initDevMode = localStorage.getItem('minutes.recallDevMode') === 'true';
       recallModeToggleBtn.classList.toggle('active', _initDevMode);
-      if (_initDevMode) {
-        recallModeToggleBtn.title = 'Switch to chat (native mode)';
-      }
       recallModeToggleBtn.addEventListener('click', async () => {
         await requestRecallMode(!recallDevMode);
       });
@@ -13604,11 +13834,13 @@
     let recallInitialized = false;
     let recallResizeObserver = null;
     let recallThemeHandler = null;
+    let recallThemeObserver = null;
     let expandAnimating = false;
 
     // ── Recall native chat state ──
     // Persisted in localStorage so it survives app restarts.
     let recallDevMode = localStorage.getItem('minutes.recallDevMode') === 'true';
+    let recallModePreferenceExplicit = localStorage.getItem('minutes.recallModePreferenceExplicit') === 'true';
     const recallChatPanel = document.getElementById('recall-chat-panel');
     const recallChatMessages = document.getElementById('recall-chat-messages');
     const recallChatInput = document.getElementById('recall-chat-input');
@@ -13635,16 +13867,23 @@
       recallProviderNotice.classList.toggle('error', tone === 'error');
     }
 
-    function syncRecallModeControls() {
-      localStorage.setItem('minutes.recallDevMode', String(recallDevMode));
+    function syncRecallModeControls({ persist = true } = {}) {
+      if (persist) localStorage.setItem('minutes.recallDevMode', String(recallDevMode));
       setSettingsToggle('settings-recall-dev-mode', recallDevMode);
+      const nativeAvailable = Boolean(recallReadiness?.nativeAvailable);
       const modeToggleBtn = document.getElementById('btn-recall-mode-toggle');
       if (modeToggleBtn) {
         modeToggleBtn.classList.toggle('active', recallDevMode);
+        modeToggleBtn.hidden = !nativeAvailable;
+        modeToggleBtn.setAttribute('aria-hidden', nativeAvailable ? 'false' : 'true');
         modeToggleBtn.title = recallDevMode
-          ? 'Switch to chat (native mode)'
-          : 'Switch to terminal (subscription mode)';
+          ? 'Switch to Chat'
+          : `Use ${recallReadiness?.assistantName || 'assistant'} in Terminal`;
       }
+      const settingsRow = document.getElementById('settings-recall-mode-row');
+      const settingsHint = document.getElementById('settings-recall-mode-hint');
+      if (settingsRow) settingsRow.classList.toggle('is-hidden', !nativeAvailable);
+      if (settingsHint) settingsHint.classList.toggle('is-hidden', !nativeAvailable);
     }
 
     async function refreshRecallReadiness() {
@@ -13662,16 +13901,17 @@
 
       if (!nextDevMode && !readiness?.nativeAvailable) {
         recallDevMode = true;
-        syncRecallModeControls();
+        syncRecallModeControls({ persist: false });
         setRecallProviderNotice(
-          readiness?.message || 'Native chat is unavailable until an isolated provider is configured.',
-          'error'
+          readiness?.message || 'Private Chat is not available for this assistant yet.'
         );
         if (recallExpanded) await applyRecallMode();
         return;
       }
 
       recallDevMode = nextDevMode;
+      recallModePreferenceExplicit = true;
+      localStorage.setItem('minutes.recallModePreferenceExplicit', 'true');
       pendingRecallTerminalMeetingPath = recallDevMode ? recallSelectedMeetingPath : null;
       recallTerminalInputDraft = '';
       recallTerminalInputReliable = true;
@@ -13686,14 +13926,15 @@
     }
 
     function terminalNoticeForReadiness(readiness) {
+      const assistant = readiness.assistantName || 'Your assistant';
       if (!readiness.terminalAvailable) {
-        return `${readiness.message} Install or select an assistant in Settings before sharing a meeting.`;
+        return `${assistant} could not be found. Install it or choose an installed assistant in Settings. No meeting was read.`;
       }
       const meeting = pendingRecallTerminalMeetingPath ? 'the selected meeting' : 'meeting context';
       const auth = readiness.terminalAuthenticated
         ? `Ask your question here; Minutes will load ${meeting} only when you submit it.`
-        : `Sign in with /login first. Minutes will not read ${meeting} for account commands.`;
-      return `${readiness.message} ${auth}`;
+        : `Sign in here first. Minutes will not read ${meeting} during sign-in.`;
+      return `${assistant} is open in Terminal. ${auth}`;
     }
 
     async function chooseRecallExperience(mode, meetingPath) {
@@ -13707,9 +13948,9 @@
       } catch (error) {
         console.error('Recall provider readiness:', error);
         recallDevMode = true;
-        syncRecallModeControls();
+        syncRecallModeControls({ persist: false });
         setRecallProviderNotice(
-          'Minutes could not verify an isolated Native provider, so it opened Terminal chat without reading the meeting.',
+          'Minutes could not verify private Chat, so it opened your assistant in Terminal without reading the meeting.',
           'error'
         );
         pendingRecallTerminalMeetingPath = mode === 'meeting' ? meetingPath : null;
@@ -13720,8 +13961,13 @@
 
       if (!readiness.nativeAvailable) {
         recallDevMode = true;
+      } else if (!recallModePreferenceExplicit) {
+        // Earlier builds persisted Terminal when Chat was unavailable. Once a
+        // verified private provider becomes available, restore the simple
+        // experience unless the user explicitly chose Terminal themselves.
+        recallDevMode = false;
       }
-      syncRecallModeControls();
+      syncRecallModeControls({ persist: readiness.nativeAvailable });
 
       if (recallDevMode) {
         pendingRecallTerminalMeetingPath = mode === 'meeting' ? meetingPath : null;
@@ -13765,24 +14011,49 @@
       if (pill) pill.style.display = 'block';
     }
 
-    function renderChatMarkdown(src) {
-      const esc = (s) => s
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;');
-      const blocks = [];
-      // Fenced code blocks first, so their contents aren't formatted.
-      let s = String(src).replace(/```[^\n]*\n?([\s\S]*?)```/g, (_, code) => {
-        blocks.push('<pre class="chat-code">' + esc(code.replace(/\n$/, '')) + '</pre>');
-        return '\x00B' + (blocks.length - 1) + '\x00';
+    // Assistant replies render through renderMarkdownToElement — the same
+    // escape-before-parse path the artifact viewer uses. The hand-rolled regex
+    // renderer this replaced only understood code/bold/italic, so every list
+    // and heading the model produced arrived as literal "- " and "## " text.
+    //
+    // Streaming arrives token-by-token, and each chunk would otherwise reparse
+    // and rebuild the entire accumulated reply — quadratic in the length of the
+    // answer, and it collapses any text selection the user has made mid-stream.
+    // Coalesce to at most one render per animation frame.
+    let assistantRenderFrame = null;
+    function scheduleAssistantBubbleRender(bubble) {
+      if (assistantRenderFrame !== null) return;
+      assistantRenderFrame = requestAnimationFrame(() => {
+        assistantRenderFrame = null;
+        if (!bubble.isConnected) return;
+        renderMarkdownToElement(bubble, currentAssistantRaw);
       });
-      s = esc(s);
-      s = s.replace(/`([^`\n]+)`/g, (_, c) => '<code class="chat-code-inline">' + c + '</code>');
-      s = s.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
-      s = s.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>');
-      s = s.replace(/\x00B(\d+)\x00/g, (_, i) => blocks[Number(i)]);
-      return s;
     }
+
+    function flushAssistantBubbleRender(bubble) {
+      if (assistantRenderFrame !== null) {
+        cancelAnimationFrame(assistantRenderFrame);
+        assistantRenderFrame = null;
+      }
+      if (bubble?.isConnected) renderMarkdownToElement(bubble, currentAssistantRaw);
+    }
+
+    // That renderer also produces real anchors, which the regex one never did.
+    // An un-intercepted click would navigate this webview away from the app
+    // shell — there is no back button and no CSP to land on — so chat links
+    // are routed out to the OS the same way the artifact viewer routes them.
+    recallChatMessages?.addEventListener('click', async (event) => {
+      const anchor = event.target?.closest?.('a[href]');
+      if (!anchor) return;
+      event.preventDefault();
+      const href = anchor.getAttribute('href');
+      if (!href || href === '#') return;
+      try {
+        await invoke('cmd_open_file', { path: href });
+      } catch (e) {
+        console.error('Open chat link:', e);
+      }
+    });
     // Tracks which meeting the *currently displayed* native chat conversation
     // belongs to. Deliberately separate from currentMeetingPath: other flows
     // (e.g. closeDetailView()) null out currentMeetingPath transiently before
@@ -13965,8 +14236,19 @@
       if (recallInitialized) return;
       recallInitialized = true;
 
+      // The app theme can be forced via data-theme (settings/localStorage),
+      // in which case the OS media query is the wrong authority — following
+      // it painted a dark terminal slab into a light UI whenever the two
+      // disagreed.
+      const effectiveTerminalDark = () => {
+        const forced = document.documentElement.getAttribute('data-theme');
+        if (forced === 'dark') return true;
+        if (forced === 'light') return false;
+        return window.MINUTES_XTERM_THEME_QUERY.matches;
+      };
+
       recallTerminal = new Terminal({
-        theme: window.MINUTES_XTERM_THEME,
+        theme: window.getMinutesTheme(effectiveTerminalDark()),
         fontFamily: "'Geist Mono', 'SF Mono', Menlo, monospace",
         fontSize: getTerminalFontSize(),
         lineHeight: 1.2,
@@ -13976,9 +14258,12 @@
         allowProposedApi: true,
       });
 
-      recallThemeHandler = (event) => {
-        if (recallTerminal) recallTerminal.options.theme = window.getMinutesTheme(event.matches);
+      recallThemeHandler = () => {
+        if (recallTerminal) recallTerminal.options.theme = window.getMinutesTheme(effectiveTerminalDark());
       };
+      // Re-theme when the app's own override flips, not only when the OS does.
+      recallThemeObserver = new MutationObserver(recallThemeHandler);
+      recallThemeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
 
       recallFitAddon = new FitAddon.FitAddon();
       recallTerminal.loadAddon(recallFitAddon);
@@ -14162,6 +14447,10 @@
     /// are responsible for confirming the meeting actually changed before
     /// calling this — it unconditionally wipes the current conversation.
     async function resetRecallChat() {
+      if (assistantRenderFrame !== null) {
+        cancelAnimationFrame(assistantRenderFrame);
+        assistantRenderFrame = null;
+      }
       if (recallChatMessages) recallChatMessages.replaceChildren();
       currentAssistantBubble = null;
       currentAssistantRaw = '';
@@ -14294,6 +14583,9 @@
 
     function finishRecallChatUi() {
       if (currentAssistantBubble) {
+        // A throttled render may still be queued; without this the last chunk
+        // of the reply never reaches the DOM.
+        flushAssistantBubbleRender(currentAssistantBubble);
         currentAssistantBubble.classList.remove('streaming');
         currentAssistantBubble = null;
       }
@@ -14336,11 +14628,16 @@
           // renders nothing at all, even though the model answered correctly.
           text = chunk.text;
         } else if (chunk && chunk.type === 'result' && typeof chunk.result === 'string') {
-          // Final result event — use as fallback if the assistant bubble is still empty.
-          if (currentAssistantBubble && !currentAssistantBubble.textContent.trim()) {
+          // Final result event — use as fallback if the assistant bubble is
+          // still empty. Emptiness is measured by whether anything was
+          // streamed, NOT by textContent: a reply that is only an image
+          // renders to an <img> with no text, and a textContent check would
+          // read that as empty and append the whole reply a second time.
+          const bubbleIsEmpty = !currentAssistantRaw;
+          if (currentAssistantBubble && bubbleIsEmpty) {
             text = chunk.result;
           }
-          if (chunk.subtype !== 'success' && currentAssistantBubble && !currentAssistantBubble.textContent.trim()) {
+          if (chunk.subtype !== 'success' && currentAssistantBubble && bubbleIsEmpty) {
             text = chunk.error || chunk.result || 'Claude returned an error.';
           }
         }
@@ -14348,10 +14645,11 @@
           // Capture BEFORE the content grows: was the user already at the bottom?
           const atBottom = recallChatNearBottom();
           // Accumulate raw text and re-render markdown each chunk (cheap at
-          // chat length). renderChatMarkdown escapes first, so the model's
+          // chat length). renderMarkdownToElement escapes before parsing and
+          // builds nodes rather than assigning innerHTML, so the model's
           // output can never inject HTML (#404 follow-up).
           currentAssistantRaw += text;
-          currentAssistantBubble.innerHTML = renderChatMarkdown(currentAssistantRaw);
+          scheduleAssistantBubbleRender(currentAssistantBubble);
           // Only auto-scroll if they were at the bottom — never yank someone off
           // a paragraph they've scrolled up to read aloud in coach mode. When
           // scrolled up, surface a "jump to latest" pill instead (#404 follow-up).
@@ -14617,7 +14915,7 @@
         return;
       }
 
-      // Developer (terminal) mode \u2014 original PTY path.
+      // Terminal mode, using the original PTY path.
       // If the panel was already expanded, expandRecallPanel bailed out
       // and skipped initRecallTerminal. Ensure it's initialized.
       initRecallTerminal();
@@ -15935,6 +16233,10 @@
       if (recallThemeHandler) {
         window.MINUTES_XTERM_THEME_QUERY.removeEventListener('change', recallThemeHandler);
         recallThemeHandler = null;
+        if (recallThemeObserver) {
+          recallThemeObserver.disconnect();
+          recallThemeObserver = null;
+        }
       }
       if (recallTerminal) {
         try { recallTerminal.dispose(); } catch (_) { }
@@ -16117,8 +16419,15 @@
 
         const openBtn = document.createElement('button');
         openBtn.className = 'btn btn-secondary btn-sm md-viewer-history-open';
-        openBtn.textContent = item.path === activePath ? 'Open again' : 'Open';
+        const isActive = item.path === activePath;
+        // "Open again" on the document you are already looking at reads like the
+        // click did nothing. What it does is re-read from disk.
+        openBtn.textContent = isActive ? 'Reload' : 'Open';
         openBtn.addEventListener('click', async () => {
+          if (openBtn.disabled) return;
+          const restoreLabel = openBtn.textContent;
+          openBtn.disabled = true;
+          openBtn.textContent = 'Opening…';
           try {
             const access = await invoke('cmd_get_text_file_access', { path: item.path });
             const content = await invoke('cmd_read_text_file', { path: item.path });
@@ -16134,6 +16443,14 @@
           } catch (e) {
             console.error('Open recent artifact:', e);
             setMdViewerStatus('Could not reopen artifact', 'warning');
+          } finally {
+            // The strip is re-rendered on a successful open, discarding this
+            // button — but on failure it survives, and a permanently disabled
+            // "Opening…" would be worse than the lag it replaced.
+            if (openBtn.isConnected) {
+              openBtn.disabled = false;
+              openBtn.textContent = restoreLabel;
+            }
           }
         });
 
@@ -16176,8 +16493,43 @@
         .replace(/>/g, '&gt;');
     }
 
+    // Inline image data only. Remote schemes are deliberately absent: a note
+    // body is untrusted content, and auto-fetching https: would turn a tracking
+    // pixel pasted into a meeting note into a beacon that reports when the note
+    // was read. That is the one thing a privacy-first notes app must not do.
+    // Local files (file:, relative) need Tauri's asset protocol, which is not
+    // enabled on this app — until it is, they cannot load either.
+    const LOADABLE_IMAGE_SRC = /^\s*data:image\/(png|jpe?g|gif|webp|avif);base64,/i;
+
+    // A data: URI is decoded by the webview with no network round trip to
+    // bound it, so the document itself is the only limit. Cap it: ~1.3 MB of
+    // base64 is a generous inline screenshot and a poor DoS payload. Oversized
+    // images fall through to alt text like any other image we decline.
+    const MAX_INLINE_IMAGE_CHARS = 1_400_000;
+
+    // Above this, skip source annotation. The map allocates one array entry
+    // per code unit of the escaped text, and escaping multiplies '&' fivefold,
+    // so a pathological file can allocate tens of millions of numbers and
+    // wedge the webview. Large files still render and still edit — they just
+    // fall back to whole-document source mode instead of click-to-edit.
+    const MAX_ANNOTATED_SOURCE_CHARS = 500_000;
+
+    // An image we will not load becomes its alt text rather than disappearing.
+    // Silent removal was the old behavior and it made authored content vanish
+    // with no indication that anything had been there.
+    function replaceImageWithAltText(img) {
+      const alt = (img.getAttribute('alt') || '').trim();
+      const src = (img.getAttribute('src') || '').trim();
+      const placeholder = img.ownerDocument.createElement('span');
+      placeholder.className = 'md-image-placeholder';
+      placeholder.textContent = alt ? `🖼 ${alt}` : `🖼 ${src || 'image'}`;
+      if (src) placeholder.setAttribute('title', src);
+      img.replaceWith(placeholder);
+    }
+
     function sanitizeDom(root) {
-      const dangerous = 'script,iframe,object,embed,form,input,textarea,select,button,base,meta,link,style,img,picture,source,video,audio,svg,math';
+      // <img> is no longer blanket-removed; it is filtered by src below.
+      const dangerous = 'script,iframe,object,embed,form,input,textarea,select,button,base,meta,link,style,picture,source,video,audio,svg,math';
       root.querySelectorAll(dangerous).forEach(n => n.remove());
       root.querySelectorAll('*').forEach(el => {
         for (const attr of [...el.attributes]) {
@@ -16194,6 +16546,14 @@
             el.setAttribute('href', '#');
           }
         }
+        if (el.tagName === 'IMG') {
+          el.removeAttribute('srcset');
+          const imgSrc = el.getAttribute('src') || '';
+          if (!LOADABLE_IMAGE_SRC.test(imgSrc) || imgSrc.length > MAX_INLINE_IMAGE_CHARS) {
+            replaceImageWithAltText(el);
+            return;
+          }
+        }
         if (el.hasAttribute('src') && /^\s*javascript:/i.test(el.getAttribute('src'))) {
           el.removeAttribute('src');
         }
@@ -16203,10 +16563,85 @@
       });
     }
 
-    function renderMarkdownToElement(el, markdownText) {
-      const html = marked.parse(escapeHtmlForMarkdown(markdownText));
-      const doc = new DOMParser().parseFromString(html, 'text/html');
+    // Maps every code unit of the string marked actually lexes back to its
+    // index in the original source, so a rendered block can be traced to the
+    // exact bytes that produced it. Two transforms sit between them:
+    //
+    //   1. escapeHtmlForMarkdown expands & < > (to 5, 4, 4 chars).
+    //   2. marked normalizes CRLF to LF before lexing, so token.raw is
+    //      measured against a string with every \r removed.
+    //
+    // (2) is why a CRLF file cannot be annotated from escaped offsets alone:
+    // token.raw lengths sum to less than the escaped text, so every block
+    // after the first line break is off by the number of \r seen so far.
+    // The \n of a CRLF pair anchors at the \r's index, so a block ending at a
+    // line break stops before the \r instead of swallowing it.
+    //
+    // Keep in lockstep with escapeHtmlForMarkdown and with marked's
+    // normalization; the caller's length assertion catches drift in either.
+    function buildSourceOffsetMap(text) {
+      const map = [];
+      for (let i = 0; i < text.length; i++) {
+        const code = text.charCodeAt(i);
+        if (code === 13 && text.charCodeAt(i + 1) === 10) {
+          map.push(i);
+          i++;
+          continue;
+        }
+        const width = code === 38 ? 5 : (code === 60 || code === 62) ? 4 : 1;
+        for (let k = 0; k < width; k++) map.push(i);
+      }
+      map.push(text.length);
+      return map;
+    }
+
+    // Tokens the parser turns into no element at all. `def` is the non-obvious
+    // one: a link reference definition ([1]: http://x) occupies source text but
+    // renders nothing, so it must not consume a rendered block.
+    const INVISIBLE_MARKDOWN_TOKENS = new Set(['space', 'def']);
+
+    // Tag each top-level rendered element with the source range that produced
+    // it, so a click in the preview can open exactly that block for editing.
+    function annotateBlocksWithSource(body, tokens, source) {
+      const offsets = buildSourceOffsetMap(source);
+      const ranges = [];
+      let cursor = 0;
+      for (const token of tokens) {
+        const start = cursor;
+        cursor += token.raw.length;
+        if (!INVISIBLE_MARKDOWN_TOKENS.has(token.type)) ranges.push([start, cursor]);
+      }
+      // Length assertion FIRST, and it is the load-bearing one. The token
+      // stream must account for every code unit the offset map knows about;
+      // if marked normalized something the map did not model, the offsets are
+      // silently wrong while the block count still matches — which is exactly
+      // how CRLF corrupted edits before this check existed. Bail instead.
+      if (cursor !== offsets.length - 1) return false;
+
+      const blocks = [...body.children];
+      // One rendered element per visible token holds across marked's block
+      // grammar, but it is an observation, not a contract it promises to keep.
+      // If a future version breaks it, ship the document unannotated rather
+      // than wiring every click to the wrong line.
+      if (blocks.length !== ranges.length) return false;
+      blocks.forEach((block, i) => {
+        block.classList.add('md-block');
+        block.dataset.srcStart = String(offsets[ranges[i][0]]);
+        block.dataset.srcEnd = String(offsets[ranges[i][1]]);
+      });
+      return true;
+    }
+
+    function renderMarkdownToElement(el, markdownText, { annotateSource = false } = {}) {
+      const source = markdownText || '';
+      // Escape BEFORE parsing so marked can never emit raw HTML; sanitizeDom
+      // is defense in depth, not the only barrier (#404).
+      const tokens = marked.lexer(escapeHtmlForMarkdown(source));
+      const doc = new DOMParser().parseFromString(marked.parser(tokens), 'text/html');
       sanitizeDom(doc.body);
+      if (annotateSource && source.length <= MAX_ANNOTATED_SOURCE_CHARS) {
+        annotateBlocksWithSource(doc.body, tokens, source);
+      }
       el.textContent = '';
       while (doc.body.firstChild) {
         el.appendChild(doc.body.firstChild);
@@ -16300,7 +16735,8 @@
       if (openArtifactKind === 'json') {
         renderJsonToElement(el, text);
       } else if (openArtifactKind === 'markdown') {
-        renderMarkdownToElement(el, text);
+        // Source annotation only matters when the blocks are clickable.
+        renderMarkdownToElement(el, text, { annotateSource: openArtifactEditable });
       } else {
         renderTextToElement(el, text);
       }
@@ -16317,7 +16753,11 @@
     }
 
     function currentArtifactBuffer() {
-      return mdViewerMode === 'source' ? mdViewerEditor.value : (openArtifactContent || '');
+      // In preview mode the editor textarea is normally stale, but inline block
+      // edits write through it so the existing save path stays the single
+      // writer. Once dirty, it is the live buffer in either mode.
+      if (mdViewerMode === 'source' || openArtifactDirty) return mdViewerEditor.value;
+      return openArtifactContent || '';
     }
 
     function formatJsonSource(text) {
@@ -16352,6 +16792,9 @@
       mdViewerPromoteBtn.hidden = !openArtifactPath || openArtifactEditable;
       mdViewerReviewBtn.disabled = !mdViewerReviewData?.available;
       mdViewerContent.style.display = sourceMode ? 'none' : 'block';
+      // Gates the block hover affordance: read-only artifacts should not
+      // advertise an edit that clicking cannot start.
+      mdViewer.classList.toggle('is-editable', openArtifactEditable && openArtifactKind === 'markdown');
       mdViewerEditor.classList.toggle('active', sourceMode);
       mdViewerEditor.readOnly = !openArtifactEditable;
       mdViewerSaveBtn.disabled =
@@ -16378,7 +16821,8 @@
       }
     }
 
-    async function setMdViewerMode(mode) {
+    async function setMdViewerMode(mode, { caret = null } = {}) {
+      commitInlineBlockEditor();
       if (mode === 'source' && !openArtifactEditable) {
         mdViewerMode = 'preview';
       } else {
@@ -16390,7 +16834,16 @@
             ? formatJsonSource(openArtifactContent || '')
             : (openArtifactContent || '');
         }
-        requestAnimationFrame(() => mdViewerEditor.focus());
+        requestAnimationFrame(() => {
+          mdViewerEditor.focus();
+          // Land on the block that was clicked instead of the top of the file.
+          // Without this, opening source on a long document means scrolling to
+          // find the line you were just looking at in the preview.
+          if (caret !== null && caret <= mdViewerEditor.value.length) {
+            mdViewerEditor.setSelectionRange(caret, caret);
+            scrollTextareaToCaret(mdViewerEditor, caret);
+          }
+        });
       } else {
         await flushOpenArtifactSave();
         rerenderOpenArtifact(currentArtifactBuffer(), { preserveScroll: true });
@@ -16426,6 +16879,133 @@
       refreshMdViewerChrome();
     }
 
+    // ──────────────────────────────────────────────────────────────
+    // Inline block editing.
+    // Clicking a rendered block swaps just that block for a textarea holding
+    // its exact source range, so a typo fix in prep notes never means leaving
+    // the rendered view, hunting the line in a full-document source pane, and
+    // switching back. The rest of the document stays rendered around it.
+    // ──────────────────────────────────────────────────────────────
+    let activeBlockEdit = null;
+
+    function autosizeBlockEditor(editor) {
+      editor.style.height = 'auto';
+      editor.style.height = `${editor.scrollHeight}px`;
+    }
+
+    // Setting selectionStart does not scroll a textarea, so a caret restored
+    // deep in a long file lands off-screen. Approximate by hard-line count:
+    // soft-wrapped lines make this an underestimate, which errs toward
+    // scrolling too little and leaving the target visible below the fold.
+    function scrollTextareaToCaret(textarea, caret) {
+      const line = textarea.value.slice(0, caret).split('\n').length - 1;
+      const styles = getComputedStyle(textarea);
+      let lineHeight = parseFloat(styles.lineHeight);
+      if (!Number.isFinite(lineHeight)) lineHeight = parseFloat(styles.fontSize) * 1.7;
+      textarea.scrollTop = Math.max(0, line * lineHeight - textarea.clientHeight / 3);
+    }
+
+    function isInlineBlockEditing() {
+      return activeBlockEdit !== null;
+    }
+
+    function openInlineBlockEditor(block) {
+      if (!openArtifactEditable || openArtifactKind !== 'markdown') return false;
+      const start = Number(block.dataset.srcStart);
+      const end = Number(block.dataset.srcEnd);
+      if (!Number.isInteger(start) || !Number.isInteger(end) || end < start) return false;
+
+      commitInlineBlockEditor();
+
+      const source = currentArtifactBuffer();
+      if (end > source.length) return false;
+      const raw = source.slice(start, end);
+      // Trailing blank lines belong to the document's block separation, not to
+      // the block's text. Hold them aside and restore them verbatim on commit
+      // so editing a paragraph never welds it to the next one. Matches CRLF as
+      // one unit: stripping only \n would leave a stray \r in the editor and
+      // write it back into the middle of the document.
+      const trailing = (raw.match(/(?:\r?\n)*$/) || [''])[0];
+      const body = raw.slice(0, raw.length - trailing.length);
+
+      const editor = document.createElement('textarea');
+      editor.className = 'md-block-editor';
+      editor.spellcheck = false;
+      editor.value = body;
+      editor.addEventListener('input', () => autosizeBlockEditor(editor));
+      editor.addEventListener('blur', () => commitInlineBlockEditor());
+      editor.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          event.stopPropagation();
+          cancelInlineBlockEditor();
+        } else if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
+          event.preventDefault();
+          commitInlineBlockEditor();
+        }
+      });
+      block.replaceWith(editor);
+      activeBlockEdit = {
+        editor, start, end, trailing,
+        original: body,
+        sourceSnapshot: source,
+        // Bytes alone do not identify the document. Two artifacts with
+        // identical contents would pass a bytes-only guard, letting an edit
+        // started in one file commit into the other.
+        path: openArtifactPath,
+      };
+      autosizeBlockEditor(editor);
+      editor.focus();
+      editor.setSelectionRange(body.length, body.length);
+      setMdViewerStatus('Editing block — Esc to cancel', 'unsaved');
+      return true;
+    }
+
+    function commitInlineBlockEditor() {
+      const state = activeBlockEdit;
+      if (!state) return;
+      activeBlockEdit = null;
+      const next = state.editor.value;
+
+      if (next === state.original) {
+        rerenderOpenArtifact(currentArtifactBuffer(), { preserveScroll: true });
+        refreshMdViewerChrome();
+        return;
+      }
+      // The offsets were computed against sourceSnapshot. If anything else
+      // rewrote the buffer while the editor was open, splicing by those offsets
+      // would corrupt the file — drop the edit rather than write at the wrong
+      // index. refreshOpenArtifactIfChanged also holds off while editing, so
+      // this is a backstop, not the primary guard.
+      if (state.path !== openArtifactPath) {
+        setMdViewerStatus('Different document open — inline edit discarded', 'danger');
+        return;
+      }
+      if (currentArtifactBuffer() !== state.sourceSnapshot) {
+        setMdViewerStatus('Document changed — inline edit discarded', 'danger');
+        rerenderOpenArtifact(currentArtifactBuffer(), { preserveScroll: true });
+        return;
+      }
+
+      const updated = state.sourceSnapshot.slice(0, state.start)
+        + next + state.trailing
+        + state.sourceSnapshot.slice(state.end);
+
+      mdViewerEditor.value = updated;
+      openArtifactDirty = updated !== (openArtifactContent || '');
+      if (openArtifactDirty) openArtifactExternalNotice = null;
+      rerenderOpenArtifact(updated, { preserveScroll: true });
+      refreshMdViewerChrome();
+      scheduleOpenArtifactSave();
+    }
+
+    function cancelInlineBlockEditor() {
+      if (!activeBlockEdit) return;
+      activeBlockEdit = null;
+      rerenderOpenArtifact(currentArtifactBuffer(), { preserveScroll: true });
+      refreshMdViewerChrome();
+    }
+
     function rerenderOpenArtifact(markdownText, { preserveScroll = false } = {}) {
       const previousScrollTop = preserveScroll ? mdViewerContent.scrollTop : 0;
       renderArtifactPreview(mdViewerContent, markdownText);
@@ -16439,6 +17019,9 @@
     async function refreshOpenArtifactIfChanged() {
       if (!openArtifactPath || !mdViewer.classList.contains('active')) return;
       if (openArtifactSaving) return;
+      // An open inline editor holds source offsets into the current buffer.
+      // Swapping the document underneath it would invalidate them mid-edit.
+      if (isInlineBlockEditing()) return;
       try {
         const content = await invoke('cmd_read_text_file', { path: openArtifactPath });
         openArtifactLastError = null;
@@ -16482,6 +17065,12 @@
     }
 
     async function flushOpenArtifactSave() {
+      // An open inline editor holds text that has not reached the buffer yet,
+      // and typing in it deliberately does not set openArtifactDirty (the
+      // commit needs an unchanged snapshot to splice against). Without this,
+      // Cmd+S on a clean document is a no-op that silently discards the block
+      // the user just typed.
+      commitInlineBlockEditor();
       if (mdViewerSaveTimer) {
         clearTimeout(mdViewerSaveTimer);
         mdViewerSaveTimer = null;
@@ -16508,7 +17097,11 @@
           openArtifactDirty = currentContent !== savedContent;
           openArtifactExternalNotice = null;
           mdViewerLastSavedAt = new Date();
-          if (mdViewerMode === 'preview') {
+          // Never rerender under a live inline editor: the debounced save can
+          // land while a second block is open, and rerendering would detach
+          // that focused textarea while activeBlockEdit still pointed at it —
+          // the typed text disappears and editing jams.
+          if (mdViewerMode === 'preview' && !isInlineBlockEditing()) {
             rerenderOpenArtifact(currentContent, { preserveScroll: true });
           }
           if (openArtifactDirty) {
@@ -16566,6 +17159,8 @@
       rerenderOpenArtifact(markdownText);
       mdViewerEditor.value = kind === 'json' ? formatJsonSource(markdownText) : markdownText;
       mdViewer.classList.add('active');
+      // Drives the three-pane split: chat yields, the list keeps its width.
+      document.body.classList.add('doc-open');
       // The detail overlay is a fixed full-screen layer (z-index 120) — leaving it
       // open would render the draft behind the meeting note. Close it so the
       // newly-active md-viewer is actually visible.
@@ -16579,26 +17174,57 @@
         resetResummarizeButton();
         clearDetailFeedback();
       }
-      meetingsScroll.style.display = 'none';
-      mdSearchWrap.style.display = 'none';
-      footer.style.display = 'none';
+      // The list, search and footer used to be hidden here because the viewer
+      // was a child of this same pane and had to take their place. It has its
+      // own pane now, so hiding them only blanks the list column and takes
+      // Start Recording with it — the exact thing this layout exists to stop.
       refreshMdViewerChrome();
       startOpenArtifactPolling();
-      try {
-        await invoke('cmd_set_open_artifact', { path });
-      } catch (e) {
-        console.error('Set open artifact:', e);
-      }
-      await persistRecallWorkspaceState({ openArtifactPath: path });
-      await loadRecentArtifacts(path);
-      await refreshArtifactReview();
+      // Everything below is bookkeeping, not display: workspace context files,
+      // assistant focus notification, persisted state, the recents strip, the
+      // review snapshot. cmd_set_open_artifact in particular is synchronous
+      // Rust doing real filesystem writes — awaiting it held the open hostage
+      // for seconds while the document was already rendered. Run the chain in
+      // the background, in order, and bail between steps if the user has
+      // already moved to a different artifact (or closed the viewer) so a
+      // slow step can't stamp stale focus onto the wrong document.
+      (async () => {
+        try {
+          await invoke('cmd_set_open_artifact', { path });
+        } catch (e) {
+          console.error('Set open artifact:', e);
+        }
+        if (openArtifactPath !== path) return;
+        try {
+          await persistRecallWorkspaceState({ openArtifactPath: path });
+        } catch (e) {
+          console.error('Persist artifact state:', e);
+        }
+        if (openArtifactPath !== path) return;
+        try {
+          await loadRecentArtifacts(path);
+        } catch (e) {
+          console.error('Load recent artifacts:', e);
+        }
+        if (openArtifactPath !== path) return;
+        try {
+          await refreshArtifactReview();
+        } catch (e) {
+          console.error('Refresh artifact review:', e);
+        }
+      })();
       return true;
     }
 
     async function hideMdViewer() {
       if (openArtifactDirty) {
         await flushOpenArtifactSave();
-        if (openArtifactDirty) return;
+        if (openArtifactDirty) {
+          // Refusing to close over unsaved work is right; doing it silently is
+          // not. Without this the Back button simply appears broken.
+          setMdViewerStatus('Unsaved changes — could not close', 'danger');
+          return;
+        }
       }
       if (openArtifactPollTimer) {
         clearInterval(openArtifactPollTimer);
@@ -16619,9 +17245,8 @@
       mdViewerReviewData = null;
       mdViewerReviewVisible = false;
       mdViewer.classList.remove('active');
-      meetingsScroll.style.display = '';
-      mdSearchWrap.style.display = '';
-      footer.style.display = '';
+      document.body.classList.remove('doc-open');
+      // Nothing to restore: the list, search and footer are never hidden now.
       mdViewerFilename.textContent = '';
       mdViewerContent.textContent = '';
       mdViewerEditor.value = '';
@@ -16752,11 +17377,18 @@
       }
     }
 
-    document.getElementById('md-viewer-back').addEventListener('click', () => { hideMdViewer(); });
+    document.getElementById('md-viewer-back').addEventListener('click', () => {
+      // hideMdViewer is async; an unhandled rejection here would look exactly
+      // like a dead button.
+      hideMdViewer().catch((e) => {
+        console.error('Close artifact viewer:', e);
+        setMdViewerStatus('Could not close: ' + String(e), 'danger');
+      });
+    });
     mdViewerPreviewBtn.addEventListener('click', () => setMdViewerMode('preview'));
     mdViewerSourceBtn.addEventListener('click', () => setMdViewerMode('source'));
     mdViewerPromoteBtn.addEventListener('click', promoteOpenArtifact);
-    mdViewerSaveBtn.addEventListener('click', saveOpenArtifact);
+    mdViewerSaveBtn.addEventListener('click', flushOpenArtifactSave);
     mdViewerReviewBtn.addEventListener('click', () => {
       if (!mdViewerReviewData?.available) return;
       mdViewerReviewVisible = !mdViewerReviewVisible;
@@ -16815,9 +17447,16 @@
         return;
       }
       if (window.getSelection?.().toString()) return;
-      if (openArtifactEditable && mdViewerMode !== 'source') {
-        await setMdViewerMode('source');
-      }
+      if (event.target?.closest?.('.md-block-editor')) return;
+      if (!openArtifactEditable || mdViewerMode === 'source') return;
+
+      // Prefer editing just the clicked block. Falling through to whole-file
+      // source mode is the path for anything unannotated — a JSON/text
+      // artifact, or a document where the block/token zip did not hold.
+      const block = clickedElement?.closest?.('.md-block[data-src-start]');
+      if (block && openInlineBlockEditor(block)) return;
+      const caret = block ? Number(block.dataset.srcStart) : null;
+      await setMdViewerMode('source', { caret: Number.isInteger(caret) ? caret : null });
     });
 
     // Cmd+O shortcut — only when focus is not inside an editable context or the terminal
