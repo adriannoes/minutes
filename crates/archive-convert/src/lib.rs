@@ -28,6 +28,7 @@ pub const MAX_BLOCKS: usize = 10_000;
 pub const MAX_DOCX_ENTRIES: usize = 2_000;
 pub const MAX_DOCX_XML_BYTES: usize = 24 * 1024 * 1024;
 const WORKER_CPU_SECONDS: u64 = 15;
+#[cfg(target_os = "macos")]
 const WORKER_MEMORY_GROWTH_BYTES: u64 = 1024 * 1024 * 1024;
 const WORKER_DEADLINE: Duration = Duration::from_secs(20);
 const MAX_WORKER_STDERR_BYTES: usize = 4 * 1024;
