@@ -322,6 +322,29 @@
       flex: 1 1 auto;
     }
 
+    /* Three panes: list · chat · document.
+       Chat becomes the flexible middle so the document can hold a real width
+       without squeezing the list below its 260px floor. Without this, an
+       explicitly-sized chat (50%) plus an explicitly-sized document (34%)
+       leaves the list 16% and it overflows its own minimum. */
+    body.doc-open .app-left {
+      flex: 0 0 var(--list-width, 22%);
+    }
+
+    body.doc-open .recall-panel.expanded {
+      width: auto;
+      flex: 1 1 auto;
+      min-width: 280px;
+    }
+
+    /* Cmd+O and the Documents browser can open a document while chat is
+       closed. With the list pinned and the doc at a fixed 34%, nothing left
+       had flex-grow — 44% of the window sat empty. Two panes: doc takes the
+       remainder. (.recall-panel precedes .md-viewer in the DOM, so ~ works.) */
+    body.doc-open .recall-panel:not(.expanded) ~ .md-viewer.active {
+      flex: 1 1 auto;
+    }
+
     .window-drag-strip {
       display: none;
     }
@@ -1914,15 +1937,42 @@
     }
 
     /* ── Markdown viewer (replaces meeting list) ── */
+    /* Row feedback while the two open IPC calls run — without it a slow open
+       reads as a dead click and gets clicked again. */
+    .document-item.is-opening {
+      opacity: 0.55;
+      pointer-events: none;
+      cursor: progress;
+    }
+
+    /* A top-level pane now, not a child of the list pane. `flex: 1` was right
+       when it filled a flex COLUMN; as a row sibling it needs a width basis,
+       and zero width when closed so the app renders exactly as before until a
+       document is actually opened. */
     .md-viewer {
       display: none;
       flex-direction: column;
-      flex: 1;
+      flex: 0 0 0;
+      width: 0;
+      min-width: 0;
       min-height: 0;
+      overflow: hidden;
+      background: var(--bg);
     }
 
     .md-viewer.active {
       display: flex;
+      flex: 0 0 var(--doc-width, 34%);
+      width: auto;
+      min-width: 280px;
+      border-left: 1px solid var(--border);
+    }
+
+    /* Collapsing the list must not shrink the document — that pairing is the
+       whole point of the live-meeting layout. Let it reclaim the freed space
+       the same way the chat panel does. */
+    body.sidebar-collapsed .md-viewer.active {
+      flex-basis: var(--doc-width, 40%);
     }
 
     .md-viewer-header {
@@ -1932,6 +1982,20 @@
       padding: 8px 16px;
       border-bottom: 1px solid var(--border);
       flex-shrink: 0;
+      /* The pane now reaches the window's top edge, which puts this header
+         under the fixed 32px .window-drag-strip (z-index 5) on macOS — an
+         invisible drag region that swallows clicks, so ×/Review/Revert felt
+         dead. Lift the header above it, keep its background draggable like
+         .recall-header, and opt the controls out. */
+      position: relative;
+      z-index: 6;
+      -webkit-app-region: drag;
+    }
+
+    .md-viewer-header button,
+    .md-viewer-header .md-viewer-toolbar,
+    .md-viewer-header .md-viewer-status {
+      -webkit-app-region: no-drag;
     }
 
     .md-viewer-header-main {
@@ -2047,7 +2111,11 @@
     .md-viewer-content {
       flex: 1;
       overflow-y: auto;
-      padding: 16px 20px;
+      /* Mirror the source editor's centered 70ch column. The old 16/20px was
+         sized for the narrow list pane; in a wide pane it ran text nearly
+         edge to edge. Symmetric max() padding centers the measure and never
+         drops below 28px at narrow widths. */
+      padding: 24px max(28px, calc((100% - 70ch) / 2)) 32px;
       -webkit-user-select: text;
       user-select: text;
     }
@@ -2193,7 +2261,10 @@
       display: none;
       gap: 10px;
       overflow-x: auto;
-      padding: 10px 18px 0;
+      /* Bottom padding is not decorative: with 0 the active card's ring sits
+         flush against the scroll container and gets clipped along its lower
+         edge. */
+      padding: 10px 18px 10px;
     }
 
     .md-viewer-history.active {
@@ -3941,7 +4012,12 @@
 
     .footer-action-secondary {
       display: grid;
-      grid-template-columns: minmax(0, 0.72fr) minmax(0, 1.55fr) minmax(0, 1fr);
+      /* Whole buttons wrap to a second row instead of labels breaking
+         mid-word. Sized by the pane, not the viewport: the old ≥540px media
+         override re-imposed three rigid columns whenever the WINDOW was wide,
+         but with a document open the list pane pins to 22%, so a wide window
+         and a 320px pane coexist — exactly when it broke. */
+      grid-template-columns: repeat(auto-fit, minmax(96px, 1fr));
       gap: 4px;
     }
 
@@ -3981,9 +4057,6 @@
         grid-template-columns: 1fr;
       }
 
-      .footer-action-secondary {
-        grid-template-columns: minmax(0, 0.72fr) minmax(0, 1.55fr) minmax(0, 1fr);
-      }
     }
 
     /* ── Buttons ── */
@@ -5712,44 +5785,6 @@
     </div>
 
     <!-- Markdown viewer (replaces meeting list when a file is open) -->
-    <div class="md-viewer" id="md-viewer">
-      <div class="md-viewer-header">
-        <div class="md-viewer-header-main">
-          <button class="md-viewer-back" id="md-viewer-back" title="Back to meetings">←</button>
-          <span class="md-viewer-filename" id="md-viewer-filename"></span>
-          <span class="md-viewer-kind" id="md-viewer-kind">MD</span>
-        </div>
-        <div class="md-viewer-toolbar">
-          <button class="btn md-viewer-mode-btn active" id="md-viewer-preview-btn">Preview</button>
-          <button class="btn md-viewer-mode-btn" id="md-viewer-source-btn">Source</button>
-          <span class="md-viewer-toolbar-sep"></span>
-          <button class="btn" id="md-viewer-promote-btn" hidden>Make Editable Copy</button>
-          <button class="btn" id="md-viewer-save-btn" disabled>Save</button>
-          <button class="btn" id="md-viewer-review-btn" disabled>Review</button>
-          <button class="btn" id="md-viewer-revert-btn" disabled>Revert</button>
-          <span class="md-viewer-status" id="md-viewer-status">Viewing</span>
-        </div>
-      </div>
-      <div class="md-viewer-history" id="md-viewer-history"></div>
-      <div class="md-viewer-review" id="md-viewer-review">
-        <div class="md-viewer-review-head">
-          <div class="md-viewer-review-title">Last Change Review</div>
-          <div class="md-viewer-review-meta" id="md-viewer-review-meta"></div>
-        </div>
-        <div class="md-viewer-review-grid">
-          <div class="md-viewer-review-col">
-            <div class="md-viewer-review-label">Before</div>
-            <pre class="md-viewer-review-pre" id="md-viewer-review-before"></pre>
-          </div>
-          <div class="md-viewer-review-col">
-            <div class="md-viewer-review-label">Current</div>
-            <pre class="md-viewer-review-pre" id="md-viewer-review-current"></pre>
-          </div>
-        </div>
-      </div>
-      <div class="md-viewer-content" id="md-viewer-content"></div>
-      <textarea class="md-viewer-editor" id="md-viewer-editor" spellcheck="false"></textarea>
-    </div>
 
     <!-- Meeting list -->
     <div class="meetings-scroll" id="meetings-scroll">
@@ -5834,6 +5869,52 @@
       Session ended.
       <button class="btn btn-secondary btn-sm" id="btn-recall-restart">Restart</button>
     </div>
+  </div>
+
+  <!-- ── Document pane ──
+       Sibling of .app-left and .recall-panel, not a child of the list pane.
+       Living inside .app-left meant `body.sidebar-collapsed .app-left > *
+       { visibility: hidden }` hid an open document whenever the list was
+       collapsed — so the one gesture that would give notes more room during
+       a meeting destroyed the view instead. Ordered after the chat panel to
+       match where every assistant surface puts its artifact panel. ── -->
+  <div class="md-viewer" id="md-viewer">
+    <div class="md-viewer-header">
+      <div class="md-viewer-header-main">
+        <button class="md-viewer-back" id="md-viewer-back" title="Close document">×</button>
+        <span class="md-viewer-filename" id="md-viewer-filename"></span>
+        <span class="md-viewer-kind" id="md-viewer-kind">MD</span>
+      </div>
+      <div class="md-viewer-toolbar">
+        <button class="btn md-viewer-mode-btn active" id="md-viewer-preview-btn">Preview</button>
+        <button class="btn md-viewer-mode-btn" id="md-viewer-source-btn">Source</button>
+        <span class="md-viewer-toolbar-sep"></span>
+        <button class="btn" id="md-viewer-promote-btn" hidden>Make Editable Copy</button>
+        <button class="btn" id="md-viewer-save-btn" disabled>Save</button>
+        <button class="btn" id="md-viewer-review-btn" disabled>Review</button>
+        <button class="btn" id="md-viewer-revert-btn" disabled>Revert</button>
+        <span class="md-viewer-status" id="md-viewer-status">Viewing</span>
+      </div>
+    </div>
+    <div class="md-viewer-history" id="md-viewer-history"></div>
+    <div class="md-viewer-review" id="md-viewer-review">
+      <div class="md-viewer-review-head">
+        <div class="md-viewer-review-title">Last Change Review</div>
+        <div class="md-viewer-review-meta" id="md-viewer-review-meta"></div>
+      </div>
+      <div class="md-viewer-review-grid">
+        <div class="md-viewer-review-col">
+          <div class="md-viewer-review-label">Before</div>
+          <pre class="md-viewer-review-pre" id="md-viewer-review-before"></pre>
+        </div>
+        <div class="md-viewer-review-col">
+          <div class="md-viewer-review-label">Current</div>
+          <pre class="md-viewer-review-pre" id="md-viewer-review-current"></pre>
+        </div>
+      </div>
+    </div>
+    <div class="md-viewer-content" id="md-viewer-content"></div>
+    <textarea class="md-viewer-editor" id="md-viewer-editor" spellcheck="false"></textarea>
   </div>
 
   <!-- In-app meeting detail view -->
@@ -10787,15 +10868,33 @@
         badge.textContent = doc.kind || 'text';
 
         const openDocument = async () => {
+          if (item.classList.contains('is-opening')) return;
+          item.classList.add('is-opening');
+          item.setAttribute('aria-busy', 'true');
+          const t0 = performance.now();
+          let tAccess = 0, tRead = 0;
           try {
             const access = await invoke('cmd_get_text_file_access', { path: doc.path });
+            tAccess = performance.now() - t0;
             const content = await invoke('cmd_read_text_file', { path: doc.path });
+            tRead = performance.now() - t0 - tAccess;
             await showMdViewer(doc.path, doc.filename || doc.path.split(/[\\/]/).pop() || doc.path, content, {
               editable: !!access.editable,
               kind: access.kind || doc.kind || 'text',
             });
           } catch (e) {
             console.error('Open document:', e);
+          } finally {
+            item.classList.remove('is-opening');
+            item.removeAttribute('aria-busy');
+            const total = performance.now() - t0;
+            const tShow = total - tAccess - tRead;
+            console.log(`[md-open] access ${Math.round(tAccess)}ms · read ${Math.round(tRead)}ms · show ${Math.round(tShow)}ms · ${doc.path}`);
+            if (total > 800) {
+              const phases = [['access check', tAccess], ['file read', tRead], ['viewer setup', tShow]];
+              phases.sort((a, b) => b[1] - a[1]);
+              setMdViewerStatus(`Slow open — ${phases[0][0]} ${(phases[0][1] / 1000).toFixed(1)}s`, 'warning');
+            }
           }
         };
 
@@ -16267,8 +16366,15 @@
 
         const openBtn = document.createElement('button');
         openBtn.className = 'btn btn-secondary btn-sm md-viewer-history-open';
-        openBtn.textContent = item.path === activePath ? 'Open again' : 'Open';
+        const isActive = item.path === activePath;
+        // "Open again" on the document you are already looking at reads like the
+        // click did nothing. What it does is re-read from disk.
+        openBtn.textContent = isActive ? 'Reload' : 'Open';
         openBtn.addEventListener('click', async () => {
+          if (openBtn.disabled) return;
+          const restoreLabel = openBtn.textContent;
+          openBtn.disabled = true;
+          openBtn.textContent = 'Opening…';
           try {
             const access = await invoke('cmd_get_text_file_access', { path: item.path });
             const content = await invoke('cmd_read_text_file', { path: item.path });
@@ -16284,6 +16390,14 @@
           } catch (e) {
             console.error('Open recent artifact:', e);
             setMdViewerStatus('Could not reopen artifact', 'warning');
+          } finally {
+            // The strip is re-rendered on a successful open, discarding this
+            // button — but on failure it survives, and a permanently disabled
+            // "Opening…" would be worse than the lag it replaced.
+            if (openBtn.isConnected) {
+              openBtn.disabled = false;
+              openBtn.textContent = restoreLabel;
+            }
           }
         });
 
@@ -16992,6 +17106,8 @@
       rerenderOpenArtifact(markdownText);
       mdViewerEditor.value = kind === 'json' ? formatJsonSource(markdownText) : markdownText;
       mdViewer.classList.add('active');
+      // Drives the three-pane split: chat yields, the list keeps its width.
+      document.body.classList.add('doc-open');
       // The detail overlay is a fixed full-screen layer (z-index 120) — leaving it
       // open would render the draft behind the meeting note. Close it so the
       // newly-active md-viewer is actually visible.
@@ -17005,26 +17121,57 @@
         resetResummarizeButton();
         clearDetailFeedback();
       }
-      meetingsScroll.style.display = 'none';
-      mdSearchWrap.style.display = 'none';
-      footer.style.display = 'none';
+      // The list, search and footer used to be hidden here because the viewer
+      // was a child of this same pane and had to take their place. It has its
+      // own pane now, so hiding them only blanks the list column and takes
+      // Start Recording with it — the exact thing this layout exists to stop.
       refreshMdViewerChrome();
       startOpenArtifactPolling();
-      try {
-        await invoke('cmd_set_open_artifact', { path });
-      } catch (e) {
-        console.error('Set open artifact:', e);
-      }
-      await persistRecallWorkspaceState({ openArtifactPath: path });
-      await loadRecentArtifacts(path);
-      await refreshArtifactReview();
+      // Everything below is bookkeeping, not display: workspace context files,
+      // assistant focus notification, persisted state, the recents strip, the
+      // review snapshot. cmd_set_open_artifact in particular is synchronous
+      // Rust doing real filesystem writes — awaiting it held the open hostage
+      // for seconds while the document was already rendered. Run the chain in
+      // the background, in order, and bail between steps if the user has
+      // already moved to a different artifact (or closed the viewer) so a
+      // slow step can't stamp stale focus onto the wrong document.
+      (async () => {
+        try {
+          await invoke('cmd_set_open_artifact', { path });
+        } catch (e) {
+          console.error('Set open artifact:', e);
+        }
+        if (openArtifactPath !== path) return;
+        try {
+          await persistRecallWorkspaceState({ openArtifactPath: path });
+        } catch (e) {
+          console.error('Persist artifact state:', e);
+        }
+        if (openArtifactPath !== path) return;
+        try {
+          await loadRecentArtifacts(path);
+        } catch (e) {
+          console.error('Load recent artifacts:', e);
+        }
+        if (openArtifactPath !== path) return;
+        try {
+          await refreshArtifactReview();
+        } catch (e) {
+          console.error('Refresh artifact review:', e);
+        }
+      })();
       return true;
     }
 
     async function hideMdViewer() {
       if (openArtifactDirty) {
         await flushOpenArtifactSave();
-        if (openArtifactDirty) return;
+        if (openArtifactDirty) {
+          // Refusing to close over unsaved work is right; doing it silently is
+          // not. Without this the Back button simply appears broken.
+          setMdViewerStatus('Unsaved changes — could not close', 'danger');
+          return;
+        }
       }
       if (openArtifactPollTimer) {
         clearInterval(openArtifactPollTimer);
@@ -17045,9 +17192,8 @@
       mdViewerReviewData = null;
       mdViewerReviewVisible = false;
       mdViewer.classList.remove('active');
-      meetingsScroll.style.display = '';
-      mdSearchWrap.style.display = '';
-      footer.style.display = '';
+      document.body.classList.remove('doc-open');
+      // Nothing to restore: the list, search and footer are never hidden now.
       mdViewerFilename.textContent = '';
       mdViewerContent.textContent = '';
       mdViewerEditor.value = '';
@@ -17178,7 +17324,14 @@
       }
     }
 
-    document.getElementById('md-viewer-back').addEventListener('click', () => { hideMdViewer(); });
+    document.getElementById('md-viewer-back').addEventListener('click', () => {
+      // hideMdViewer is async; an unhandled rejection here would look exactly
+      // like a dead button.
+      hideMdViewer().catch((e) => {
+        console.error('Close artifact viewer:', e);
+        setMdViewerStatus('Could not close: ' + String(e), 'danger');
+      });
+    });
     mdViewerPreviewBtn.addEventListener('click', () => setMdViewerMode('preview'));
     mdViewerSourceBtn.addEventListener('click', () => setMdViewerMode('source'));
     mdViewerPromoteBtn.addEventListener('click', promoteOpenArtifact);
