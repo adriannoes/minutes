@@ -50,7 +50,9 @@
 mod bounded;
 pub use bounded::{BoundedTranscriber, WORKER_MARKER};
 
+#[cfg(target_os = "macos")]
 use std::ffi::{c_char, CStr};
+#[cfg(target_os = "macos")]
 use std::ptr;
 
 use serde::{Deserialize, Serialize};

@@ -28,6 +28,7 @@ const MAX_WORKER_STDERR_BYTES: usize = 4 * 1024;
 const WORKER_RESPONSE_DEADLINE: Duration = Duration::from_secs(30);
 const WORKER_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(2);
 const WORKER_CPU_SECONDS: u64 = 600;
+#[cfg(target_os = "macos")]
 const WORKER_MEMORY_GROWTH_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
