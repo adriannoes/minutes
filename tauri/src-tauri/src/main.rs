@@ -302,7 +302,12 @@ pub(crate) fn show_main_window(app: &tauri::AppHandle) {
         // Empty title hides the centered "Minutes" text in any native chrome.
         // The in-app brand mark (italic m + recording dot) carries the identity.
         .title("")
-        .inner_size(560.0, 700.0)
+        // 560px was sized for a single list pane. Chat expands to half the
+        // window and a document opens beside it; three panes need ~820px just
+        // to reach their minimums and stop fighting near 1000. First launch
+        // now opens wide enough for the layout the app actually has. Returning
+        // users keep their saved size (tauri_plugin_window_state).
+        .inner_size(1120.0, 720.0)
         .min_inner_size(460.0, 520.0)
         // The main window is hidden, shown, and resized while the app lives in
         // the tray. On macOS 26, keeping that long-lived WebView transparent
