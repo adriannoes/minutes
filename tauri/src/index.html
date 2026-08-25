@@ -5108,8 +5108,11 @@
       grid-template-columns: 1fr;
     }
 
+    /* Written for the old three-button row. The picker is the only visible
+       child now (the originals are hidden), so three fixed tracks parked it
+       in a 0.72fr sliver during capture — "M… M… L…". One full-width track. */
     .footer.capture-mode .footer-action-secondary {
-      grid-template-columns: minmax(0, 0.72fr) minmax(0, 1.55fr) minmax(0, 1fr);
+      grid-template-columns: 1fr;
     }
 
     .btn {
