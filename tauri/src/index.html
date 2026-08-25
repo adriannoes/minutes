@@ -345,6 +345,16 @@
       box-shadow: -8px 0 24px var(--shadow-soft);
     }
 
+    /* Collapsed must beat doc-open. Both selectors have equal specificity and
+       this block comes later, so with a document open the list kept its 22%
+       while every child was visibility:hidden — a blank column where the
+       list used to be, and chat never reclaimed the space. */
+    body.sidebar-collapsed.doc-open .app-left {
+      flex: 0 0 0;
+      width: 0;
+      min-width: 0;
+    }
+
     body.doc-open .recall-panel.expanded {
       width: auto;
       flex: 1 1 auto;
@@ -1840,6 +1850,12 @@
 
     .list-toggle-btn {
       padding: 6px 10px;
+    }
+
+    .recall-toggle-btn {
+      position: relative;
+      margin-left: auto;
+      margin-right: 6px;
     }
 
     .sidebar-collapse-btn {
@@ -5739,6 +5755,11 @@
         <div class="list-header-group">
           <button class="sidebar-collapse-btn" id="btn-sidebar-collapse" type="button" aria-label="Collapse list pane" title="Collapse list pane">‹</button>
         </div>
+        <!-- Recall opens a panel; it is navigation, not capture, so it lives
+             with the other pane controls rather than beside Start Recording.
+             Same id and nudge element: every existing handler keeps working. -->
+        <button class="list-toggle-btn recall-toggle-btn" id="btn-assistant" type="button" aria-expanded="false" title="Open Recall">Recall <span class="recall-nudge"
+            id="recall-nudge" aria-label="Recall has new content"></span></button>
         <button class="list-toggle-btn" id="btn-documents-toggle" type="button" aria-pressed="false">Documents</button>
       </div>
       <input class="search-box" type="text" placeholder="Search recordings..." id="search-input" />
@@ -5880,8 +5901,6 @@
             title="Start live transcription — ask your agent in Recall for coaching"
             aria-label="Start live transcription">Live</button>
           <button class="btn btn-secondary" id="btn-quick-thought">Quick Thought</button>
-          <button class="btn btn-secondary" id="btn-assistant" aria-expanded="false">Recall <span class="recall-nudge"
-              id="recall-nudge" aria-label="Recall has new content"></span></button>
         </div>
       </div>
     </div>
@@ -7576,13 +7595,8 @@
       const actions = document.createElement('div');
       actions.className = 'ambient-context-actions';
 
-      const recallBtn = document.createElement('button');
-      recallBtn.className = 'btn btn-secondary btn-sm';
-      recallBtn.textContent = 'Open Recall';
-      recallBtn.addEventListener('click', () => {
-        openRecall('assistant');
-      });
-
+      // Open Recall used to live here too; Recall now has a permanent home in
+      // the list header, so the card keeps only what is unique to it.
       const weeklyBtn = document.createElement('button');
       weeklyBtn.className = 'btn btn-secondary btn-sm';
       weeklyBtn.textContent = 'Weekly';
@@ -7590,7 +7604,6 @@
         openWeeklyPhase();
       });
 
-      actions.appendChild(recallBtn);
       actions.appendChild(weeklyBtn);
 
       card.appendChild(title);
@@ -10925,9 +10938,11 @@
 
         const meta = document.createElement('div');
         meta.className = 'meeting-meta';
-        const source = doc.source === 'assistant'
-          ? 'assistant'
-          : (doc.meeting_slug || 'meeting');
+        // 'meeting' rows carry a slug; every other source ('assistant',
+        // 'prep') is its own label.
+        const source = doc.source === 'meeting'
+          ? (doc.meeting_slug || 'meeting')
+          : doc.source;
         meta.textContent = [formatRelativeTime(doc.mtime), source].filter(Boolean).join(' · ');
 
         info.appendChild(title);
@@ -13900,6 +13915,16 @@
     let recallResizeObserver = null;
     let recallThemeHandler = null;
     let recallThemeObserver = null;
+
+    // The app theme can be forced via data-theme (settings/localStorage), in
+    // which case the OS media query is the wrong authority. Used for the
+    // terminal palette and exported to the PTY child as COLORFGBG.
+    function isEffectiveDarkTheme() {
+      const forced = document.documentElement.getAttribute('data-theme');
+      if (forced === 'dark') return true;
+      if (forced === 'light') return false;
+      return window.MINUTES_XTERM_THEME_QUERY.matches;
+    }
     let expandAnimating = false;
 
     // ── Recall native chat state ──
@@ -14324,12 +14349,7 @@
       // in which case the OS media query is the wrong authority — following
       // it painted a dark terminal slab into a light UI whenever the two
       // disagreed.
-      const effectiveTerminalDark = () => {
-        const forced = document.documentElement.getAttribute('data-theme');
-        if (forced === 'dark') return true;
-        if (forced === 'light') return false;
-        return window.MINUTES_XTERM_THEME_QUERY.matches;
-      };
+      const effectiveTerminalDark = isEffectiveDarkTheme;
 
       recallTerminal = new Terminal({
         theme: window.getMinutesTheme(effectiveTerminalDark()),
@@ -14363,9 +14383,24 @@
         if (!recallExpanded) return;
         clearTimeout(fitTimeout);
         fitTimeout = setTimeout(() => {
-          if (!recallFitAddon) return;
+          if (!recallFitAddon || !recallTerminal) return;
+          // Resizing reflows the buffer, and a TUI answering the SIGWINCH
+          // redraws from scratch — both of which used to leave the viewport
+          // parked at the top of scrollback. Every window drag, pane open,
+          // or list collapse threw the reader back up to the beginning of a
+          // long answer. Remember whether they were following the tail and
+          // put them back there.
+          const buf = recallTerminal.buffer.active;
+          const wasAtBottom = buf.viewportY >= buf.baseY;
+          const prevCols = recallTerminal.cols;
+          const prevRows = recallTerminal.rows;
           recallFitAddon.fit();
-          if (recallPtyAlive && recallTerminal) {
+          if (wasAtBottom) recallTerminal.scrollToBottom();
+          // Only tell the child when the grid actually changed. A width jitter
+          // that rounds to the same cell grid still fired SIGWINCH and forced a
+          // full TUI redraw for nothing.
+          const gridChanged = recallTerminal.cols !== prevCols || recallTerminal.rows !== prevRows;
+          if (recallPtyAlive && gridChanged) {
             invoke('cmd_pty_resize', {
               sessionId: SESSION_ID,
               cols: recallTerminal.cols,
@@ -14573,7 +14608,7 @@
           // Always re-apply deferred mode, even to an existing PTY. This
           // clears any stale CURRENT_MEETING.md before a new question while
           // the backend keeps the already-running terminal session intact.
-          await invoke('cmd_spawn_terminal', { mode: 'deferred' });
+          await invoke('cmd_spawn_terminal', { mode: 'deferred', themeDark: isEffectiveDarkTheme() });
           recallPtyAlive = true;
           recallEndBtn.classList.add('active');
         } catch (e) {
@@ -15006,7 +15041,7 @@
       await registerPtyListeners();
 
       try {
-        const opts = { mode };
+        const opts = { mode, themeDark: isEffectiveDarkTheme() };
         if (meetingPath) opts.meetingPath = meetingPath;
         await invoke('cmd_spawn_terminal', opts);
         recallPtyAlive = true;
@@ -16903,6 +16938,9 @@
       mdViewerPreviewBtn.classList.toggle('active', !sourceMode);
       mdViewerSourceBtn.classList.toggle('active', sourceMode);
       mdViewerSourceBtn.disabled = !openArtifactEditable;
+      if (!openArtifactEditable && openArtifactPath && mdViewerStatus.textContent === 'Viewing') {
+        mdViewerStatus.textContent = 'Read-only';
+      }
       mdViewerPromoteBtn.hidden = !openArtifactPath || openArtifactEditable;
       mdViewerReviewBtn.disabled = !mdViewerReviewData?.available;
       mdViewerContent.style.display = sourceMode ? 'none' : 'block';
