@@ -4108,7 +4108,13 @@
     }
 
     .footer-device-picker .device-picker {
+      /* A native select sizes itself to its longest option (a device name can
+         be long) and, as a grid item, drags its cell wider than the card.
+         Own the width outright. */
+      width: 100%;
+      min-width: 0;
       max-width: 100%;
+      box-sizing: border-box;
     }
 
     @media (min-width: 540px) {
