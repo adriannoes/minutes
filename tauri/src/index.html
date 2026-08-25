@@ -13835,6 +13835,16 @@
     let recallResizeObserver = null;
     let recallThemeHandler = null;
     let recallThemeObserver = null;
+
+    // The app theme can be forced via data-theme (settings/localStorage), in
+    // which case the OS media query is the wrong authority. Used for the
+    // terminal palette and exported to the PTY child as COLORFGBG.
+    function isEffectiveDarkTheme() {
+      const forced = document.documentElement.getAttribute('data-theme');
+      if (forced === 'dark') return true;
+      if (forced === 'light') return false;
+      return window.MINUTES_XTERM_THEME_QUERY.matches;
+    }
     let expandAnimating = false;
 
     // ── Recall native chat state ──
@@ -14240,12 +14250,7 @@
       // in which case the OS media query is the wrong authority — following
       // it painted a dark terminal slab into a light UI whenever the two
       // disagreed.
-      const effectiveTerminalDark = () => {
-        const forced = document.documentElement.getAttribute('data-theme');
-        if (forced === 'dark') return true;
-        if (forced === 'light') return false;
-        return window.MINUTES_XTERM_THEME_QUERY.matches;
-      };
+      const effectiveTerminalDark = isEffectiveDarkTheme;
 
       recallTerminal = new Terminal({
         theme: window.getMinutesTheme(effectiveTerminalDark()),
@@ -14489,7 +14494,7 @@
           // Always re-apply deferred mode, even to an existing PTY. This
           // clears any stale CURRENT_MEETING.md before a new question while
           // the backend keeps the already-running terminal session intact.
-          await invoke('cmd_spawn_terminal', { mode: 'deferred' });
+          await invoke('cmd_spawn_terminal', { mode: 'deferred', themeDark: isEffectiveDarkTheme() });
           recallPtyAlive = true;
           recallEndBtn.classList.add('active');
         } catch (e) {
@@ -14922,7 +14927,7 @@
       await registerPtyListeners();
 
       try {
-        const opts = { mode };
+        const opts = { mode, themeDark: isEffectiveDarkTheme() };
         if (meetingPath) opts.meetingPath = meetingPath;
         await invoke('cmd_spawn_terminal', opts);
         recallPtyAlive = true;
