@@ -975,13 +975,18 @@ fn spawn_client(stream: Stream, shared: Arc<SharedRelayState>, auth_token: Strin
 }
 
 fn handle_client(
-    mut stream: Stream,
+    stream: Stream,
     shared: &Arc<SharedRelayState>,
     auth_token: &str,
 ) -> Result<(), CaptureRelayError> {
-    let read_stream = interprocess::TryClone::try_clone(&stream)?;
-    let mut reader = BufReader::new(read_stream);
+    // Read the one client request through the original handle, then recover it
+    // for replies. A cloned Windows named-pipe read handle can tear down an
+    // otherwise idle observer when that clone is dropped after the handshake.
+    // Unix sockets do not expose the race because a duplicated descriptor has
+    // ordinary reference-counted close semantics.
+    let mut reader = BufReader::new(stream);
     let hello: ClientHello = read_json_line(&mut reader)?;
+    let mut stream = reader.into_inner();
     if hello.v != RELAY_PROTOCOL_VERSION {
         write_frame(
             &mut stream,
