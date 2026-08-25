@@ -829,11 +829,11 @@ fn connection_closed_error() -> CaptureRelayError {
 
 #[cfg(windows)]
 fn windows_stream_has_data(stream: &Stream) -> io::Result<bool> {
-    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::io::{AsHandle, AsRawHandle};
     use windows_sys::Win32::System::Pipes::PeekNamedPipe;
 
     let raw_handle = match stream {
-        Stream::NamedPipe(named_pipe) => named_pipe.as_raw_handle(),
+        Stream::NamedPipe(named_pipe) => named_pipe.as_handle().as_raw_handle(),
     };
     let mut available = 0_u32;
     let success = unsafe {
