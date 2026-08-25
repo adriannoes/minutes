@@ -3178,12 +3178,33 @@ const LEGACY_POLICY_CACHE_NAMES: &[&str] = &[
     "graph.db-journal",
 ];
 
+/// How long a retirement caller waits for a peer that holds the lease.
+/// Retirement itself takes milliseconds; the wait exists so concurrent
+/// startup readers serialize instead of the loser failing.
+const LEGACY_POLICY_CACHE_RETIREMENT_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+const LEGACY_POLICY_CACHE_RETIREMENT_POLL: std::time::Duration =
+    std::time::Duration::from_millis(25);
+
+/// Whether any legacy cache file or the legacy `graph` directory is present.
+/// Checked through the bound directory so a symlinked or replaced entry is
+/// refused the same way the retirement itself refuses it.
+fn legacy_policy_cache_entries_exist(state: &BoundRecoveryDirectory) -> std::io::Result<bool> {
+    for name in LEGACY_POLICY_CACHE_NAMES {
+        if state.entry_exists(OsStr::new(name))? {
+            return Ok(true);
+        }
+    }
+    state.entry_exists(OsStr::new("graph"))
+}
+
 /// Remove durable search/graph projections created by Minutes versions that
 /// predate process-private policy projections.
 ///
-/// Cleanup is capability-bound, serialized across current processes, and
-/// nonblocking. Startup callers may warn and continue when another process owns
-/// the cleanup lease; answer-time callers fail closed instead of waiting.
+/// Cleanup is capability-bound and serialized across current processes with a
+/// bounded wait: a caller that finds the lease held waits up to two seconds for
+/// the holder to finish rather than failing on the spot. The steady state --
+/// nothing left to retire -- takes no lease at all. Startup callers may warn
+/// and continue if the wait times out; answer-time callers fail closed.
 /// Every exact single-link file is truncated before unlink so an
 /// already-open legacy descriptor cannot retain meeting metadata. Symlinks,
 /// hard links, directories, replacement races, and unsafe state roots are
@@ -3244,13 +3265,33 @@ fn retire_legacy_policy_caches_at(state_root: &Path) -> std::io::Result<()> {
     }
 
     let state = BoundRecoveryDirectory::prepare_owner_private(state_root)?;
+
+    // Fast path. After the one-time migration nothing is left to retire, and
+    // this runs on every search/graph open. Without it, concurrent startup
+    // readers (meeting inventory, config, graph, ambient context) raced for a
+    // lease held for microseconds, and the loser surfaced a fatal "another
+    // process" error that was really another thread a few milliseconds earlier.
+    if !legacy_policy_cache_entries_exist(&state)? {
+        return Ok(());
+    }
+
     let lease =
         state.bind_or_create_private_lease_file(OsStr::new("policy-cache-retirement.lock"))?;
-    if !lease.try_lock_exclusive()? {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::WouldBlock,
-            "another process is retiring legacy policy caches",
-        ));
+    let deadline = std::time::Instant::now() + LEGACY_POLICY_CACHE_RETIREMENT_WAIT;
+    loop {
+        if lease.try_lock_exclusive()? {
+            break;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            // Bounded on purpose: a wedged holder or a stalled sync must not
+            // freeze startup. Callers still fail closed on this error.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "timed out waiting for a peer to finish retiring legacy policy caches",
+            ));
+        }
+        std::thread::sleep(LEGACY_POLICY_CACHE_RETIREMENT_POLL.min(deadline - now));
     }
 
     for name in LEGACY_POLICY_CACHE_NAMES {
@@ -3310,7 +3351,9 @@ mod tests {
     }
 
     #[test]
-    fn legacy_policy_cache_retirement_never_waits_on_a_peer_lease() {
+    fn legacy_policy_cache_retirement_fast_path_ignores_a_busy_lease() {
+        // Nothing to retire: a held lease must not matter, because in the
+        // steady state no lease is taken at all.
         let root = tempfile::TempDir::new().unwrap();
         let state_path = root.path().join("state");
         let state = BoundRecoveryDirectory::prepare_owner_private(&state_path).unwrap();
@@ -3320,9 +3363,53 @@ mod tests {
         assert!(lease.try_lock_exclusive().unwrap());
 
         let started = std::time::Instant::now();
+        retire_legacy_policy_caches_at(&state_path).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn legacy_policy_cache_retirement_waits_for_a_peer_then_retires() {
+        // The startup race: a peer holds the lease while legacy bytes exist.
+        // The caller must wait for the peer, then retire, not fail.
+        let root = tempfile::TempDir::new().unwrap();
+        let state_path = root.path().join("state");
+        let state = BoundRecoveryDirectory::prepare_owner_private(&state_path).unwrap();
+        let search = state_path.join("search.db");
+        fs::write(&search, b"PRIVATE-LEGACY-SEARCH-CANARY").unwrap();
+        let holder = File::open(&search).unwrap();
+        let lease = state
+            .bind_or_create_private_lease_file(OsStr::new("policy-cache-retirement.lock"))
+            .unwrap();
+        assert!(lease.try_lock_exclusive().unwrap());
+
+        let retiring_path = state_path.clone();
+        let retiring = std::thread::spawn(move || retire_legacy_policy_caches_at(&retiring_path));
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        drop(lease);
+
+        retiring.join().unwrap().unwrap();
+        assert!(!search.exists());
+        assert_eq!(holder.metadata().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn legacy_policy_cache_retirement_gives_up_after_the_bounded_wait() {
+        // A holder that never releases must not freeze the caller forever.
+        let root = tempfile::TempDir::new().unwrap();
+        let state_path = root.path().join("state");
+        let state = BoundRecoveryDirectory::prepare_owner_private(&state_path).unwrap();
+        fs::write(state_path.join("search.db"), b"x").unwrap();
+        let lease = state
+            .bind_or_create_private_lease_file(OsStr::new("policy-cache-retirement.lock"))
+            .unwrap();
+        assert!(lease.try_lock_exclusive().unwrap());
+
+        let started = std::time::Instant::now();
         let error = retire_legacy_policy_caches_at(&state_path).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        let waited = started.elapsed();
+        assert!(waited >= LEGACY_POLICY_CACHE_RETIREMENT_WAIT);
+        assert!(waited < LEGACY_POLICY_CACHE_RETIREMENT_WAIT * 3);
     }
 
     #[test]
