@@ -126,7 +126,7 @@ Limits for v1:
 - draft cost ceiling: existing `partial_max_secs`, default 30 seconds;
 - reader replay: bounded by relay buffer and a short quiet window, never a continuous poll.
 
-If final work is pending, it is selected before another draft job. An in-flight recognizer call is allowed to finish, but its result is rejected if the utterance was superseded. Stop does not wait for repeated draft work. The WAV writer and capture stop deadline remain authoritative.
+If final work is pending, it is selected before another draft job. Superseded results are rejected. Recording stop raises Whisper's abort signal, seals the WAV and any stems before joining the optional sidecar, and never waits for repeated draft work. The WAV writer and capture stop deadline remain authoritative.
 
 ## Capture and failure isolation
 

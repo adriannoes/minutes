@@ -1,4 +1,8 @@
 use crate::transcribe::streaming_whisper_params;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use whisper_rs::WhisperContext;
 
 // ──────────────────────────────────────────────────────────────
@@ -78,6 +82,10 @@ pub struct StreamingWhisper {
     /// Cap on partial-transcription buffer length, in samples at 16kHz. Past
     /// this length, partials are skipped (final still runs at end of utterance).
     partial_max_samples: usize,
+    /// Optional session stop signal. Recording sidecars use this to abort an
+    /// in-flight Whisper pass so optional live evidence cannot hold capture
+    /// shutdown open after the WAV has been sealed.
+    abort_signal: Option<Arc<AtomicBool>>,
 }
 
 impl StreamingWhisper {
@@ -108,7 +116,18 @@ impl StreamingWhisper {
             language,
             has_created_state: false,
             partial_max_samples,
+            abort_signal: None,
         }
+    }
+
+    /// Abort an in-flight Whisper pass when `abort_signal` becomes true.
+    ///
+    /// Ordinary standalone streaming keeps the historical behavior. Capture
+    /// sidecars opt in because their draft/final evidence is optional and must
+    /// yield immediately to recording shutdown.
+    pub fn with_abort_signal(mut self, abort_signal: Arc<AtomicBool>) -> Self {
+        self.abort_signal = Some(abort_signal);
+        self
     }
 
     /// Feed audio samples. Returns a partial result if enough audio has
@@ -181,6 +200,9 @@ impl StreamingWhisper {
         let mut params = streaming_whisper_params();
         params.set_n_threads(self.n_threads);
         params.set_language(self.language.as_deref());
+        if let Some(abort_signal) = self.abort_signal.as_ref().map(Arc::clone) {
+            params.set_abort_callback_safe(move || abort_signal.load(Ordering::Relaxed));
+        }
 
         let start = std::time::Instant::now();
 
@@ -321,5 +343,16 @@ mod tests {
         let sw = StreamingWhisper::with_partial_max_secs(None, 0);
         assert_eq!(sw.partial_max_samples, 0);
         // The feed() check `partial_max_samples > 0` short-circuits the cap.
+    }
+
+    #[test]
+    fn recording_sidecar_abort_signal_is_explicit_and_shared() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let sw = StreamingWhisper::new(None).with_abort_signal(Arc::clone(&stop));
+        let configured = sw.abort_signal.expect("abort signal should be configured");
+
+        assert!(!configured.load(Ordering::Relaxed));
+        stop.store(true, Ordering::Relaxed);
+        assert!(configured.load(Ordering::Relaxed));
     }
 }

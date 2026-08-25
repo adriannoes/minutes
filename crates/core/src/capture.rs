@@ -1589,10 +1589,10 @@ fn record_to_wav_dual_source(
 
     voice_stream.take();
     system_stream.take();
-    drop(live_tx);
-    if let Some(handle) = sidecar_handle {
-        handle.join().ok();
-    }
+    // Capture is authoritative. Tell the optional live sidecar to abort any
+    // in-flight recognition, then seal the mixed WAV and stems before waiting
+    // for that consumer to retire.
+    stop_flag.store(true, Ordering::Relaxed);
 
     // Clear mute state so the next recording starts fresh.
     crate::streaming::clear_mic_mute_for_new_recording();
@@ -1633,6 +1633,11 @@ fn record_to_wav_dual_source(
     if let Some(stems) = stem_paths_for(output_path) {
         set_capture_permissions(&stems.voice);
         set_capture_permissions(&stems.system);
+    }
+
+    drop(live_tx);
+    if let Some(handle) = sidecar_handle {
+        handle.join().ok();
     }
 
     eprintln!(
@@ -1969,21 +1974,9 @@ pub fn record_to_wav_with_lifecycle(
 
     // Stop and finalize
     drop(stream);
-
-    // Disconnect the live sidecar channel and wait for it to finish
-    drop(live_tx);
-    if let Some(handle) = sidecar_handle {
-        handle.join().ok();
-    }
-    #[cfg(all(feature = "whisper", feature = "streaming"))]
-    crate::live_transcript::clear_status_file();
-    let sidecar_drops = SIDECAR_DROPS.swap(0, Ordering::Relaxed);
-    if sidecar_drops > 0 {
-        tracing::warn!(
-            dropped_chunks = sidecar_drops,
-            "live sidecar: audio chunks dropped (transcript may have gaps)"
-        );
-    }
+    // Capture is authoritative. Abort optional recognition immediately, then
+    // seal the WAV before waiting for the sidecar thread to retire.
+    stop_flag.store(true, Ordering::Relaxed);
 
     let total_samples = sample_count.load(Ordering::Relaxed);
     let duration_secs = total_samples as f64 / 16000.0;
@@ -2005,6 +1998,20 @@ pub fn record_to_wav_with_lifecycle(
 
     // Set restrictive permissions on the recording (contains sensitive audio)
     set_capture_permissions(output_path);
+
+    drop(live_tx);
+    if let Some(handle) = sidecar_handle {
+        handle.join().ok();
+    }
+    #[cfg(all(feature = "whisper", feature = "streaming"))]
+    crate::live_transcript::clear_status_file();
+    let sidecar_drops = SIDECAR_DROPS.swap(0, Ordering::Relaxed);
+    if sidecar_drops > 0 {
+        tracing::warn!(
+            dropped_chunks = sidecar_drops,
+            "live sidecar: audio chunks dropped (transcript may have gaps)"
+        );
+    }
 
     eprintln!(
         "[minutes] Captured {} samples ({:.1}s), peak audio level during recording: {}",

@@ -1918,6 +1918,7 @@ fn transcribe_with_whisper_for_live_sidecar(
     samples: &[f32],
     whisper_ctx: &whisper_rs::WhisperContext,
     language: Option<String>,
+    abort_signal: Option<&Arc<AtomicBool>>,
 ) -> Option<(String, f64)> {
     if samples.is_empty() {
         return None;
@@ -1932,6 +1933,9 @@ fn transcribe_with_whisper_for_live_sidecar(
     // `transcription.partial_max_secs` setting; that knob is for live
     // responsiveness, not for batch fan-in.
     let mut streaming = StreamingWhisper::with_partial_max_secs(language, 1);
+    if let Some(abort_signal) = abort_signal {
+        streaming = streaming.with_abort_signal(Arc::clone(abort_signal));
+    }
     for chunk in samples.chunks(1600) {
         let _ = streaming.feed(chunk, whisper_ctx);
     }
@@ -2066,6 +2070,7 @@ fn transcribe_utterance_for_sidecar(
     config: &Config,
     whisper_ctx: &mut Option<whisper_rs::WhisperContext>,
     parakeet_enabled: &mut bool,
+    stop_flag: &Arc<AtomicBool>,
 ) -> Option<(String, f64)> {
     #[cfg(feature = "parakeet")]
     if *parakeet_enabled {
@@ -2098,7 +2103,12 @@ fn transcribe_utterance_for_sidecar(
             }
         },
     };
-    transcribe_with_whisper_for_live_sidecar(samples, ctx, config.transcription.language.clone())
+    transcribe_with_whisper_for_live_sidecar(
+        samples,
+        ctx,
+        config.transcription.language.clone(),
+        Some(stop_flag),
+    )
 }
 
 #[cfg(feature = "whisper")]
@@ -2362,6 +2372,7 @@ fn finalize_live_utterance(
                             apple_utterance_samples,
                             whisper_ctx,
                             config.transcription.language.clone(),
+                            None,
                         ))
                     },
                 );
@@ -2409,6 +2420,7 @@ fn finalize_live_utterance(
                                 parakeet_utterance_samples,
                                 whisper_ctx,
                                 config.transcription.language.clone(),
+                                None,
                             )
                         {
                             let ok = writer.write_utterance(&text, duration_secs);
@@ -2544,6 +2556,7 @@ fn finalize_live_utterance(
                                 apple_utterance_samples,
                                 whisper_ctx,
                                 config.transcription.language.clone(),
+                                None,
                             )
                         {
                             let ok = writer.write_utterance(&text, duration_secs);
@@ -2786,6 +2799,7 @@ fn run_sidecar_inner_mpsc(
                             &config,
                             &mut whisper_ctx,
                             &mut parakeet_enabled,
+                            &stop_flag,
                         );
                         counters.pending.fetch_sub(1, Ordering::Relaxed);
                         if let Some((text, duration_secs)) = result {
@@ -2813,6 +2827,7 @@ fn run_sidecar_inner_mpsc(
                                 &job.samples,
                                 ctx,
                                 config.transcription.language.clone(),
+                                Some(&stop_flag),
                             ) {
                                 draft_results.offer_latest(SidecarDraftResult {
                                     utterance_sequence: job.utterance_sequence,
@@ -2839,6 +2854,7 @@ fn run_sidecar_inner_mpsc(
                                 &config,
                                 &mut whisper_ctx,
                                 &mut parakeet_enabled,
+                                &stop_flag,
                             );
                             counters.pending.fetch_sub(1, Ordering::Relaxed);
                             if let Some((text, duration_secs)) = result {
