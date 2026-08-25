@@ -72,7 +72,10 @@ jobs:
           $runtimeLib = "$env:GITHUB_WORKSPACE\sherpa-onnx-v1.13.6-win-x64-shared-MD-Release-no-tts\lib"
           $model = "$env:GITHUB_WORKSPACE\sherpa-onnx-nemotron-speech-streaming-en-0.6b-560ms-int8-2026-04-25"
           $audio = "$env:GITHUB_WORKSPACE\tests\eval\fixtures\audio\apple-speech-meeting.wav"
-          $env:PATH = "$runtimeBin;$runtimeLib;$env:PATH"
+          # The release archive also places an older ONNX Runtime in bin for
+          # some bundled tools. The current C API requires the matching DLL in
+          # lib, so lib must win Windows DLL resolution.
+          $env:PATH = "$runtimeLib;$runtimeBin;$env:PATH"
           & .\benchmark_sherpa_streaming.exe $model $audio 120 2 --content-free |
             Tee-Object -FilePath nemotron-windows-metrics.json
           if ($LASTEXITCODE -ne 0) { throw "Paced benchmark exited with $LASTEXITCODE" }
