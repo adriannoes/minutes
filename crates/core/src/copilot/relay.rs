@@ -682,6 +682,10 @@ impl CaptureRelayClient {
                 )));
             }
         }
+        // PIPE_NOWAIT can report an idle Windows byte-mode pipe as a zero-byte
+        // read, which is indistinguishable from EOF through `Read`. Keep the
+        // handle blocking there and use PeekNamedPipe in `try_recv` instead.
+        #[cfg(not(windows))]
         reader.get_ref().set_nonblocking(true)?;
         Ok(Self {
             discovery_path: discovery_path.to_path_buf(),
@@ -707,6 +711,16 @@ impl CaptureRelayClient {
 
     pub fn try_recv(&mut self) -> Result<Option<RelayFrame>, CaptureRelayError> {
         loop {
+            #[cfg(windows)]
+            match windows_stream_has_data(self.reader.get_ref()) {
+                Ok(false) => return Ok(None),
+                Ok(true) => {}
+                Err(error) if !self.established => {
+                    self.reconnect_during_establishment(CaptureRelayError::Io(error))?;
+                    continue;
+                }
+                Err(error) => return Err(CaptureRelayError::Io(error)),
+            }
             match self.reader.read_line(&mut self.pending_line) {
                 Ok(0) if !self.established => {
                     self.reconnect_during_establishment(connection_closed_error())?;
@@ -811,6 +825,29 @@ fn connection_closed_error() -> CaptureRelayError {
         io::ErrorKind::UnexpectedEof,
         "capture relay closed the connection",
     ))
+}
+
+#[cfg(windows)]
+fn windows_stream_has_data(stream: &Stream) -> io::Result<bool> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+
+    let mut available = 0_u32;
+    let success = unsafe {
+        PeekNamedPipe(
+            stream.as_raw_handle(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            &mut available,
+            std::ptr::null_mut(),
+        )
+    };
+    if success == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(available > 0)
+    }
 }
 
 fn is_unexpected_eof(error: &CaptureRelayError) -> bool {
@@ -979,11 +1016,9 @@ fn handle_client(
     shared: &Arc<SharedRelayState>,
     auth_token: &str,
 ) -> Result<(), CaptureRelayError> {
-    // Read the one client request through the original handle, then recover it
-    // for replies. A cloned Windows named-pipe read handle can tear down an
-    // otherwise idle observer when that clone is dropped after the handshake.
-    // Unix sockets do not expose the race because a duplicated descriptor has
-    // ordinary reference-counted close semantics.
+    // Read the one client request through the original connection, then recover
+    // that connection for replies. The protocol has exactly one client request,
+    // so a second cloned I/O handle is unnecessary.
     let mut reader = BufReader::new(stream);
     let hello: ClientHello = read_json_line(&mut reader)?;
     let mut stream = reader.into_inner();
