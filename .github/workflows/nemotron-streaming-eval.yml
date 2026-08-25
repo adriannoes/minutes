@@ -20,6 +20,8 @@ jobs:
     env:
       RUNTIME_ARCHIVE: sherpa-onnx-v1.13.6-win-x64-shared-MD-Release-no-tts.tar.bz2
       RUNTIME_SHA256: 071d6641efd737a1f60de48c9c4cd596f78d5b0980815e8ad3798c95785d2b26
+      ORT_ARCHIVE: onnxruntime-win-x64-1.27.1.zip
+      ORT_SHA256: 2e00414a63fdef0914cd5a5ede6c707844878e0c08e1b6693842f0451b2df2a1
       MODEL_ARCHIVE: sherpa-onnx-nemotron-speech-streaming-en-0.6b-560ms-int8-2026-04-25.tar.bz2
       MODEL_SHA256: 78e2b79fcf7271553a74402a76b771b09ea40117a39566a79f52235b23db6358
     steps:
@@ -39,12 +41,16 @@ jobs:
         shell: pwsh
         run: |
           curl.exe -L --fail --retry 3 --output $env:RUNTIME_ARCHIVE "https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.6/$env:RUNTIME_ARCHIVE"
+          curl.exe -L --fail --retry 3 --output $env:ORT_ARCHIVE "https://github.com/microsoft/onnxruntime/releases/download/v1.27.1/$env:ORT_ARCHIVE"
           curl.exe -L --fail --retry 3 --output $env:MODEL_ARCHIVE "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/$env:MODEL_ARCHIVE"
           $runtimeHash = (Get-FileHash $env:RUNTIME_ARCHIVE -Algorithm SHA256).Hash.ToLowerInvariant()
+          $ortHash = (Get-FileHash $env:ORT_ARCHIVE -Algorithm SHA256).Hash.ToLowerInvariant()
           $modelHash = (Get-FileHash $env:MODEL_ARCHIVE -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($runtimeHash -ne $env:RUNTIME_SHA256) { throw "Sherpa runtime checksum mismatch" }
+          if ($ortHash -ne $env:ORT_SHA256) { throw "ONNX Runtime checksum mismatch" }
           if ($modelHash -ne $env:MODEL_SHA256) { throw "Nemotron model checksum mismatch" }
           tar -xjf $env:RUNTIME_ARCHIVE
+          Expand-Archive -Path $env:ORT_ARCHIVE -DestinationPath .
           tar -xjf $env:MODEL_ARCHIVE
 
       - name: Locate Visual Studio C++ tools
@@ -70,12 +76,13 @@ jobs:
         run: |
           $runtimeBin = "$env:GITHUB_WORKSPACE\sherpa-onnx-v1.13.6-win-x64-shared-MD-Release-no-tts\bin"
           $runtimeLib = "$env:GITHUB_WORKSPACE\sherpa-onnx-v1.13.6-win-x64-shared-MD-Release-no-tts\lib"
+          $ortLib = "$env:GITHUB_WORKSPACE\onnxruntime-win-x64-1.27.1\lib"
           $model = "$env:GITHUB_WORKSPACE\sherpa-onnx-nemotron-speech-streaming-en-0.6b-560ms-int8-2026-04-25"
           $audio = "$env:GITHUB_WORKSPACE\tests\eval\fixtures\audio\apple-speech-meeting.wav"
-          # The release archive also places an older ONNX Runtime in bin for
-          # some bundled tools. The current C API requires the matching DLL in
-          # lib, so lib must win Windows DLL resolution.
-          $env:PATH = "$runtimeLib;$runtimeBin;$env:PATH"
+          # The Sherpa Windows archive bundles ONNX Runtime 1.17.1 even though
+          # its current C API requests API 27. Use the checksummed official
+          # 1.27.1 DLL that matches the macOS release runtime.
+          $env:PATH = "$ortLib;$runtimeLib;$runtimeBin;$env:PATH"
           & .\benchmark_sherpa_streaming.exe $model $audio 120 2 --content-free |
             Tee-Object -FilePath nemotron-windows-metrics.json
           if ($LASTEXITCODE -ne 0) { throw "Paced benchmark exited with $LASTEXITCODE" }
