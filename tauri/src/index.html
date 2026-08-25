@@ -331,6 +331,16 @@
       flex: 0 0 var(--list-width, 22%);
     }
 
+    /* Collapsed must beat doc-open. Both selectors have equal specificity and
+       this block comes later, so with a document open the list kept its 22%
+       while every child was visibility:hidden — a blank column where the
+       list used to be, and chat never reclaimed the space. */
+    body.sidebar-collapsed.doc-open .app-left {
+      flex: 0 0 0;
+      width: 0;
+      min-width: 0;
+    }
+
     body.doc-open .recall-panel.expanded {
       width: auto;
       flex: 1 1 auto;
