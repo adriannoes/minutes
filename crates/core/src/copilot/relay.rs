@@ -832,10 +832,13 @@ fn windows_stream_has_data(stream: &Stream) -> io::Result<bool> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::System::Pipes::PeekNamedPipe;
 
+    let raw_handle = match stream {
+        Stream::NamedPipe(named_pipe) => named_pipe.as_raw_handle(),
+    };
     let mut available = 0_u32;
     let success = unsafe {
         PeekNamedPipe(
-            stream.as_raw_handle(),
+            raw_handle,
             std::ptr::null_mut(),
             0,
             std::ptr::null_mut(),
