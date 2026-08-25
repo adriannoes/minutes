@@ -8800,10 +8800,11 @@ registerTool(
 
 registerTool(
   "read_live_transcript",
-  "Read the live transcript — works during both recordings and live transcript sessions. Use 'since' to get new lines after a cursor (line number) or time window (e.g., '5m', '30s'). Use 'status' mode to check if a session is active.",
+  "Read the live transcript — works during both recordings and live transcript sessions. Use 'since' to get new finalized lines after a cursor (line number) or time window (e.g., '5m', '30s'). Set include_current for one fresh, clearly provisional current-speech draft. Use 'status' mode to check if a session is active.",
   {
     since: z.string().optional().describe("Line number (e.g., '42') or duration (e.g., '5m', '30s'). Omit to get all lines."),
     status_only: z.boolean().optional().default(false).describe("If true, return session status instead of transcript lines"),
+    include_current: z.boolean().optional().default(false).describe("If true, return finalized lines plus at most one fresh provisional current-speech draft and its replacement identity"),
     relay_cursor: z.object({
       session_id: z.string().optional(),
       transcript_seq: z.number().int().nonnegative(),
@@ -8811,7 +8812,7 @@ registerTool(
     }).optional().describe("Transient relay cursor returned by a previous read. Reconnects without replaying already-seen transcript or nudge frames."),
   },
   { title: "Read Live Transcript", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-  async ({ since, status_only, relay_cursor }) => {
+  async ({ since, status_only, include_current, relay_cursor }) => {
     if (!(await isCliAvailable())) {
       return { content: [{ type: "text" as const, text: CLI_INSTALL_MSG }] };
     }
@@ -8822,19 +8823,31 @@ registerTool(
     } else if (since) {
       args.push("--since", since);
     }
+    if (include_current && !status_only) {
+      args.push("--include-current");
+    }
 
     let relay: CaptureRelaySnapshot | undefined;
-    try {
-      relay = await attachCaptureRelay(relay_cursor as CaptureRelayCursor | undefined);
-    } catch {
-      // A durable-only or inactive session is still readable. start_live_transcript
-      // reports attachment failures explicitly when another process owns capture.
+    if (!include_current) {
+      try {
+        relay = await attachCaptureRelay(relay_cursor as CaptureRelayCursor | undefined);
+      } catch {
+        // A durable-only or inactive session is still readable. start_live_transcript
+        // reports attachment failures explicitly when another process owns capture.
+      }
     }
 
     try {
       const { stdout } = await runMinutes(args, 10000);
       // For status queries, a message is helpful. For transcript reads, empty = no new lines.
       const fallback = status_only ? "No transcript data available." : "";
+      if (include_current && !status_only) {
+        const snapshot = parseJsonOutput(stdout || fallback);
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify(snapshot, null, 2) }],
+          structuredContent: snapshot,
+        };
+      }
       if (relay) {
         const payload = {
           durable: parseJsonOutput(stdout || fallback),

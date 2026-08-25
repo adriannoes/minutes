@@ -34,6 +34,7 @@ const ESTABLISHMENT_RETRY_TIMEOUT: Duration = Duration::from_secs(1);
 const ESTABLISHMENT_RETRY_DELAY: Duration = Duration::from_millis(25);
 const ESTABLISHMENT_RETRY_LIMIT: u8 = 20;
 const FRAME_CAPACITY: usize = 512;
+pub const CURRENT_DRAFT_STALE_AFTER: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -82,6 +83,9 @@ pub enum RelayTranscriptUpdate {
         /// Capture-to-relay time for a partial. Finals use zero because the
         /// durable event contract does not expose a monotonic audio timestamp.
         producer_latency_ms: u64,
+        /// Wall-clock time when the capture owner admitted this update to the
+        /// transient relay. Readers use it to reject stale drafts.
+        observed_at: DateTime<Utc>,
     },
     Superseded {
         session_epoch: u64,
@@ -134,6 +138,142 @@ pub enum RelayFrame {
     Shutdown {
         reason: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayDraftState {
+    Current,
+    None,
+    Finalizing,
+    Superseded,
+    Stale,
+    Unavailable,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayCurrentDraft {
+    pub provisional: bool,
+    pub session_epoch: u64,
+    pub utterance_sequence: u64,
+    pub revision: u64,
+    pub text: String,
+    pub speaker: Option<String>,
+    pub offset_ms: u64,
+    pub producer_latency_ms: u64,
+    pub observed_at: DateTime<Utc>,
+    pub age_ms: u64,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayDraftSnapshot {
+    pub current_draft: Option<RelayCurrentDraft>,
+    pub draft_state: RelayDraftState,
+    #[serde(default)]
+    pub gap: bool,
+}
+
+/// Reduce one bounded relay replay to the single draft a reader may use.
+/// Supersession and gaps fail closed, and old text is never returned merely
+/// because it was the last frame in the buffer.
+pub fn reduce_relay_draft(
+    frames: &[RelayFrame],
+    evidence_mode: CopilotEvidenceMode,
+    now: DateTime<Utc>,
+) -> RelayDraftSnapshot {
+    let mut current: Option<RelayCurrentDraft> = None;
+    let mut state = if evidence_mode == CopilotEvidenceMode::FinalOnly {
+        RelayDraftState::Unsupported
+    } else {
+        RelayDraftState::None
+    };
+    let mut gap = false;
+
+    for frame in frames {
+        match frame {
+            RelayFrame::Transcript {
+                update:
+                    RelayTranscriptUpdate::Utterance {
+                        session_epoch,
+                        utterance,
+                        producer_latency_ms,
+                        observed_at,
+                    },
+                ..
+            } if utterance.update_kind == TranscriptUpdateKind::Partial => {
+                let age_ms = now
+                    .signed_duration_since(*observed_at)
+                    .num_milliseconds()
+                    .max(0) as u64;
+                current = Some(RelayCurrentDraft {
+                    provisional: true,
+                    session_epoch: *session_epoch,
+                    utterance_sequence: utterance.utterance_sequence,
+                    revision: utterance.revision,
+                    text: utterance.text.clone(),
+                    speaker: utterance.speaker.clone(),
+                    offset_ms: utterance.offset_ms,
+                    producer_latency_ms: *producer_latency_ms,
+                    observed_at: *observed_at,
+                    age_ms,
+                    source: utterance.source.clone(),
+                });
+                state = RelayDraftState::Current;
+            }
+            RelayFrame::Transcript {
+                update:
+                    RelayTranscriptUpdate::Superseded {
+                        session_epoch,
+                        through_utterance_sequence,
+                        reason,
+                        ..
+                    },
+                ..
+            } => {
+                if current.as_ref().is_some_and(|draft| {
+                    draft.session_epoch == *session_epoch
+                        && draft.utterance_sequence <= *through_utterance_sequence
+                }) {
+                    current = None;
+                }
+                state = if reason == "finalizing" {
+                    RelayDraftState::Finalizing
+                } else {
+                    RelayDraftState::Superseded
+                };
+            }
+            RelayFrame::Gap { stream, .. } if stream == "transcript" => {
+                current = None;
+                state = RelayDraftState::Unavailable;
+                gap = true;
+            }
+            RelayFrame::CursorReset { .. } => {
+                current = None;
+                state = RelayDraftState::None;
+            }
+            RelayFrame::Shutdown { .. } | RelayFrame::Error { .. } => {
+                current = None;
+                state = RelayDraftState::Unavailable;
+            }
+            _ => {}
+        }
+    }
+
+    if current
+        .as_ref()
+        .is_some_and(|draft| draft.age_ms > CURRENT_DRAFT_STALE_AFTER.as_millis() as u64)
+    {
+        current = None;
+        state = RelayDraftState::Stale;
+    }
+
+    RelayDraftSnapshot {
+        current_draft: current,
+        draft_state: state,
+        gap,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -781,6 +921,7 @@ fn run_server(
                         duration_ms,
                     },
                     producer_latency_ms: 0,
+                    observed_at: Utc::now(),
                 };
                 let mut state = lock_state(&shared);
                 state.push_transcript(update);
@@ -1001,11 +1142,12 @@ fn relay_partial_update(event: LivePartialEvent) -> RelayTranscriptUpdate {
                 .saturating_duration_since(partial.audio_received_at)
                 .as_millis()
                 .min(u64::MAX as u128) as u64,
+            observed_at: Utc::now(),
             utterance: CopilotUtterance {
                 utterance_sequence: partial.utterance_sequence,
                 revision: partial.revision,
                 update_kind: TranscriptUpdateKind::Partial,
-                source: "capture-relay".into(),
+                source: partial.source,
                 text: partial.text,
                 speaker: partial.speaker,
                 speaker_verified: false,
@@ -1019,6 +1161,7 @@ fn relay_partial_update(event: LivePartialEvent) -> RelayTranscriptUpdate {
             last_revision: signal.last_revision,
             reason: match signal.reason {
                 SupersessionReason::Finalized => "finalized",
+                SupersessionReason::Finalizing => "finalizing",
                 SupersessionReason::Discarded => "discarded",
             }
             .into(),
@@ -1240,6 +1383,7 @@ mod tests {
                 duration_ms: 0,
             },
             producer_latency_ms: 12,
+            observed_at: Utc::now(),
         }
     }
 
@@ -1263,6 +1407,90 @@ mod tests {
             ttl_ms: 12_000,
             supersedes: None,
         }
+    }
+
+    #[test]
+    fn bounded_replay_exposes_only_the_latest_fresh_draft() {
+        let now = Utc::now();
+        let mut first = utterance("first draft");
+        let RelayTranscriptUpdate::Utterance { observed_at, .. } = &mut first else {
+            unreachable!()
+        };
+        *observed_at = now - chrono::Duration::milliseconds(800);
+        let mut second = utterance("corrected draft");
+        let RelayTranscriptUpdate::Utterance {
+            utterance,
+            observed_at,
+            ..
+        } = &mut second
+        else {
+            unreachable!()
+        };
+        utterance.revision = 5;
+        *observed_at = now - chrono::Duration::milliseconds(100);
+
+        let snapshot = reduce_relay_draft(
+            &[
+                RelayFrame::Transcript {
+                    seq: 1,
+                    update: first,
+                },
+                RelayFrame::Transcript {
+                    seq: 2,
+                    update: second,
+                },
+            ],
+            CopilotEvidenceMode::CaptureRelayPartials,
+            now,
+        );
+
+        assert_eq!(snapshot.draft_state, RelayDraftState::Current);
+        let draft = snapshot.current_draft.unwrap();
+        assert_eq!(draft.text, "corrected draft");
+        assert_eq!(draft.revision, 5);
+        assert_eq!(draft.age_ms, 100);
+    }
+
+    #[test]
+    fn supersession_and_age_fail_closed() {
+        let now = Utc::now();
+        let mut stale = utterance("too old");
+        let RelayTranscriptUpdate::Utterance { observed_at, .. } = &mut stale else {
+            unreachable!()
+        };
+        *observed_at = now - chrono::Duration::seconds(4);
+        let stale_snapshot = reduce_relay_draft(
+            &[RelayFrame::Transcript {
+                seq: 1,
+                update: stale,
+            }],
+            CopilotEvidenceMode::CaptureRelayPartials,
+            now,
+        );
+        assert_eq!(stale_snapshot.draft_state, RelayDraftState::Stale);
+        assert!(stale_snapshot.current_draft.is_none());
+
+        let finalizing_snapshot = reduce_relay_draft(
+            &[
+                RelayFrame::Transcript {
+                    seq: 1,
+                    update: utterance("about to finalize"),
+                },
+                RelayFrame::Transcript {
+                    seq: 2,
+                    update: RelayTranscriptUpdate::Superseded {
+                        session_epoch: 7,
+                        through_utterance_sequence: 3,
+                        last_revision: 4,
+                        reason: "finalizing".into(),
+                    },
+                },
+            ],
+            CopilotEvidenceMode::CaptureRelayPartials,
+            now,
+        );
+        assert_eq!(finalizing_snapshot.draft_state, RelayDraftState::Finalizing);
+        assert!(finalizing_snapshot.current_draft.is_none());
     }
 
     fn wait_for_frame(
@@ -1290,6 +1518,68 @@ mod tests {
             }
         }
         panic!("timed out waiting for relay error");
+    }
+
+    #[test]
+    fn recording_style_partial_channel_reaches_relay_and_finalizing_retracts_it() {
+        let dir = TempDir::new().unwrap();
+        let (mut publisher, subscriber) =
+            crate::live_partials::channel_with_source(44, 2, "recording-sidecar");
+        let _server = CaptureRelayServer::start_inner(
+            dir.path(),
+            CopilotEvidenceMode::CaptureRelayPartials,
+            Some(subscriber),
+            false,
+        )
+        .unwrap();
+        let discovery_path = capture_relay_discovery_path_in(dir.path());
+        let mut client =
+            CaptureRelayClient::connect_from(&discovery_path, RelayCursor::default()).unwrap();
+
+        publisher.begin_utterance(Instant::now());
+        publisher.try_publish("current speech".into(), 250);
+        let partial = wait_for_frame(&mut client, |frame| {
+            matches!(
+                frame,
+                RelayFrame::Transcript {
+                    update: RelayTranscriptUpdate::Utterance { utterance, .. },
+                    ..
+                } if utterance.update_kind == TranscriptUpdateKind::Partial
+                    && utterance.text == "current speech"
+            )
+        });
+        let (session_epoch, source) = match &partial {
+            RelayFrame::Transcript {
+                update:
+                    RelayTranscriptUpdate::Utterance {
+                        session_epoch,
+                        utterance,
+                        ..
+                    },
+                ..
+            } => (*session_epoch, utterance.source.as_str()),
+            _ => unreachable!(),
+        };
+        assert_eq!(session_epoch, 44);
+        assert_eq!(source, "recording-sidecar");
+
+        publisher.supersede_current(SupersessionReason::Finalizing);
+        let retracted = wait_for_frame(&mut client, |frame| {
+            matches!(
+                frame,
+                RelayFrame::Transcript {
+                    update: RelayTranscriptUpdate::Superseded { reason, .. },
+                    ..
+                } if reason == "finalizing"
+            )
+        });
+        let snapshot = reduce_relay_draft(
+            &[partial, retracted],
+            CopilotEvidenceMode::CaptureRelayPartials,
+            Utc::now(),
+        );
+        assert_eq!(snapshot.draft_state, RelayDraftState::Finalizing);
+        assert!(snapshot.current_draft.is_none());
     }
 
     #[test]

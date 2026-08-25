@@ -407,7 +407,7 @@ fn run_one_engine(
 
     let started = Instant::now();
     let sidecar_handle = std::thread::spawn(move || {
-        minutes_core::live_transcript::run_sidecar_mpsc(rx, stop_flag_clone, &config);
+        minutes_core::live_transcript::run_sidecar_mpsc(rx, stop_flag_clone, &config, None);
     });
 
     // Feed at full speed. recv_timeout(100ms) tolerates faster

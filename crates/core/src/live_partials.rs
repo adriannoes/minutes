@@ -24,6 +24,7 @@ pub struct LivePartial {
     pub utterance_sequence: u64,
     pub revision: u64,
     pub is_final: bool,
+    pub source: String,
     pub text: String,
     pub speaker: Option<String>,
     pub offset_ms: u64,
@@ -34,6 +35,7 @@ pub struct LivePartial {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SupersessionReason {
     Finalized,
+    Finalizing,
     Discarded,
 }
 
@@ -42,12 +44,14 @@ impl SupersessionReason {
         match self {
             Self::Finalized => 1,
             Self::Discarded => 2,
+            Self::Finalizing => 3,
         }
     }
 
     fn decode(value: u8) -> Self {
         match value {
             1 => Self::Finalized,
+            3 => Self::Finalizing,
             _ => Self::Discarded,
         }
     }
@@ -153,6 +157,7 @@ impl ChannelInner {
 /// makes its capture-thread ownership obvious at the type boundary.
 pub struct LivePartialPublisher {
     inner: Arc<ChannelInner>,
+    source: String,
     utterance_sequence: u64,
     revision: u64,
     audio_received_at: Option<Instant>,
@@ -161,6 +166,10 @@ pub struct LivePartialPublisher {
 impl LivePartialPublisher {
     pub fn session_epoch(&self) -> u64 {
         self.inner.epoch
+    }
+
+    pub fn current_utterance_sequence(&self) -> u64 {
+        self.utterance_sequence
     }
 
     /// Record the first audio receipt for the current utterance. Repeated VAD
@@ -197,6 +206,7 @@ impl LivePartialPublisher {
             utterance_sequence: self.utterance_sequence,
             revision: self.revision,
             is_final: false,
+            source: self.source.clone(),
             text,
             speaker: None,
             offset_ms,
@@ -305,6 +315,14 @@ pub fn channel(
     session_epoch: u64,
     capacity: usize,
 ) -> (LivePartialPublisher, LivePartialSubscriber) {
+    channel_with_source(session_epoch, capacity, "in-process-live")
+}
+
+pub fn channel_with_source(
+    session_epoch: u64,
+    capacity: usize,
+    source: impl Into<String>,
+) -> (LivePartialPublisher, LivePartialSubscriber) {
     let inner = Arc::new(ChannelInner {
         epoch: session_epoch,
         partials: ArrayQueue::new(capacity.max(1)),
@@ -318,6 +336,7 @@ pub fn channel(
     (
         LivePartialPublisher {
             inner: Arc::clone(&inner),
+            source: source.into(),
             utterance_sequence: 1,
             revision: 0,
             audio_received_at: None,

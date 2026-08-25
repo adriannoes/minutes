@@ -3474,6 +3474,37 @@ fn start_native_call_recording(
         minutes_core::pid::remove().ok();
         return Err(error.to_string());
     }
+    let relay_epoch = chrono::Utc::now().timestamp_millis().unsigned_abs().max(1);
+    let (publisher, subscriber) = minutes_core::live_partials::channel_with_source(
+        relay_epoch,
+        minutes_core::live_partials::DEFAULT_PARTIAL_CHANNEL_CAPACITY,
+        "recording-sidecar",
+    );
+    let mut recording_partial_publisher = Some(publisher);
+    let _capture_relay = match minutes_core::copilot::CaptureRelayServer::start(
+        minutes_core::copilot::CopilotEvidenceMode::CaptureRelayPartials,
+        Some(subscriber),
+    ) {
+        Ok(relay) => Some(relay),
+        Err(minutes_core::copilot::CaptureRelayError::AlreadyOwned(owner_pid)) => {
+            minutes_core::pid::remove().ok();
+            return Err(format!(
+                "Another Minutes process (PID {owner_pid}) already owns capture. Minutes did not open a second recording."
+            ));
+        }
+        Err(minutes_core::copilot::CaptureRelayError::OwnershipBusy) => {
+            minutes_core::pid::remove().ok();
+            return Err(
+                "Another Minutes process is starting or stopping capture. Wait a moment and try again."
+                    .into(),
+            );
+        }
+        Err(error) => {
+            recording_partial_publisher = None;
+            tracing::warn!(error = %error, "native call capture relay unavailable; recording continues");
+            None
+        }
+    };
     // Config written through Settings is already canonical, but older/manual
     // TOML may still contain the picker decoration (sample rate/channels).
     // ScreenCaptureKit resolves AVCaptureDevice.localizedName exactly, so
@@ -3556,6 +3587,7 @@ fn start_native_call_recording(
                     Some(system),
                     config,
                     std::sync::Arc::clone(&live_stop),
+                    recording_partial_publisher,
                 )
                 .is_some()
             }
@@ -20603,9 +20635,10 @@ fn run_live_session(app: tauri::AppHandle, active: Arc<AtomicBool>, stop_flag: A
     crate::sync_tray_state(&app);
 
     let relay_epoch = chrono::Utc::now().timestamp_millis().unsigned_abs().max(1);
-    let (partial_publisher, partial_subscriber) = minutes_core::live_partials::channel(
+    let (partial_publisher, partial_subscriber) = minutes_core::live_partials::channel_with_source(
         relay_epoch,
         minutes_core::live_partials::DEFAULT_PARTIAL_CHANNEL_CAPACITY,
+        "standalone",
     );
     let _capture_relay = match minutes_core::copilot::CaptureRelayServer::start(
         minutes_core::copilot::CopilotEvidenceMode::CaptureRelayPartials,

@@ -1944,6 +1944,62 @@ fn transcribe_with_whisper_for_live_sidecar(
 #[cfg(feature = "whisper")]
 const SIDECAR_UTTERANCE_QUEUE_CAP: usize = 3;
 
+/// Recording-sidecar drafts start after one second of speech, then refresh at
+/// a two-second cadence. Pending work is latest-only: the VAD consumer may
+/// replace a queued snapshot and never waits for recognition.
+#[cfg(feature = "whisper")]
+const SIDECAR_DRAFT_INTERVAL_SAMPLES: usize = 16000 * 2;
+#[cfg(feature = "whisper")]
+const SIDECAR_FIRST_DRAFT_SAMPLES: usize = 16000;
+
+#[cfg(feature = "whisper")]
+struct SidecarDraftJob {
+    utterance_sequence: u64,
+    samples: Vec<f32>,
+}
+
+#[cfg(feature = "whisper")]
+struct SidecarDraftResult {
+    utterance_sequence: u64,
+    text: String,
+}
+
+/// A capacity-one, newest-wins handoff. Both lock holders only swap an Option;
+/// recognition and audio copying happen outside the lock.
+#[cfg(feature = "whisper")]
+struct SidecarDraftMailbox<T> {
+    pending: Mutex<Option<T>>,
+    replaced: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(feature = "whisper")]
+impl<T> Default for SidecarDraftMailbox<T> {
+    fn default() -> Self {
+        Self {
+            pending: Mutex::new(None),
+            replaced: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+#[cfg(feature = "whisper")]
+impl<T> SidecarDraftMailbox<T> {
+    fn offer_latest(&self, item: T) {
+        let mut pending = lock_ignore_poison(&self.pending);
+        if pending.replace(item).is_some() {
+            self.replaced.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn take(&self) -> Option<T> {
+        lock_ignore_poison(&self.pending).take()
+    }
+
+    fn clear(&self) {
+        lock_ignore_poison(&self.pending).take();
+    }
+}
+
 /// A poisoned writer mutex means a thread panicked mid-write; the writer's
 /// own failure latches (`jsonl_failed`) already cover torn state, and losing
 /// the remaining transcript over a poison flag would be strictly worse.
@@ -1959,11 +2015,12 @@ fn enqueue_sidecar_utterance(
     job_tx: &std::sync::mpsc::SyncSender<Vec<f32>>,
     samples: Vec<f32>,
     counters: &QueueCounters,
-) {
+) -> EnqueueResult {
     if samples.is_empty() {
-        return;
+        return EnqueueResult::Disconnected;
     }
-    match try_send_drop_newest(job_tx, samples, counters) {
+    let outcome = try_send_drop_newest(job_tx, samples, counters);
+    match outcome {
         EnqueueResult::Queued | EnqueueResult::Disconnected => {}
         EnqueueResult::DroppedFull => {
             let total = counters.dropped.load(Ordering::Relaxed);
@@ -1972,6 +2029,25 @@ fn enqueue_sidecar_utterance(
                 "live sidecar transcription backlog full — dropping utterance audio"
             );
         }
+    }
+    outcome
+}
+
+#[cfg(feature = "whisper")]
+fn finish_sidecar_utterance(
+    job_tx: &std::sync::mpsc::SyncSender<Vec<f32>>,
+    samples: Vec<f32>,
+    counters: &QueueCounters,
+    partial_publisher: Option<&mut LivePartialPublisher>,
+) {
+    let outcome = enqueue_sidecar_utterance(job_tx, samples, counters);
+    if let Some(publisher) = partial_publisher {
+        publisher.supersede_current(match outcome {
+            EnqueueResult::Queued => SupersessionReason::Finalizing,
+            EnqueueResult::DroppedFull | EnqueueResult::Disconnected => {
+                SupersessionReason::Discarded
+            }
+        });
     }
 }
 
@@ -2554,9 +2630,10 @@ pub fn run_sidecar_mpsc(
     rx: std::sync::mpsc::Receiver<Vec<f32>>,
     stop_flag: Arc<AtomicBool>,
     config: &Config,
+    partial_publisher: Option<LivePartialPublisher>,
 ) {
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_sidecar_inner_mpsc(rx, stop_flag, config)
+        run_sidecar_inner_mpsc(rx, stop_flag, config, partial_publisher)
     }));
 
     match outcome {
@@ -2589,6 +2666,7 @@ fn run_sidecar_inner_mpsc(
     rx: std::sync::mpsc::Receiver<Vec<f32>>,
     stop_flag: Arc<AtomicBool>,
     config: &Config,
+    mut partial_publisher: Option<LivePartialPublisher>,
 ) -> Result<(), MinutesError> {
     // Guard: don't clobber a standalone live transcript session's JSONL.
     // `inspect_pid_file` (not `check_pid_file`) so a standalone session holding
@@ -2655,11 +2733,16 @@ fn run_sidecar_inner_mpsc(
     // the status file) instead of the whole session.
     let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(SIDECAR_UTTERANCE_QUEUE_CAP);
     let queue_counters = Arc::new(QueueCounters::default());
+    let draft_jobs = Arc::new(SidecarDraftMailbox::<SidecarDraftJob>::default());
+    let draft_results = Arc::new(SidecarDraftMailbox::<SidecarDraftResult>::default());
+    let drafts_enabled = partial_publisher.is_some();
     let worker = {
         let writer = Arc::clone(&writer);
         let config = config.clone();
         let counters = Arc::clone(&queue_counters);
         let stop_flag = Arc::clone(&stop_flag);
+        let draft_jobs = Arc::clone(&draft_jobs);
+        let draft_results = Arc::clone(&draft_results);
         std::thread::Builder::new()
             .name("live-sidecar-transcribe".into())
             .spawn(move || {
@@ -2669,24 +2752,98 @@ fn run_sidecar_inner_mpsc(
                 // the consumer thread, as before) dropped the first ~13s of
                 // every meeting. Parakeet sessions never pay it at all.
                 let mut whisper_ctx: Option<whisper_rs::WhisperContext> = None;
-                while let Ok(samples) = job_rx.recv() {
-                    // After stop, the recording's batch transcription
-                    // supersedes the live transcript; drain instead of
-                    // transcribing so stop stays responsive.
-                    if stop_flag.load(Ordering::Relaxed) {
+                if drafts_enabled {
+                    match load_sidecar_whisper_ctx(&config) {
+                        Ok(ctx) => whisper_ctx = Some(ctx),
+                        Err(error) => tracing::warn!(
+                            error = %error,
+                            "whisper model unavailable for current-speech drafts"
+                        ),
+                    }
+                }
+                let mut finals_disconnected = false;
+                loop {
+                    let final_samples = match job_rx.try_recv() {
+                        Ok(samples) => Some(samples),
+                        Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            finals_disconnected = true;
+                            None
+                        }
+                    };
+                    if let Some(samples) = final_samples {
+                        if stop_flag.load(Ordering::Relaxed) {
+                            counters.pending.fetch_sub(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        let result = transcribe_utterance_for_sidecar(
+                            &samples,
+                            &config,
+                            &mut whisper_ctx,
+                            &mut parakeet_enabled,
+                        );
                         counters.pending.fetch_sub(1, Ordering::Relaxed);
+                        if let Some((text, duration_secs)) = result {
+                            if let Some(w) = lock_ignore_poison(&writer).as_mut() {
+                                w.write_utterance(&text, duration_secs);
+                            }
+                        }
                         continue;
                     }
-                    let result = transcribe_utterance_for_sidecar(
-                        &samples,
-                        &config,
-                        &mut whisper_ctx,
-                        &mut parakeet_enabled,
-                    );
-                    counters.pending.fetch_sub(1, Ordering::Relaxed);
-                    if let Some((text, duration_secs)) = result {
-                        if let Some(w) = lock_ignore_poison(&writer).as_mut() {
-                            w.write_utterance(&text, duration_secs);
+
+                    if stop_flag.load(Ordering::Relaxed) {
+                        draft_jobs.clear();
+                    } else if let Some(job) = draft_jobs.take() {
+                        if whisper_ctx.is_none() {
+                            match load_sidecar_whisper_ctx(&config) {
+                                Ok(ctx) => whisper_ctx = Some(ctx),
+                                Err(error) => tracing::warn!(
+                                    error = %error,
+                                    "whisper model unavailable for current-speech drafts"
+                                ),
+                            }
+                        }
+                        if let Some(ctx) = whisper_ctx.as_ref() {
+                            if let Some((text, _)) = transcribe_with_whisper_for_live_sidecar(
+                                &job.samples,
+                                ctx,
+                                config.transcription.language.clone(),
+                            ) {
+                                draft_results.offer_latest(SidecarDraftResult {
+                                    utterance_sequence: job.utterance_sequence,
+                                    text,
+                                });
+                            }
+                        }
+                        continue;
+                    }
+
+                    if finals_disconnected {
+                        break;
+                    }
+
+                    match job_rx.recv_timeout(Duration::from_millis(25)) {
+                        Ok(samples) => {
+                            if stop_flag.load(Ordering::Relaxed) {
+                                counters.pending.fetch_sub(1, Ordering::Relaxed);
+                                continue;
+                            }
+                            let result = transcribe_utterance_for_sidecar(
+                                &samples,
+                                &config,
+                                &mut whisper_ctx,
+                                &mut parakeet_enabled,
+                            );
+                            counters.pending.fetch_sub(1, Ordering::Relaxed);
+                            if let Some((text, duration_secs)) = result {
+                                if let Some(w) = lock_ignore_poison(&writer).as_mut() {
+                                    w.write_utterance(&text, duration_secs);
+                                }
+                            }
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            finals_disconnected = true;
                         }
                     }
                 }
@@ -2694,9 +2851,31 @@ fn run_sidecar_inner_mpsc(
             .map_err(|e| MinutesError::from(TranscribeError::Io(e)))?
     };
 
-    tracing::info!("live sidecar started (recording mode)");
+    let mut samples_received = 0usize;
+    let mut utterance_start_offset_ms = 0u64;
+    let mut next_draft_at = SIDECAR_FIRST_DRAFT_SAMPLES;
+    let draft_max_samples = (config.transcription.partial_max_secs as usize).saturating_mul(16000);
+    let mut last_draft_text = String::new();
+
+    tracing::info!(
+        current_speech_drafts = partial_publisher.is_some(),
+        "live sidecar started (recording mode)"
+    );
 
     loop {
+        if let Some(result) = draft_results.take() {
+            if partial_publisher.as_ref().is_some_and(|publisher| {
+                publisher.current_utterance_sequence() == result.utterance_sequence
+            }) && was_speaking
+                && result.text != last_draft_text
+            {
+                if let Some(publisher) = partial_publisher.as_mut() {
+                    let _ = publisher.try_publish(result.text.clone(), utterance_start_offset_ms);
+                }
+                last_draft_text = result.text;
+            }
+        }
+
         // The heartbeat must never block behind the worker (which holds the
         // lock across file IO in write_utterance). Skipping a contended tick
         // is fine: the heartbeat interval is 1s and the staleness threshold
@@ -2719,7 +2898,12 @@ fn run_sidecar_inner_mpsc(
             Err(std::sync::TryLockError::WouldBlock) => {}
         }
         if stop_flag.load(Ordering::Relaxed) {
-            enqueue_sidecar_utterance(&job_tx, std::mem::take(&mut utterance), &queue_counters);
+            draft_jobs.clear();
+            if let Some(publisher) = partial_publisher.as_mut() {
+                publisher.supersede_current(SupersessionReason::Discarded);
+            }
+            let _ =
+                enqueue_sidecar_utterance(&job_tx, std::mem::take(&mut utterance), &queue_counters);
             break;
         }
 
@@ -2727,7 +2911,13 @@ fn run_sidecar_inner_mpsc(
             Ok(s) => s,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                enqueue_sidecar_utterance(&job_tx, std::mem::take(&mut utterance), &queue_counters);
+                draft_jobs.clear();
+                finish_sidecar_utterance(
+                    &job_tx,
+                    std::mem::take(&mut utterance),
+                    &queue_counters,
+                    partial_publisher.as_mut(),
+                );
                 break;
             }
         };
@@ -2743,18 +2933,56 @@ fn run_sidecar_inner_mpsc(
         gating_stats.observe(samples.len(), vad_result.speaking);
 
         if vad_result.speaking {
+            if !was_speaking {
+                utterance_start_offset_ms = samples_to_ms(samples_received);
+                next_draft_at = SIDECAR_FIRST_DRAFT_SAMPLES;
+                last_draft_text.clear();
+                if let Some(publisher) = partial_publisher.as_mut() {
+                    publisher.begin_utterance(Instant::now());
+                }
+            }
             was_speaking = true;
             utterance.extend_from_slice(&samples);
 
+            if partial_publisher.is_some()
+                && utterance.len() >= next_draft_at
+                && (draft_max_samples == 0 || utterance.len() <= draft_max_samples)
+            {
+                let utterance_sequence = partial_publisher
+                    .as_ref()
+                    .map(LivePartialPublisher::current_utterance_sequence)
+                    .unwrap_or(0);
+                draft_jobs.offer_latest(SidecarDraftJob {
+                    utterance_sequence,
+                    samples: utterance.clone(),
+                });
+                next_draft_at = next_draft_at.saturating_add(SIDECAR_DRAFT_INTERVAL_SAMPLES);
+            }
+
             if utterance.len() >= max_utterance_samples {
                 tracing::info!("sidecar: max utterance duration, force-finalizing");
-                enqueue_sidecar_utterance(&job_tx, std::mem::take(&mut utterance), &queue_counters);
+                draft_jobs.clear();
+                finish_sidecar_utterance(
+                    &job_tx,
+                    std::mem::take(&mut utterance),
+                    &queue_counters,
+                    partial_publisher.as_mut(),
+                );
                 was_speaking = false;
+                last_draft_text.clear();
             }
         } else if was_speaking && !utterance.is_empty() {
-            enqueue_sidecar_utterance(&job_tx, std::mem::take(&mut utterance), &queue_counters);
+            draft_jobs.clear();
+            finish_sidecar_utterance(
+                &job_tx,
+                std::mem::take(&mut utterance),
+                &queue_counters,
+                partial_publisher.as_mut(),
+            );
             was_speaking = false;
+            last_draft_text.clear();
         }
+        samples_received = samples_received.saturating_add(samples.len());
     }
 
     // Let the worker drain its queue (post-stop jobs are skipped, and a single
@@ -2780,6 +3008,8 @@ fn run_sidecar_inner_mpsc(
     tracing::info!(
         lines = lines,
         duration_secs = format!("{:.1}", duration),
+        draft_jobs_replaced = draft_jobs.replaced.load(Ordering::Relaxed),
+        draft_results_replaced = draft_results.replaced.load(Ordering::Relaxed),
         "live sidecar ended (recording mode)"
     );
 
@@ -2792,6 +3022,7 @@ pub fn run_sidecar_mpsc(
     _rx: std::sync::mpsc::Receiver<Vec<f32>>,
     _stop_flag: Arc<AtomicBool>,
     _config: &Config,
+    _partial_publisher: Option<LivePartialPublisher>,
 ) {
     tracing::warn!("live sidecar requires the whisper feature");
 }
@@ -3214,6 +3445,46 @@ mod tests {
 
         assert_eq!(counters.pending.load(Ordering::Relaxed), 0);
         assert_eq!(counters.dropped.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn sidecar_draft_mailbox_keeps_only_the_newest_pending_snapshot() {
+        let mailbox = SidecarDraftMailbox::default();
+        mailbox.offer_latest(SidecarDraftJob {
+            utterance_sequence: 1,
+            samples: vec![0.1; 1600],
+        });
+        mailbox.offer_latest(SidecarDraftJob {
+            utterance_sequence: 1,
+            samples: vec![0.2; 3200],
+        });
+
+        let pending = mailbox.take().unwrap();
+        assert_eq!(pending.samples.len(), 3200);
+        assert_eq!(mailbox.replaced.load(Ordering::Relaxed), 1);
+        assert!(mailbox.take().is_none());
+    }
+
+    #[test]
+    fn queued_final_immediately_supersedes_the_visible_draft() {
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(1);
+        let counters = QueueCounters::default();
+        let (mut publisher, mut subscriber) = crate::live_partials::channel(9, 2);
+        publisher.begin_utterance(Instant::now());
+        assert_eq!(
+            publisher.try_publish("provisional".into(), 0),
+            crate::live_partials::PartialPublishOutcome::Published
+        );
+
+        finish_sidecar_utterance(&tx, vec![0.1; 1600], &counters, Some(&mut publisher));
+
+        let crate::live_partials::LivePartialEvent::Superseded(signal) =
+            subscriber.try_recv().unwrap()
+        else {
+            panic!("speech end must invalidate a provisional draft before final inference");
+        };
+        assert_eq!(signal.reason, SupersessionReason::Finalizing);
+        assert!(subscriber.try_recv().is_none());
     }
 
     #[test]

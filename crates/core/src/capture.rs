@@ -1305,6 +1305,7 @@ fn record_to_wav_dual_source(
     config: &Config,
     plan: DualCapturePlan,
     started_context: Option<RecordingStartedContext>,
+    partial_publisher: Option<crate::live_partials::LivePartialPublisher>,
 ) -> Result<(), CaptureError> {
     crate::pid::check_and_clear_sentinel();
     // Refresh the in-process mic-mute flag from the sentinel. The CLI
@@ -1316,7 +1317,7 @@ fn record_to_wav_dual_source(
     let mut writers = DualCaptureWriters::new(output_path)?;
     AUDIO_LEVEL.store(0, Ordering::Relaxed);
 
-    let (live_tx, sidecar_handle) = start_live_sidecar(config, &stop_flag);
+    let (live_tx, sidecar_handle) = start_live_sidecar(config, &stop_flag, partial_publisher);
 
     // Screen context is an independent evidence lane. Start it before opening
     // either audio stream so a slow or blocked microphone/system-audio setup
@@ -1700,12 +1701,30 @@ pub fn record_to_wav_with_lifecycle(
     use cpal::traits::DeviceTrait;
 
     let capture_plan = resolve_capture_plan(config)?;
-    // The capture owner exposes finalized live evidence over a transient local
-    // relay. Failure is non-fatal for recording, but it is never hidden: an
-    // attaching copilot will refuse to open a second microphone.
+    // The capture owner exposes finalized evidence plus one replaceable,
+    // in-memory current-speech draft over a transient local relay. The draft
+    // producer is bounded and optional; relay failure disables drafts without
+    // changing capture or the durable transcript path.
+    let relay_epoch = chrono::Utc::now().timestamp_millis().unsigned_abs().max(1);
+    let (mut recording_partial_publisher, recording_partial_subscriber) =
+        if cfg!(all(feature = "whisper", feature = "streaming")) {
+            let (publisher, subscriber) = crate::live_partials::channel_with_source(
+                relay_epoch,
+                crate::live_partials::DEFAULT_PARTIAL_CHANNEL_CAPACITY,
+                "recording-sidecar",
+            );
+            (Some(publisher), Some(subscriber))
+        } else {
+            (None, None)
+        };
+    let relay_evidence_mode = if recording_partial_subscriber.is_some() {
+        crate::copilot::CopilotEvidenceMode::CaptureRelayPartials
+    } else {
+        crate::copilot::CopilotEvidenceMode::FinalOnly
+    };
     let _capture_relay = match crate::copilot::CaptureRelayServer::start(
-        crate::copilot::CopilotEvidenceMode::FinalOnly,
-        None,
+        relay_evidence_mode,
+        recording_partial_subscriber,
     ) {
         Ok(relay) => Some(relay),
         Err(crate::copilot::CaptureRelayError::AlreadyOwned(owner_pid)) => {
@@ -1721,6 +1740,7 @@ pub fn record_to_wav_with_lifecycle(
             return Err(CaptureError::CaptureOwnerBusy);
         }
         Err(error) => {
+            recording_partial_publisher = None;
             eprintln!(
                 "[minutes] Live coaching attachment is unavailable for this recording: {error}. Recording continues; Minutes will not let another process silently open a second microphone."
             );
@@ -1730,7 +1750,14 @@ pub fn record_to_wav_with_lifecycle(
     };
     #[cfg(feature = "streaming")]
     if let CapturePlan::Dual(plan) = capture_plan.clone() {
-        return record_to_wav_dual_source(output_path, stop_flag, config, plan, started_context);
+        return record_to_wav_dual_source(
+            output_path,
+            stop_flag,
+            config,
+            plan,
+            started_context,
+            recording_partial_publisher,
+        );
     }
 
     // Clear any stale stop sentinel from a previous session
@@ -1771,7 +1798,8 @@ pub fn record_to_wav_with_lifecycle(
 
     // Start live transcript sidecar — streams real-time transcription to JSONL
     // so agents can see what's being discussed during the recording.
-    let (live_tx, sidecar_handle) = start_live_sidecar(config, &stop_flag);
+    let (live_tx, sidecar_handle) =
+        start_live_sidecar(config, &stop_flag, recording_partial_publisher);
 
     // Screen context is independent of microphone readiness. Start it before
     // building the audio stream so permission prompts or a slow device cannot
@@ -2153,6 +2181,7 @@ fn report_screen_permission_failure(output_path: &Path) {
 pub(crate) fn start_live_sidecar(
     config: &Config,
     stop_flag: &Arc<AtomicBool>,
+    partial_publisher: Option<crate::live_partials::LivePartialPublisher>,
 ) -> (
     Option<std::sync::mpsc::SyncSender<Vec<f32>>>,
     Option<std::thread::JoinHandle<()>>,
@@ -2163,7 +2192,12 @@ pub(crate) fn start_live_sidecar(
     match std::thread::Builder::new()
         .name("live-sidecar".into())
         .spawn(move || {
-            crate::live_transcript::run_sidecar_mpsc(rx, sidecar_stop, &sidecar_config);
+            crate::live_transcript::run_sidecar_mpsc(
+                rx,
+                sidecar_stop,
+                &sidecar_config,
+                partial_publisher,
+            );
         }) {
         Ok(handle) => (Some(tx), Some(handle)),
         Err(e) => {
@@ -2177,6 +2211,7 @@ pub(crate) fn start_live_sidecar(
 pub(crate) fn start_live_sidecar(
     _config: &Config,
     _stop_flag: &Arc<AtomicBool>,
+    _partial_publisher: Option<crate::live_partials::LivePartialPublisher>,
 ) -> (
     Option<std::sync::mpsc::SyncSender<Vec<f32>>>,
     Option<std::thread::JoinHandle<()>>,

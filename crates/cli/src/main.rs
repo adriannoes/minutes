@@ -1262,6 +1262,10 @@ enum Commands {
         /// Output format: text or json
         #[arg(long, default_value = "json", value_parser = ["text", "json"])]
         format: String,
+
+        /// Include one fresh, clearly provisional current-speech draft
+        #[arg(long)]
+        include_current: bool,
     },
 
     /// Open the Meeting Intelligence Dashboard in your browser
@@ -2526,7 +2530,8 @@ fn main() -> Result<()> {
             since,
             status,
             format,
-        } => cmd_transcript(since.as_deref(), status, &format),
+            include_current,
+        } => cmd_transcript(since.as_deref(), status, &format, include_current),
         Commands::Dashboard { port, no_open } => dashboard::serve(&config, port, !no_open),
     };
 
@@ -17248,9 +17253,10 @@ fn cmd_live(config: &Config) -> Result<()> {
     });
 
     let relay_epoch = chrono::Utc::now().timestamp_millis().unsigned_abs().max(1);
-    let (partial_publisher, partial_subscriber) = minutes_core::live_partials::channel(
+    let (partial_publisher, partial_subscriber) = minutes_core::live_partials::channel_with_source(
         relay_epoch,
         minutes_core::live_partials::DEFAULT_PARTIAL_CHANNEL_CAPACITY,
+        "standalone",
     );
     let _capture_relay = match minutes_core::copilot::CaptureRelayServer::start(
         minutes_core::copilot::CopilotEvidenceMode::CaptureRelayPartials,
@@ -17302,7 +17308,89 @@ fn cmd_live(_config: &Config) -> Result<()> {
 }
 
 #[cfg(feature = "whisper")]
-fn cmd_transcript(since: Option<&str>, status: bool, format: &str) -> Result<()> {
+#[derive(Serialize)]
+struct TranscriptCaptureRelayProjection {
+    session_id: String,
+    owner_pid: u32,
+    evidence_mode: minutes_core::copilot::CopilotEvidenceMode,
+    cursor: minutes_core::copilot::RelayCursor,
+}
+
+#[cfg(feature = "whisper")]
+#[derive(Serialize)]
+struct LiveEvidenceSnapshotV1 {
+    schema_version: u32,
+    active: bool,
+    finals: Vec<minutes_core::live_transcript::TranscriptLine>,
+    current_draft: Option<minutes_core::copilot::RelayCurrentDraft>,
+    draft_state: minutes_core::copilot::RelayDraftState,
+    capture_relay: Option<TranscriptCaptureRelayProjection>,
+    gap: bool,
+}
+
+#[cfg(feature = "whisper")]
+fn relay_draft_state_label(state: minutes_core::copilot::RelayDraftState) -> &'static str {
+    use minutes_core::copilot::RelayDraftState;
+    match state {
+        RelayDraftState::Current => "current",
+        RelayDraftState::None => "no speech in progress",
+        RelayDraftState::Finalizing => "speech ended; finalizing",
+        RelayDraftState::Superseded => "superseded",
+        RelayDraftState::Stale => "stale; ignored",
+        RelayDraftState::Unavailable => "unavailable",
+        RelayDraftState::Unsupported => "finalized transcript only",
+    }
+}
+
+#[cfg(feature = "whisper")]
+fn read_current_speech_replay() -> std::result::Result<
+    (
+        TranscriptCaptureRelayProjection,
+        minutes_core::copilot::RelayDraftSnapshot,
+    ),
+    minutes_core::copilot::CaptureRelayError,
+> {
+    use minutes_core::copilot::{reduce_relay_draft, CaptureRelayClient, RelayCursor, RelayFrame};
+    use std::time::Instant;
+
+    let mut client = CaptureRelayClient::connect(RelayCursor::default())?;
+    let discovery = client.discovery().clone();
+    let deadline = Instant::now() + Duration::from_millis(350);
+    let mut quiet_since = Instant::now();
+    let mut frames = Vec::<RelayFrame>::new();
+    loop {
+        match client.try_recv()? {
+            Some(frame) => {
+                frames.push(frame);
+                quiet_since = Instant::now();
+            }
+            None if !frames.is_empty() && quiet_since.elapsed() >= Duration::from_millis(40) => {
+                break;
+            }
+            None if Instant::now() >= deadline => break,
+            None => std::thread::sleep(Duration::from_millis(5)),
+        }
+    }
+    let cursor = client.cursor();
+    let snapshot = reduce_relay_draft(&frames, discovery.evidence_mode, chrono::Utc::now());
+    Ok((
+        TranscriptCaptureRelayProjection {
+            session_id: discovery.session_id,
+            owner_pid: discovery.owner_pid,
+            evidence_mode: discovery.evidence_mode,
+            cursor,
+        },
+        snapshot,
+    ))
+}
+
+#[cfg(feature = "whisper")]
+fn cmd_transcript(
+    since: Option<&str>,
+    status: bool,
+    format: &str,
+    include_current: bool,
+) -> Result<()> {
     if status {
         let s = minutes_core::live_transcript::session_status();
         if format == "json" {
@@ -17369,7 +17457,57 @@ fn cmd_transcript(since: Option<&str>, status: bool, format: &str) -> Result<()>
         }
     };
 
-    if format == "json" {
+    if include_current {
+        let session = minutes_core::live_transcript::session_status();
+        let (capture_relay, draft) = match read_current_speech_replay() {
+            Ok((relay, draft)) => (Some(relay), draft),
+            Err(minutes_core::copilot::CaptureRelayError::NotFound) if !session.active => (
+                None,
+                minutes_core::copilot::RelayDraftSnapshot {
+                    current_draft: None,
+                    draft_state: minutes_core::copilot::RelayDraftState::None,
+                    gap: false,
+                },
+            ),
+            Err(_) => (
+                None,
+                minutes_core::copilot::RelayDraftSnapshot {
+                    current_draft: None,
+                    draft_state: minutes_core::copilot::RelayDraftState::Unavailable,
+                    gap: false,
+                },
+            ),
+        };
+        let active = session.active || capture_relay.is_some();
+        let snapshot = LiveEvidenceSnapshotV1 {
+            schema_version: 1,
+            active,
+            finals: lines,
+            current_draft: draft.current_draft,
+            draft_state: draft.draft_state,
+            capture_relay,
+            gap: draft.gap,
+        };
+        if format == "json" {
+            println!("{}", serde_json::to_string_pretty(&snapshot)?);
+        } else {
+            for line in &snapshot.finals {
+                let ts = line.ts.format("%H:%M:%S");
+                let speaker = line.speaker.as_deref().unwrap_or("?");
+                println!("[{}] [{}] {}", ts, speaker, line.text);
+            }
+            if let Some(draft) = &snapshot.current_draft {
+                println!("[current speech, provisional] {}", draft.text);
+            } else if snapshot.active
+                && snapshot.draft_state != minutes_core::copilot::RelayDraftState::None
+            {
+                println!(
+                    "[current speech: {}]",
+                    relay_draft_state_label(snapshot.draft_state)
+                );
+            }
+        }
+    } else if format == "json" {
         for line in &lines {
             println!("{}", serde_json::to_string(line)?);
         }
@@ -17385,7 +17523,12 @@ fn cmd_transcript(since: Option<&str>, status: bool, format: &str) -> Result<()>
 }
 
 #[cfg(not(feature = "whisper"))]
-fn cmd_transcript(_since: Option<&str>, _status: bool, _format: &str) -> Result<()> {
+fn cmd_transcript(
+    _since: Option<&str>,
+    _status: bool,
+    _format: &str,
+    _include_current: bool,
+) -> Result<()> {
     Err(anyhow::anyhow!(
         "`minutes transcript` requires the `whisper` feature. Reinstall without `--no-default-features` to read live transcripts."
     ))
