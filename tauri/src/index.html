@@ -16791,6 +16791,9 @@
       mdViewerPreviewBtn.classList.toggle('active', !sourceMode);
       mdViewerSourceBtn.classList.toggle('active', sourceMode);
       mdViewerSourceBtn.disabled = !openArtifactEditable;
+      if (!openArtifactEditable && openArtifactPath && mdViewerStatus.textContent === 'Viewing') {
+        mdViewerStatus.textContent = 'Read-only';
+      }
       mdViewerPromoteBtn.hidden = !openArtifactPath || openArtifactEditable;
       mdViewerReviewBtn.disabled = !mdViewerReviewData?.available;
       mdViewerContent.style.display = sourceMode ? 'none' : 'block';

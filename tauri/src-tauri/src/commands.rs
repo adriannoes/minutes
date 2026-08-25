@@ -5077,6 +5077,10 @@ fn is_editable_text_file_path(path: &Path, config: &Config) -> bool {
         config.output_dir.clone(),
         workspace.clone(),
         workspace.join("artifacts"),
+        // Prep briefs are the document a user most wants to edit in the
+        // viewer right before a meeting; listing them (append_prep_documents)
+        // without making them editable left click-to-edit silently inert.
+        Config::minutes_dir().join("preps"),
     ];
     trusted_roots.iter().any(|root| path.starts_with(root))
 }
