@@ -4140,6 +4140,52 @@
       gap: 5px;
     }
 
+    .footer-action-secondary .btn[hidden] {
+      display: none !important;
+    }
+
+    .capture-mode-picker {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 2px;
+      padding: 2px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--bg-hover);
+    }
+
+    .capture-mode-seg {
+      font-family: var(--font-mono);
+      font-size: var(--text-2xs);
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      padding: 6px 4px;
+      border: 0;
+      border-radius: calc(var(--radius) - 2px);
+      background: transparent;
+      color: var(--text-secondary);
+      cursor: pointer;
+      min-width: 0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .capture-mode-seg:hover { color: var(--text); }
+    .capture-mode-seg:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+    .capture-mode-seg[aria-checked="true"] {
+      background: var(--bg);
+      color: var(--text);
+      box-shadow: 0 1px 2px var(--shadow-soft);
+    }
+
+    /* Mid-capture the mode is locked, like the hidden buttons it stands for. */
+    .footer.capture-mode .capture-mode-picker {
+      opacity: 0.55;
+      pointer-events: none;
+    }
+
     .footer-device-label {
       font-size: var(--text-2xs);
       font-family: var(--font-mono);
@@ -5127,8 +5173,11 @@
       grid-template-columns: 1fr;
     }
 
+    /* Written for the old three-button row. The picker is the only visible
+       child now (the originals are hidden), so three fixed tracks parked it
+       in a 0.72fr sliver during capture — "M… M… L…". One full-width track. */
     .footer.capture-mode .footer-action-secondary {
-      grid-template-columns: minmax(0, 0.72fr) minmax(0, 1.55fr) minmax(0, 1fr);
+      grid-template-columns: 1fr;
     }
 
     .btn {
@@ -5922,10 +5971,20 @@
           </select>
         </div>
         <div class="footer-action-secondary">
-          <button class="btn btn-secondary" id="btn-live"
+          <!-- Meeting, memo and live are three modes of one action. The picker
+               selects; the primary button starts. -->
+          <div class="capture-mode-picker" role="radiogroup" aria-label="What to capture">
+            <button type="button" class="capture-mode-seg" role="radio" aria-checked="true" data-capture-mode="meeting">Meeting</button>
+            <button type="button" class="capture-mode-seg" role="radio" aria-checked="false" data-capture-mode="memo">Memo</button>
+            <button type="button" class="capture-mode-seg" role="radio" aria-checked="false" data-capture-mode="live">Live</button>
+          </div>
+          <!-- The original mode buttons stay in the DOM, hidden: every handler,
+               tooltip, disabled-state update and the live transition label
+               targets them by id, and the primary button forwards to them. -->
+          <button class="btn btn-secondary" id="btn-live" hidden
             title="Start live transcription — ask your agent in Recall for coaching"
             aria-label="Start live transcription">Live</button>
-          <button class="btn btn-secondary" id="btn-quick-thought">Quick Thought</button>
+          <button class="btn btn-secondary" id="btn-quick-thought" hidden>Quick Thought</button>
         </div>
       </div>
     </div>
@@ -9442,6 +9501,64 @@
         setFooterCaptureMode(false);
       }
     });
+
+    // ── Capture mode picker ──
+    // Start Recording, Quick Thought and Live were three peer buttons for
+    // three modes of the same action, which crowded the footer and made the
+    // modes read as unrelated features. The picker chooses the mode; the
+    // primary button starts it by forwarding to the original (hidden) button,
+    // so every existing handler, tooltip and capture-state update keeps
+    // working untouched.
+    const CAPTURE_MODE_LABELS = { meeting: 'Start Recording', memo: 'Record Memo', live: 'Go Live' };
+    const captureModePicker = document.querySelector('.capture-mode-picker');
+    let captureMode = 'meeting';
+    try {
+      const stored = localStorage.getItem('minutes.captureMode');
+      if (stored && Object.prototype.hasOwnProperty.call(CAPTURE_MODE_LABELS, stored)) captureMode = stored;
+    } catch (_) { }
+
+    function syncPrimaryCaptureLabel() {
+      if (footer.classList.contains('capture-mode')) return;
+      if (captureMode === 'live' && liveTransitionButton === liveButton) {
+        // A live transition writes its progress ("Starting...") onto the hidden
+        // Live button; mirror it so the visible control shows it.
+        recordButton.textContent = liveButton.textContent;
+        return;
+      }
+      recordButton.textContent = CAPTURE_MODE_LABELS[captureMode];
+    }
+
+    function applyCaptureMode(mode, { persist = true } = {}) {
+      captureMode = Object.prototype.hasOwnProperty.call(CAPTURE_MODE_LABELS, mode) ? mode : 'meeting';
+      captureModePicker?.querySelectorAll('.capture-mode-seg').forEach((seg) => {
+        seg.setAttribute('aria-checked', seg.dataset.captureMode === captureMode ? 'true' : 'false');
+      });
+      syncPrimaryCaptureLabel();
+      if (persist) {
+        try { localStorage.setItem('minutes.captureMode', captureMode); } catch (_) { }
+      }
+    }
+
+    captureModePicker?.addEventListener('click', (event) => {
+      const seg = event.target.closest('.capture-mode-seg');
+      if (!seg || footer.classList.contains('capture-mode')) return;
+      applyCaptureMode(seg.dataset.captureMode);
+    });
+
+    // Capture phase: runs before the meeting handler above, so a non-meeting
+    // mode forwards to its own button and the meeting handler never fires.
+    recordButton.addEventListener('click', (event) => {
+      if (captureMode === 'meeting') return;
+      event.stopImmediatePropagation();
+      event.preventDefault();
+      (captureMode === 'memo' ? quickThoughtButton : liveButton).click();
+    }, true);
+
+    new MutationObserver(syncPrimaryCaptureLabel).observe(liveButton, {
+      childList: true, characterData: true, subtree: true, attributes: true, attributeFilter: ['disabled'],
+    });
+    // Deferred so every `let` this reads has been initialised by the time it runs.
+    setTimeout(() => applyCaptureMode(captureMode, { persist: false }), 0);
 
     recordingConsentConfirm.addEventListener('click', async () => {
       const args = pendingRecordingStartArgs || {};
