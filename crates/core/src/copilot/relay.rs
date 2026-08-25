@@ -830,6 +830,9 @@ fn connection_closed_error() -> CaptureRelayError {
 #[cfg(windows)]
 fn windows_stream_has_data(stream: &Stream) -> io::Result<bool> {
     use std::os::windows::io::{AsHandle, AsRawHandle};
+    use windows_sys::Win32::Foundation::{
+        ERROR_BAD_PIPE, ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED,
+    };
     use windows_sys::Win32::System::Pipes::PeekNamedPipe;
 
     let raw_handle = match stream {
@@ -847,7 +850,22 @@ fn windows_stream_has_data(stream: &Stream) -> io::Result<bool> {
         )
     };
     if success == 0 {
-        Err(io::Error::last_os_error())
+        let error = io::Error::last_os_error();
+        if matches!(
+            error.raw_os_error(),
+            Some(code)
+                if code == ERROR_BROKEN_PIPE as i32
+                    || code == ERROR_BAD_PIPE as i32
+                    || code == ERROR_NO_DATA as i32
+                    || code == ERROR_PIPE_NOT_CONNECTED as i32
+        ) {
+            Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "capture relay closed the connection",
+            ))
+        } else {
+            Err(error)
+        }
     } else {
         Ok(available > 0)
     }
