@@ -14280,6 +14280,14 @@
 
       recallThemeHandler = () => {
         if (recallTerminal) recallTerminal.options.theme = window.getMinutesTheme(effectiveTerminalDark());
+        // The palette follows the theme live, but the TUI inside chose its
+        // colours at startup from COLORFGBG, which is fixed for the life of
+        // the process. A mismatched composer with no explanation reads as a
+        // bug; say what happened and what fixes it.
+        if (recallPtyAlive && recallDevMode) {
+          const name = recallReadiness?.assistantName || 'The assistant';
+          setRecallProviderNotice(`Theme changed. ${name} keeps its startup colours until the terminal session restarts (End Session, then reopen).`);
+        }
       };
       // Re-theme when the app's own override flips, not only when the OS does.
       recallThemeObserver = new MutationObserver(recallThemeHandler);
