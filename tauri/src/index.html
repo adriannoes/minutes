@@ -331,6 +331,20 @@
       flex: 0 0 var(--list-width, 22%);
     }
 
+    /* Below 820px there is no honest three- or two-pane split. The document
+       floats over chat instead of crushing both; chat keeps its size
+       underneath, so the terminal is not re-fitted to a sliver. */
+    body.doc-overlay .md-viewer.active {
+      position: absolute;
+      top: 0;
+      right: 0;
+      bottom: 0;
+      width: min(100%, 560px);
+      flex: none;
+      z-index: 30;
+      box-shadow: -8px 0 24px var(--shadow-soft);
+    }
+
     body.doc-open .recall-panel.expanded {
       width: auto;
       flex: 1 1 auto;
@@ -429,13 +443,18 @@
       border-top-right-radius: 18px;
       flex-shrink: 0;
       -webkit-app-region: drag;
+      /* Actions wrap under the title at narrow widths instead of crushing it
+         to "Reca". */
+      flex-wrap: wrap;
+      row-gap: 8px;
     }
 
     .recall-header-info {
       display: flex;
       align-items: center;
       gap: 8px;
-      min-width: 0;
+      /* Never squeezed past a readable stub ("Reca" was the whole title). */
+      min-width: 9ch;
     }
 
     .recall-phase-dot {
@@ -560,6 +579,9 @@
       flex: 1;
       min-height: 0;
       overflow: hidden;
+      /* fit() rounds rows against the padded box; without this the last row
+         (the TUI status line) sat half under the pane edge. */
+      padding-bottom: 6px;
       margin: 0;
       border-radius: 0;
       border: none;
@@ -1994,6 +2016,8 @@
       position: relative;
       z-index: 6;
       -webkit-app-region: drag;
+      flex-wrap: wrap;
+      row-gap: 6px;
     }
 
     .md-viewer-header button,
@@ -2092,7 +2116,8 @@
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
-      min-width: 0;
+      /* Never squeezed past a readable stub ("2…" was the whole filename). */
+      min-width: 10ch;
     }
 
     .md-viewer-kind {
@@ -2572,8 +2597,10 @@
       line-height: 1.25;
     }
 
+    /* DESIGN.md sizes app headings at 18-22px. --text-2xl is the landing
+       hero scale and read as a headline in a 300px pane. */
     .md-viewer-content h1 {
-      font-size: var(--text-2xl);
+      font-size: var(--text-xl);
     }
 
     .md-viewer-content h2 {
@@ -2581,8 +2608,25 @@
     }
 
     .md-viewer-content h3 {
-      font-size: var(--text-sm);
+      font-size: var(--text-base);
     }
+
+    .md-frontmatter {
+      display: grid;
+      grid-template-columns: max-content minmax(0, 1fr);
+      column-gap: 12px;
+      row-gap: 2px;
+      margin: 0 0 16px;
+      padding: 8px 10px;
+      font-family: var(--font-mono);
+      font-size: var(--text-xs);
+      color: var(--text-secondary);
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+    }
+    .md-frontmatter dt { color: var(--text-tertiary); }
+    .md-frontmatter dd { margin: 0; color: var(--text); overflow-wrap: anywhere; }
 
     .md-viewer-content h1:first-child,
     .md-viewer-content h2:first-child,
@@ -4021,7 +4065,7 @@
          override re-imposed three rigid columns whenever the WINDOW was wide,
          but with a document open the list pane pins to 22%, so a wide window
          and a 320px pane coexist — exactly when it broke. */
-      grid-template-columns: repeat(auto-fit, minmax(96px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
       gap: 4px;
     }
 
@@ -14100,26 +14144,41 @@
 
     const storedSidebarCollapsed = localStorage.getItem('minutes.sidebarCollapsed') === 'true';
     applySidebarCollapsed(storedSidebarCollapsed);
-    if (window.innerWidth < 720 && !storedSidebarCollapsed && !userExpandedSidebarThisSession) {
-      sidebarAutoCollapsed = true;
-      document.body.classList.add('sidebar-collapsed');
-      sidebarCollapseButton.classList.add('is-collapsed');
-    }
-    sidebarCollapseButton.addEventListener('click', toggleSidebarCollapsed);
-    sidebarExpandRail.addEventListener('click', () => {
-      applySidebarCollapsed(false, { explicit: true });
-    });
-    window.addEventListener('resize', () => {
-      if (window.innerWidth < 720 && !userExpandedSidebarThisSession && localStorage.getItem('minutes.sidebarCollapsed') !== 'true') {
-        sidebarAutoCollapsed = true;
-        document.body.classList.add('sidebar-collapsed');
-        sidebarCollapseButton.classList.add('is-collapsed');
-      } else if (window.innerWidth >= 720 && sidebarAutoCollapsed) {
+
+    // Responsive layout policy. Three panes need ~820px just to reach their
+    // minimums and only stop fighting near 1000px; the default window is
+    // 560px. So with a document open the list auto-collapses to the rail
+    // below 1000px (two panes: chat + document), and below 820px the document
+    // overlays chat rather than crushing both. This is responsive, not a mode
+    // change: it reverses with width, the rail is one click away, and an
+    // explicit expand this session is respected.
+    const SIDEBAR_AUTO_COLLAPSE_WIDTH = 720;
+    const DOC_OPEN_COLLAPSE_WIDTH = 1000;
+    const DOC_OVERLAY_WIDTH = 820;
+    function syncNarrowLayout() {
+      const docOpen = document.body.classList.contains('doc-open');
+      const threshold = docOpen ? DOC_OPEN_COLLAPSE_WIDTH : SIDEBAR_AUTO_COLLAPSE_WIDTH;
+      const width = window.innerWidth;
+      const pinnedCollapsed = localStorage.getItem('minutes.sidebarCollapsed') === 'true';
+      if (width < threshold && !userExpandedSidebarThisSession && !pinnedCollapsed) {
+        if (!document.body.classList.contains('sidebar-collapsed')) {
+          sidebarAutoCollapsed = true;
+          document.body.classList.add('sidebar-collapsed');
+          sidebarCollapseButton.classList.add('is-collapsed');
+        }
+      } else if (width >= threshold && sidebarAutoCollapsed) {
         sidebarAutoCollapsed = false;
         document.body.classList.remove('sidebar-collapsed');
         sidebarCollapseButton.classList.remove('is-collapsed');
       }
+      document.body.classList.toggle('doc-overlay', docOpen && width < DOC_OVERLAY_WIDTH);
+    }
+    syncNarrowLayout();
+    sidebarCollapseButton.addEventListener('click', toggleSidebarCollapsed);
+    sidebarExpandRail.addEventListener('click', () => {
+      applySidebarCollapsed(false, { explicit: true });
     });
+    window.addEventListener('resize', syncNarrowLayout);
 
     // ── Draggable split handle ──
     function clampRecallRatio(ratio) {
@@ -16602,7 +16661,32 @@
 
     // Tag each top-level rendered element with the source range that produced
     // it, so a click in the preview can open exactly that block for editing.
-    function annotateBlocksWithSource(body, tokens, source) {
+    // Leading YAML frontmatter. marked has no notion of it: the closing ---
+    // reads as a setext underline, so the whole metadata block rendered as one
+    // giant heading. Split it off, render it as a compact key/value list, and
+    // shift click-to-edit offsets by its length so body ranges stay exact.
+    function splitFrontmatter(source) {
+      const m = /^---[ \t]*\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)/.exec(source);
+      if (!m) return { meta: null, body: source, bodyStart: 0 };
+      return { meta: m[1], body: source.slice(m[0].length), bodyStart: m[0].length };
+    }
+
+    function buildFrontmatterElement(doc, meta) {
+      const dl = doc.createElement('dl');
+      dl.className = 'md-frontmatter';
+      for (const line of meta.split(/\r?\n/)) {
+        const idx = line.indexOf(':');
+        if (idx <= 0) continue;
+        const dt = doc.createElement('dt');
+        dt.textContent = line.slice(0, idx).trim();
+        const dd = doc.createElement('dd');
+        dd.textContent = line.slice(idx + 1).trim();
+        dl.append(dt, dd);
+      }
+      return dl;
+    }
+
+    function annotateBlocksWithSource(body, tokens, source, base = 0) {
       const offsets = buildSourceOffsetMap(source);
       const ranges = [];
       let cursor = 0;
@@ -16626,22 +16710,27 @@
       if (blocks.length !== ranges.length) return false;
       blocks.forEach((block, i) => {
         block.classList.add('md-block');
-        block.dataset.srcStart = String(offsets[ranges[i][0]]);
-        block.dataset.srcEnd = String(offsets[ranges[i][1]]);
+        block.dataset.srcStart = String(base + offsets[ranges[i][0]]);
+        block.dataset.srcEnd = String(base + offsets[ranges[i][1]]);
       });
       return true;
     }
 
     function renderMarkdownToElement(el, markdownText, { annotateSource = false } = {}) {
       const source = markdownText || '';
+      const { meta, body, bodyStart } = splitFrontmatter(source);
       // Escape BEFORE parsing so marked can never emit raw HTML; sanitizeDom
       // is defense in depth, not the only barrier (#404).
-      const tokens = marked.lexer(escapeHtmlForMarkdown(source));
+      const tokens = marked.lexer(escapeHtmlForMarkdown(body));
       const doc = new DOMParser().parseFromString(marked.parser(tokens), 'text/html');
       sanitizeDom(doc.body);
       if (annotateSource && source.length <= MAX_ANNOTATED_SOURCE_CHARS) {
-        annotateBlocksWithSource(doc.body, tokens, source);
+        annotateBlocksWithSource(doc.body, tokens, body, bodyStart);
       }
+      // Prepend AFTER annotation: the block/token zip must see only the body.
+      // The list carries no source range, so clicking it falls through to
+      // source mode with the caret at the top, where the frontmatter is.
+      if (meta !== null) doc.body.prepend(buildFrontmatterElement(doc, meta));
       el.textContent = '';
       while (doc.body.firstChild) {
         el.appendChild(doc.body.firstChild);
@@ -17161,6 +17250,7 @@
       mdViewer.classList.add('active');
       // Drives the three-pane split: chat yields, the list keeps its width.
       document.body.classList.add('doc-open');
+      syncNarrowLayout();
       // The detail overlay is a fixed full-screen layer (z-index 120) — leaving it
       // open would render the draft behind the meeting note. Close it so the
       // newly-active md-viewer is actually visible.
@@ -17246,6 +17336,7 @@
       mdViewerReviewVisible = false;
       mdViewer.classList.remove('active');
       document.body.classList.remove('doc-open');
+      syncNarrowLayout();
       // Nothing to restore: the list, search and footer are never hidden now.
       mdViewerFilename.textContent = '';
       mdViewerContent.textContent = '';
