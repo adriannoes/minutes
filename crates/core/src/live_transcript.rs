@@ -1317,8 +1317,11 @@ fn run_inner(
                 writer.push_shadow_samples(&chunk.samples);
                 if let Some(sr) = streaming.feed(&chunk.samples, whisper_ctx) {
                     if let Some(publisher) = partial_publisher.as_mut() {
-                        let _ = publisher
-                            .try_publish(sr.text, writer.start_time.elapsed().as_millis() as u64);
+                        let _ = publisher.try_publish_for_snapshot(
+                            sr.text,
+                            writer.start_time.elapsed().as_millis() as u64,
+                            audio_received_at,
+                        );
                         // A full ring drops here. Do not log, wait, retry,
                         // normalize, allocate another queue, or touch the
                         // durable event path from this thread. Text cleanup is
@@ -1956,12 +1959,14 @@ const SIDECAR_FIRST_DRAFT_SAMPLES: usize = 16000;
 struct SidecarDraftJob {
     utterance_sequence: u64,
     samples: Vec<f32>,
+    audio_snapshot_at: Instant,
 }
 
 #[cfg(feature = "whisper")]
 struct SidecarDraftResult {
     utterance_sequence: u64,
     text: String,
+    audio_snapshot_at: Instant,
 }
 
 /// A capacity-one, newest-wins handoff. Both lock holders only swap an Option;
@@ -2812,6 +2817,7 @@ fn run_sidecar_inner_mpsc(
                                 draft_results.offer_latest(SidecarDraftResult {
                                     utterance_sequence: job.utterance_sequence,
                                     text,
+                                    audio_snapshot_at: job.audio_snapshot_at,
                                 });
                             }
                         }
@@ -2870,7 +2876,11 @@ fn run_sidecar_inner_mpsc(
                 && result.text != last_draft_text
             {
                 if let Some(publisher) = partial_publisher.as_mut() {
-                    let _ = publisher.try_publish(result.text.clone(), utterance_start_offset_ms);
+                    let _ = publisher.try_publish_for_snapshot(
+                        result.text.clone(),
+                        utterance_start_offset_ms,
+                        result.audio_snapshot_at,
+                    );
                 }
                 last_draft_text = result.text;
             }
@@ -2955,6 +2965,7 @@ fn run_sidecar_inner_mpsc(
                 draft_jobs.offer_latest(SidecarDraftJob {
                     utterance_sequence,
                     samples: utterance.clone(),
+                    audio_snapshot_at: Instant::now(),
                 });
                 next_draft_at = next_draft_at.saturating_add(SIDECAR_DRAFT_INTERVAL_SAMPLES);
             }
@@ -3453,10 +3464,12 @@ mod tests {
         mailbox.offer_latest(SidecarDraftJob {
             utterance_sequence: 1,
             samples: vec![0.1; 1600],
+            audio_snapshot_at: Instant::now(),
         });
         mailbox.offer_latest(SidecarDraftJob {
             utterance_sequence: 1,
             samples: vec![0.2; 3200],
+            audio_snapshot_at: Instant::now(),
         });
 
         let pending = mailbox.take().unwrap();

@@ -29,6 +29,7 @@ pub struct LivePartial {
     pub speaker: Option<String>,
     pub offset_ms: u64,
     pub audio_received_at: Instant,
+    pub audio_snapshot_at: Instant,
     pub partial_published_at: Instant,
 }
 
@@ -184,6 +185,17 @@ impl LivePartialPublisher {
     /// returned to the caller only as `DroppedFull`; no retry or wakeup occurs
     /// on the capture thread.
     pub fn try_publish(&mut self, text: String, offset_ms: u64) -> PartialPublishOutcome {
+        self.try_publish_for_snapshot(text, offset_ms, Instant::now())
+    }
+
+    /// Publish a revision tied to the newest audio included in its recognition
+    /// snapshot. This lets readers include recognition delay in freshness.
+    pub fn try_publish_for_snapshot(
+        &mut self,
+        text: String,
+        offset_ms: u64,
+        audio_snapshot_at: Instant,
+    ) -> PartialPublishOutcome {
         let audio_received_at = self.audio_received_at.unwrap_or_else(Instant::now);
         self.revision = self.revision.saturating_add(1);
 
@@ -211,6 +223,7 @@ impl LivePartialPublisher {
             speaker: None,
             offset_ms,
             audio_received_at,
+            audio_snapshot_at,
             partial_published_at,
         };
 

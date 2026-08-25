@@ -46,6 +46,7 @@ The bounded CLI and MCP projection is `LiveEvidenceSnapshotV1`:
     "speaker": null,
     "offset_ms": 42000,
     "producer_latency_ms": 840,
+    "source_audio_age_ms": 120,
     "observed_at": "2026-08-25T17:00:00Z",
     "age_ms": 120,
     "source": "recording-sidecar"
@@ -69,7 +70,7 @@ Rules:
 - `finals` retains the existing `TranscriptLine` schema and caller-selected time or line bound.
 - `current_draft` is either one latest current revision or `null`.
 - `draft_state` is one of `current`, `none`, `finalizing`, `superseded`, `stale`, `unavailable`, or `unsupported`.
-- `age_ms` is computed from the relay owner's wall-clock observation time. Draft text older than 3 seconds is not released as current.
+- `source_audio_age_ms` measures recognition delay from the newest included audio to relay admission. `age_ms` adds that delay to time elapsed since admission, so a slow result cannot look fresh merely because it just arrived. Draft text older than 3 seconds is not released as current.
 - Relay cursors are session-scoped. A changed session resets the cursor and invalidates every prior draft identity.
 - A gap or overflow never fabricates continuity. The projection reports the gap and releases only evidence whose current identity can still be proven.
 - Text output labels the draft as provisional. JSON keeps the machine-readable identity and state.

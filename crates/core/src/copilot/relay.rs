@@ -83,6 +83,9 @@ pub enum RelayTranscriptUpdate {
         /// Capture-to-relay time for a partial. Finals use zero because the
         /// durable event contract does not expose a monotonic audio timestamp.
         producer_latency_ms: u64,
+        /// Age of the newest included audio when the relay admitted this
+        /// update. Finals use zero.
+        source_audio_age_ms: u64,
         /// Wall-clock time when the capture owner admitted this update to the
         /// transient relay. Readers use it to reject stale drafts.
         observed_at: DateTime<Utc>,
@@ -162,6 +165,7 @@ pub struct RelayCurrentDraft {
     pub speaker: Option<String>,
     pub offset_ms: u64,
     pub producer_latency_ms: u64,
+    pub source_audio_age_ms: u64,
     pub observed_at: DateTime<Utc>,
     pub age_ms: u64,
     pub source: String,
@@ -199,14 +203,16 @@ pub fn reduce_relay_draft(
                         session_epoch,
                         utterance,
                         producer_latency_ms,
+                        source_audio_age_ms,
                         observed_at,
                     },
                 ..
             } if utterance.update_kind == TranscriptUpdateKind::Partial => {
-                let age_ms = now
+                let relay_age_ms = now
                     .signed_duration_since(*observed_at)
                     .num_milliseconds()
                     .max(0) as u64;
+                let age_ms = relay_age_ms.saturating_add(*source_audio_age_ms);
                 current = Some(RelayCurrentDraft {
                     provisional: true,
                     session_epoch: *session_epoch,
@@ -216,6 +222,7 @@ pub fn reduce_relay_draft(
                     speaker: utterance.speaker.clone(),
                     offset_ms: utterance.offset_ms,
                     producer_latency_ms: *producer_latency_ms,
+                    source_audio_age_ms: *source_audio_age_ms,
                     observed_at: *observed_at,
                     age_ms,
                     source: utterance.source.clone(),
@@ -921,6 +928,7 @@ fn run_server(
                         duration_ms,
                     },
                     producer_latency_ms: 0,
+                    source_audio_age_ms: 0,
                     observed_at: Utc::now(),
                 };
                 let mut state = lock_state(&shared);
@@ -1140,6 +1148,11 @@ fn relay_partial_update(event: LivePartialEvent) -> RelayTranscriptUpdate {
             producer_latency_ms: partial
                 .partial_published_at
                 .saturating_duration_since(partial.audio_received_at)
+                .as_millis()
+                .min(u64::MAX as u128) as u64,
+            source_audio_age_ms: partial
+                .partial_published_at
+                .saturating_duration_since(partial.audio_snapshot_at)
                 .as_millis()
                 .min(u64::MAX as u128) as u64,
             observed_at: Utc::now(),
@@ -1383,6 +1396,7 @@ mod tests {
                 duration_ms: 0,
             },
             producer_latency_ms: 12,
+            source_audio_age_ms: 0,
             observed_at: Utc::now(),
         }
     }
@@ -1469,6 +1483,28 @@ mod tests {
         );
         assert_eq!(stale_snapshot.draft_state, RelayDraftState::Stale);
         assert!(stale_snapshot.current_draft.is_none());
+
+        let mut slow_result = utterance("slow recognition");
+        let RelayTranscriptUpdate::Utterance {
+            source_audio_age_ms,
+            observed_at,
+            ..
+        } = &mut slow_result
+        else {
+            unreachable!()
+        };
+        *source_audio_age_ms = 4_000;
+        *observed_at = now;
+        let slow_snapshot = reduce_relay_draft(
+            &[RelayFrame::Transcript {
+                seq: 1,
+                update: slow_result,
+            }],
+            CopilotEvidenceMode::CaptureRelayPartials,
+            now,
+        );
+        assert_eq!(slow_snapshot.draft_state, RelayDraftState::Stale);
+        assert!(slow_snapshot.current_draft.is_none());
 
         let finalizing_snapshot = reduce_relay_draft(
             &[
