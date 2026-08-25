@@ -2023,6 +2023,7 @@
     .md-viewer-header button,
     .md-viewer-header .md-viewer-toolbar,
     .md-viewer-header .md-viewer-status {
+      min-width: 0;
       -webkit-app-region: no-drag;
     }
 
@@ -2030,8 +2031,11 @@
       display: flex;
       align-items: center;
       gap: 8px;
-      min-width: 0;
-      flex: 1;
+      /* flex-basis 0 + min-width 0 made this "fit" on any line, so the
+         toolbar never wrapped; the title was then squeezed under Review. A
+         real floor makes wrapping kick in at the width it should. */
+      flex: 1 1 auto;
+      min-width: min(100%, 180px);
     }
 
     .md-viewer-toolbar {
@@ -4034,6 +4038,12 @@
     .footer-actions {
       display: grid;
       gap: 8px;
+      /* The card is the thing the eye reads as "the footer"; it must never
+         paint past the pane. Grid children default to min-width:auto and can
+         push it wider than its container. */
+      min-width: 0;
+      max-width: 100%;
+      overflow: hidden;
       background: var(--bg-elevated);
       border: 1px solid var(--border);
       border-radius: 14px;
@@ -4050,6 +4060,11 @@
     .footer-device-picker {
       display: grid;
       gap: 4px;
+      min-width: 0;
+    }
+    .footer-actions > *,
+    .footer-action-secondary > * {
+      min-width: 0;
     }
 
     .footer-action-primary .btn-primary {
@@ -14171,6 +14186,10 @@
         document.body.classList.remove('sidebar-collapsed');
         sidebarCollapseButton.classList.remove('is-collapsed');
       }
+      // A manual expand overrides the policy only while the window is still
+      // narrow. Once it is wide again the override has done its job; the next
+      // squeeze should auto-collapse like the first one did.
+      if (width >= threshold) userExpandedSidebarThisSession = false;
       document.body.classList.toggle('doc-overlay', docOpen && width < DOC_OVERLAY_WIDTH);
     }
     syncNarrowLayout();
