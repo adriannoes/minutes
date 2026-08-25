@@ -4406,6 +4406,31 @@
       color: var(--text-tertiary);
     }
 
+    .ambient-chip {
+      display: inline-block;
+      margin: 0 6px 6px 0;
+      padding: 3px 8px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: var(--bg);
+      color: var(--text-secondary);
+      font-family: var(--font-mono);
+      font-size: var(--text-2xs);
+      letter-spacing: 0.04em;
+    }
+
+    .ambient-chip-btn {
+      cursor: pointer;
+      color: var(--text);
+      border-color: var(--border-mid);
+    }
+
+    .ambient-chip-btn:hover,
+    .ambient-chip-btn:focus-visible {
+      border-color: var(--accent);
+      outline: none;
+    }
+
     .ambient-context-summary {
       font-size: var(--text-body);
       line-height: 1.5;
@@ -7674,7 +7699,26 @@
 
       const summary = document.createElement('div');
       summary.className = 'ambient-context-summary';
-      summary.textContent = proactiveContextBundle.summary || 'Recent context is available.';
+      // Counts as chips. Only the ones that lead somewhere are buttons:
+      // stale commitments have a section in the weekly brief, memos live in
+      // the Documents view. Losing-touch has no surface yet, so it stays a
+      // number rather than a tap that goes nowhere.
+      const chip = (label, onClick) => {
+        const el = document.createElement(onClick ? 'button' : 'span');
+        el.className = 'ambient-chip' + (onClick ? ' ambient-chip-btn' : '');
+        if (onClick) { el.type = 'button'; el.addEventListener('click', onClick); }
+        el.textContent = label;
+        return el;
+      };
+      const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+      const b = proactiveContextBundle;
+      const chips = [];
+      if (b.recentMeetingCount) chips.push(chip(plural(b.recentMeetingCount, 'meeting', 'meetings')));
+      if (b.recentMemoCount) chips.push(chip(plural(b.recentMemoCount, 'memo', 'memos'), () => setDocumentsView(true)));
+      if (b.staleCommitmentCount) chips.push(chip(plural(b.staleCommitmentCount, 'stale commitment', 'stale commitments'), () => openWeeklyPhase()));
+      if (b.losingTouchCount) chips.push(chip(plural(b.losingTouchCount, 'losing-touch alert', 'losing-touch alerts')));
+      if (chips.length) summary.replaceChildren(...chips);
+      else summary.textContent = b.summary || 'Recent context is available.';
 
       const actions = document.createElement('div');
       actions.className = 'ambient-context-actions';
