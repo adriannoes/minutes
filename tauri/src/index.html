@@ -10860,9 +10860,11 @@
 
         const meta = document.createElement('div');
         meta.className = 'meeting-meta';
-        const source = doc.source === 'assistant'
-          ? 'assistant'
-          : (doc.meeting_slug || 'meeting');
+        // 'meeting' rows carry a slug; every other source ('assistant',
+        // 'prep') is its own label.
+        const source = doc.source === 'meeting'
+          ? (doc.meeting_slug || 'meeting')
+          : doc.source;
         meta.textContent = [formatRelativeTime(doc.mtime), source].filter(Boolean).join(' · ');
 
         info.appendChild(title);
@@ -16809,6 +16811,9 @@
       mdViewerPreviewBtn.classList.toggle('active', !sourceMode);
       mdViewerSourceBtn.classList.toggle('active', sourceMode);
       mdViewerSourceBtn.disabled = !openArtifactEditable;
+      if (!openArtifactEditable && openArtifactPath && mdViewerStatus.textContent === 'Viewing') {
+        mdViewerStatus.textContent = 'Read-only';
+      }
       mdViewerPromoteBtn.hidden = !openArtifactPath || openArtifactEditable;
       mdViewerReviewBtn.disabled = !mdViewerReviewData?.available;
       mdViewerContent.style.display = sourceMode ? 'none' : 'block';

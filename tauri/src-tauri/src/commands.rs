@@ -1929,6 +1929,31 @@ fn is_assistant_instruction_file(path: &Path) -> bool {
     )
 }
 
+/// Prep briefs written by /minutes-prep live in ~/.minutes/preps/ (see the
+/// skill contract). The calendar card already reads that folder to badge an
+/// upcoming meeting as "prepped"; the Documents list did not, so a brief the
+/// assistant had just written was invisible in the sidebar -- and no restart
+/// would surface it, because the folder was never a scan root.
+fn append_prep_documents(
+    documents: &mut Vec<DocumentView>,
+    seen: &mut std::collections::HashSet<PathBuf>,
+) {
+    let preps_dir = Config::minutes_dir().join("preps");
+    let Ok(entries) = std::fs::read_dir(&preps_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_prep = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".prep.md"));
+        if is_prep && path.is_file() {
+            push_document_if_allowed(documents, seen, &path, "prep", None);
+        }
+    }
+}
+
 fn push_document_if_allowed(
     documents: &mut Vec<DocumentView>,
     seen: &mut std::collections::HashSet<PathBuf>,
@@ -2080,6 +2105,7 @@ fn list_documents_for_roots_with_recent_state(
     }
 
     append_assistant_documents(&mut documents, &mut seen, assistant_dir);
+    append_prep_documents(&mut documents, &mut seen);
     documents.sort_by(|a, b| {
         b.mtime
             .cmp(&a.mtime)
@@ -5051,6 +5077,10 @@ fn is_editable_text_file_path(path: &Path, config: &Config) -> bool {
         config.output_dir.clone(),
         workspace.clone(),
         workspace.join("artifacts"),
+        // Prep briefs are the document a user most wants to edit in the
+        // viewer right before a meeting; listing them (append_prep_documents)
+        // without making them editable left click-to-edit silently inert.
+        Config::minutes_dir().join("preps"),
     ];
     trusted_roots.iter().any(|root| path.starts_with(root))
 }
