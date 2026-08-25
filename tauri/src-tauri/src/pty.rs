@@ -170,7 +170,12 @@ impl PtyManager {
         // palette inside the dark app. The trailing COLORFGBG field is the
         // background: 0 = dark, 15 = light.
         cmd.env("TERM_PROGRAM", "Minutes");
-        cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+        // The app version from tauri.conf, not the crate's -- this package
+        // is versioned 0.1.0 and the app is not.
+        cmd.env(
+            "TERM_PROGRAM_VERSION",
+            cfg.app_handle.package_info().version.to_string(),
+        );
         if let Some(dark) = cfg.theme_dark {
             cmd.env("COLORFGBG", if dark { "15;0" } else { "0;15" });
         }
