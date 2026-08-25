@@ -1,0 +1,71 @@
+name: Nemotron Streaming Evaluation
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - eval/nemotron-streaming-live
+    paths:
+      - .github/workflows/nemotron-streaming-eval.yml
+      - scripts/benchmark_sherpa_streaming.cpp
+      - tests/eval/fixtures/audio/apple-speech-meeting.wav
+
+permissions:
+  contents: read
+
+jobs:
+  windows-paced-stream:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      RUNTIME_ARCHIVE: sherpa-onnx-v1.13.6-win-x64-shared-MD-Release-no-tts.tar.bz2
+      RUNTIME_SHA256: 071d6641efd737a1f60de48c9c4cd596f78d5b0980815e8ad3798c95785d2b26
+      MODEL_ARCHIVE: sherpa-onnx-nemotron-speech-streaming-en-0.6b-560ms-int8-2026-04-25.tar.bz2
+      MODEL_SHA256: 78e2b79fcf7271553a74402a76b771b09ea40117a39566a79f52235b23db6358
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Record representative Windows hardware
+        shell: pwsh
+        run: |
+          Get-CimInstance Win32_Processor |
+            Select-Object Name, NumberOfCores, NumberOfLogicalProcessors |
+            ConvertTo-Json -Compress
+          Get-CimInstance Win32_ComputerSystem |
+            Select-Object TotalPhysicalMemory |
+            ConvertTo-Json -Compress
+
+      - name: Download checksummed runtime and model
+        shell: pwsh
+        run: |
+          curl.exe -L --fail --retry 3 --output $env:RUNTIME_ARCHIVE "https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.6/$env:RUNTIME_ARCHIVE"
+          curl.exe -L --fail --retry 3 --output $env:MODEL_ARCHIVE "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/$env:MODEL_ARCHIVE"
+          $runtimeHash = (Get-FileHash $env:RUNTIME_ARCHIVE -Algorithm SHA256).Hash.ToLowerInvariant()
+          $modelHash = (Get-FileHash $env:MODEL_ARCHIVE -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($runtimeHash -ne $env:RUNTIME_SHA256) { throw "Sherpa runtime checksum mismatch" }
+          if ($modelHash -ne $env:MODEL_SHA256) { throw "Nemotron model checksum mismatch" }
+          tar -xjf $env:RUNTIME_ARCHIVE
+          tar -xjf $env:MODEL_ARCHIVE
+
+      - name: Compile and run at speaking speed
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          cl /nologo /std:c++17 /O2 /EHsc /I"%GITHUB_WORKSPACE%\sherpa-onnx-v1.13.6-win-x64-shared-MD-Release-no-tts\include" scripts\benchmark_sherpa_streaming.cpp /link /LIBPATH:"%GITHUB_WORKSPACE%\sherpa-onnx-v1.13.6-win-x64-shared-MD-Release-no-tts\lib" sherpa-onnx-cxx-api.lib sherpa-onnx-c-api.lib
+          set "PATH=%GITHUB_WORKSPACE%\sherpa-onnx-v1.13.6-win-x64-shared-MD-Release-no-tts\bin;%PATH%"
+          benchmark_sherpa_streaming.exe "%GITHUB_WORKSPACE%\sherpa-onnx-nemotron-speech-streaming-en-0.6b-560ms-int8-2026-04-25" "%GITHUB_WORKSPACE%\tests\eval\fixtures\audio\apple-speech-meeting.wav" 120 2 --content-free > nemotron-windows-metrics.json
+          type nemotron-windows-metrics.json
+
+      - name: Enforce live-draft viability bounds
+        shell: pwsh
+        run: |
+          $metrics = Get-Content nemotron-windows-metrics.json | ConvertFrom-Json
+          if ($metrics.firstUpdateMs -lt 0 -or $metrics.firstUpdateMs -gt 2000) {
+            throw "First live draft exceeded the 2 second product target"
+          }
+          if ($metrics.completionLagMs -gt 1500) {
+            throw "End-of-input completion lag exceeded 1.5 seconds"
+          }
+          if ($metrics.updates -lt 2) {
+            throw "The model did not produce revisable streaming updates"
+          }
