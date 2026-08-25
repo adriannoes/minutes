@@ -75,14 +75,15 @@ jobs:
         shell: pwsh
         run: |
           $runtimeBin = "$env:GITHUB_WORKSPACE\sherpa-onnx-v1.13.6-win-x64-shared-MD-Release-no-tts\bin"
-          $runtimeLib = "$env:GITHUB_WORKSPACE\sherpa-onnx-v1.13.6-win-x64-shared-MD-Release-no-tts\lib"
-          $ortLib = "$env:GITHUB_WORKSPACE\onnxruntime-win-x64-1.27.1\lib"
+          $ortDll = "$env:GITHUB_WORKSPACE\onnxruntime-win-x64-1.27.1\lib\onnxruntime.dll"
           $model = "$env:GITHUB_WORKSPACE\sherpa-onnx-nemotron-speech-streaming-en-0.6b-560ms-int8-2026-04-25"
           $audio = "$env:GITHUB_WORKSPACE\tests\eval\fixtures\audio\apple-speech-meeting.wav"
           # The Sherpa Windows archive bundles ONNX Runtime 1.17.1 even though
-          # its current C API requests API 27. Use the checksummed official
-          # 1.27.1 DLL that matches the macOS release runtime.
-          $env:PATH = "$ortLib;$runtimeLib;$runtimeBin;$env:PATH"
+          # its current C API requests API 27. Windows resolves a DLL dependency
+          # beside the Sherpa DLL before consulting PATH, so replace that stale
+          # bundled DLL with the checksummed official 1.27.1 runtime used on Mac.
+          Copy-Item -Force $ortDll (Join-Path $runtimeBin "onnxruntime.dll")
+          $env:PATH = "$runtimeBin;$env:PATH"
           & .\benchmark_sherpa_streaming.exe $model $audio 120 2 --content-free |
             Tee-Object -FilePath nemotron-windows-metrics.json
           if ($LASTEXITCODE -ne 0) { throw "Paced benchmark exited with $LASTEXITCODE" }
