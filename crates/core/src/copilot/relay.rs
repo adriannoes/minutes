@@ -85,6 +85,7 @@ pub enum RelayTranscriptUpdate {
         producer_latency_ms: u64,
         /// Age of the newest included audio when the relay admitted this
         /// update. Finals use zero.
+        #[serde(default)]
         source_audio_age_ms: u64,
         /// Wall-clock time when the capture owner admitted this update to the
         /// transient relay. Readers use it to reject stale drafts.
@@ -1421,6 +1422,25 @@ mod tests {
             ttl_ms: 12_000,
             supersedes: None,
         }
+    }
+
+    #[test]
+    fn older_relay_frames_without_source_audio_age_remain_readable() {
+        let mut legacy = serde_json::to_value(utterance("legacy frame")).unwrap();
+        legacy
+            .as_object_mut()
+            .expect("relay update should serialize as an object")
+            .remove("source_audio_age_ms");
+
+        let decoded: RelayTranscriptUpdate = serde_json::from_value(legacy).unwrap();
+        let RelayTranscriptUpdate::Utterance {
+            source_audio_age_ms,
+            ..
+        } = decoded
+        else {
+            panic!("expected utterance update")
+        };
+        assert_eq!(source_audio_age_ms, 0);
     }
 
     #[test]
