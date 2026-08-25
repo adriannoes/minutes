@@ -77,6 +77,8 @@ models/
 Minutes.app
 minutes.mcpb
 .gstack/
+tauri/src-tauri/bin/mic_check
+tauri/src-tauri/bin/mic_check-*
 tauri/src-tauri/bin/system_audio_record
 tauri/src-tauri/bin/system_audio_record-*
 tauri/src-tauri/bin/calendar-events
