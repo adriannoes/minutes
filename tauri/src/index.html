@@ -973,6 +973,8 @@
 
     .recall-provider-notice {
       display: none;
+      align-items: flex-start;
+      gap: 10px;
       padding: 8px 12px;
       border-bottom: 1px solid var(--border);
       background: var(--bg-elevated);
@@ -984,7 +986,30 @@
     }
 
     .recall-provider-notice.active {
-      display: block;
+      display: flex;
+    }
+
+    .recall-provider-notice-text {
+      flex: 1 1 auto;
+      min-width: 0;
+    }
+
+    .recall-provider-notice-dismiss {
+      flex-shrink: 0;
+      border: 0;
+      background: transparent;
+      color: var(--text-tertiary);
+      font: inherit;
+      font-size: var(--text-base);
+      line-height: 1;
+      padding: 0 2px;
+      cursor: pointer;
+    }
+
+    .recall-provider-notice-dismiss:hover,
+    .recall-provider-notice-dismiss:focus-visible {
+      color: var(--text);
+      outline: none;
     }
 
     .recall-provider-notice.error {
@@ -13999,11 +14024,48 @@
     let recallTerminalInputReliable = true;
     let recallTerminalInputQueue = Promise.resolve();
 
+    // An informational notice ("Codex is open in Terminal. Ask your question
+    // here...") earns its space exactly once: it tells you what the panel is
+    // and where to type. After that it is three lines of chrome above a
+    // terminal that is already short on height. So it is dismissible, and in
+    // Terminal mode the first keystroke dismisses it -- the question it was
+    // answering has been answered. Once dismissed, the same text stays
+    // dismissed even when a readiness refresh re-sets it. Errors are never
+    // auto-dismissed and carry no close control.
+    let recallProviderNoticeDismissedText = '';
+
     function setRecallProviderNotice(message, tone = 'info') {
       if (!recallProviderNotice) return;
-      recallProviderNotice.textContent = message || '';
-      recallProviderNotice.classList.toggle('active', Boolean(message));
+      const text = message || '';
+      const suppressed = tone !== 'error' && Boolean(text) && text === recallProviderNoticeDismissedText;
+      recallProviderNotice.replaceChildren();
+      if (text && !suppressed) {
+        const body = document.createElement('span');
+        body.className = 'recall-provider-notice-text';
+        body.textContent = text;
+        recallProviderNotice.appendChild(body);
+        if (tone !== 'error') {
+          const dismiss = document.createElement('button');
+          dismiss.type = 'button';
+          dismiss.className = 'recall-provider-notice-dismiss';
+          dismiss.setAttribute('aria-label', 'Dismiss notice');
+          dismiss.title = 'Dismiss';
+          dismiss.textContent = '×';
+          dismiss.addEventListener('click', dismissRecallProviderNotice);
+          recallProviderNotice.appendChild(dismiss);
+        }
+      }
+      recallProviderNotice.dataset.tone = tone;
+      recallProviderNotice.classList.toggle('active', Boolean(text) && !suppressed);
       recallProviderNotice.classList.toggle('error', tone === 'error');
+    }
+
+    function dismissRecallProviderNotice() {
+      if (!recallProviderNotice || !recallProviderNotice.classList.contains('active')) return;
+      if (recallProviderNotice.dataset.tone === 'error') return;
+      recallProviderNoticeDismissedText =
+        recallProviderNotice.querySelector('.recall-provider-notice-text')?.textContent || '';
+      recallProviderNotice.classList.remove('active');
     }
 
     function syncRecallModeControls({ persist = true } = {}) {
@@ -14443,6 +14505,9 @@
 
       recallTerminal.onData((data) => {
         if (!recallPtyAlive) return;
+        // Typing into the terminal is the moment the "ask your question here"
+        // notice stops being useful.
+        dismissRecallProviderNotice();
         // Serialize PTY writes so the context-preparation command completes
         // before the Enter that submits the first real question. Normal typing
         // still follows the same one-invoke-per-input path as before.
