@@ -7332,6 +7332,8 @@
     let currentMeetingDetail = null;
     let activeSearchQuery = '';
     let documentsViewActive = false;
+    let documentsRefreshTimer = null;
+    let documentsRenderedSignature = '';
     let documentsCache = [];
     let documentsLoadRequestId = 0;
     let userExpandedSidebarThisSession = false;
@@ -10932,11 +10934,16 @@
       }
     }
 
-    async function loadDocuments() {
+    async function loadDocuments({ quiet = false } = {}) {
       const requestId = ++documentsLoadRequestId;
       try {
         documentsCache = await invoke('cmd_list_documents', { limit: 200 });
         if (requestId !== documentsLoadRequestId || !documentsViewActive) return;
+        // A background refresh must not rebuild the list -- and drop the
+        // scroll position -- when nothing changed.
+        const signature = JSON.stringify((documentsCache || []).map((d) => [d.path, d.mtime]));
+        if (quiet && signature === documentsRenderedSignature) return;
+        documentsRenderedSignature = signature;
         renderDocuments(documentsCache);
       } catch (e) {
         console.error('Load documents:', e);
@@ -10947,6 +10954,16 @@
 
     function setDocumentsView(active) {
       documentsViewActive = active;
+      // While the Documents view is showing, pick up files the assistant (or
+      // /minutes-prep) writes without a toggle away and back. Quiet refreshes
+      // skip the render when the listing is unchanged.
+      if (documentsRefreshTimer) {
+        clearInterval(documentsRefreshTimer);
+        documentsRefreshTimer = null;
+      }
+      if (active) {
+        documentsRefreshTimer = setInterval(() => loadDocuments({ quiet: true }), 4000);
+      }
       documentsToggle.classList.toggle('is-active', active);
       documentsToggle.setAttribute('aria-pressed', active ? 'true' : 'false');
       // Label the button with its DESTINATION so returning to meetings is
@@ -16167,6 +16184,9 @@
       });
     });
 
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden && documentsViewActive) loadDocuments({ quiet: true });
+    });
     currentWindow.listen('artifacts:changed', () => {
       scheduleMeetingsRefresh();
     });
