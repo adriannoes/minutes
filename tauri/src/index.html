@@ -1820,6 +1820,12 @@
       padding: 6px 10px;
     }
 
+    .recall-toggle-btn {
+      position: relative;
+      margin-left: auto;
+      margin-right: 6px;
+    }
+
     .sidebar-collapse-btn {
       width: 28px;
       height: 28px;
@@ -5674,6 +5680,11 @@
         <div class="list-header-group">
           <button class="sidebar-collapse-btn" id="btn-sidebar-collapse" type="button" aria-label="Collapse list pane" title="Collapse list pane">‹</button>
         </div>
+        <!-- Recall opens a panel; it is navigation, not capture, so it lives
+             with the other pane controls rather than beside Start Recording.
+             Same id and nudge element: every existing handler keeps working. -->
+        <button class="list-toggle-btn recall-toggle-btn" id="btn-assistant" type="button" aria-expanded="false" title="Open Recall">Recall <span class="recall-nudge"
+            id="recall-nudge" aria-label="Recall has new content"></span></button>
         <button class="list-toggle-btn" id="btn-documents-toggle" type="button" aria-pressed="false">Documents</button>
       </div>
       <input class="search-box" type="text" placeholder="Search recordings..." id="search-input" />
@@ -5815,8 +5826,6 @@
             title="Start live transcription — ask your agent in Recall for coaching"
             aria-label="Start live transcription">Live</button>
           <button class="btn btn-secondary" id="btn-quick-thought">Quick Thought</button>
-          <button class="btn btn-secondary" id="btn-assistant" aria-expanded="false">Recall <span class="recall-nudge"
-              id="recall-nudge" aria-label="Recall has new content"></span></button>
         </div>
       </div>
     </div>
@@ -7511,13 +7520,8 @@
       const actions = document.createElement('div');
       actions.className = 'ambient-context-actions';
 
-      const recallBtn = document.createElement('button');
-      recallBtn.className = 'btn btn-secondary btn-sm';
-      recallBtn.textContent = 'Open Recall';
-      recallBtn.addEventListener('click', () => {
-        openRecall('assistant');
-      });
-
+      // Open Recall used to live here too; Recall now has a permanent home in
+      // the list header, so the card keeps only what is unique to it.
       const weeklyBtn = document.createElement('button');
       weeklyBtn.className = 'btn btn-secondary btn-sm';
       weeklyBtn.textContent = 'Weekly';
@@ -7525,7 +7529,6 @@
         openWeeklyPhase();
       });
 
-      actions.appendChild(recallBtn);
       actions.appendChild(weeklyBtn);
 
       card.appendChild(title);
