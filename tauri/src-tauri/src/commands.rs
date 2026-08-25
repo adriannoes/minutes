@@ -7007,7 +7007,8 @@ pub fn cmd_sensitive_stop(
     let config = Config::load();
     let result = minutes_core::sensitive::stop(None, &config).map_err(|error| error.to_string())?;
     let path = result.path.to_string_lossy().to_string();
-    if let Err(error) = spawn_terminal(&app, &state.pty_manager, "meeting", Some(&path), None) {
+    if let Err(error) = spawn_terminal(&app, &state.pty_manager, "meeting", Some(&path), None, None)
+    {
         show_user_notification(&app, "Sensitive meeting saved", &error);
     } else if let Ok(mut manager) = state.pty_manager.lock() {
         if let Some(command) = manager.session_command(crate::pty::ASSISTANT_SESSION_ID) {
@@ -7044,7 +7045,7 @@ pub fn cmd_run_meeting_debrief(
     let config = Config::load();
     let meeting_path = std::path::PathBuf::from(&path);
     minutes_core::notes::validate_meeting_path(&meeting_path, &config.output_dir)?;
-    spawn_terminal(&app, &state.pty_manager, "meeting", Some(&path), None)?;
+    spawn_terminal(&app, &state.pty_manager, "meeting", Some(&path), None, None)?;
     if let Ok(mut manager) = state.pty_manager.lock() {
         if let Some(command) = manager.session_command(crate::pty::ASSISTANT_SESSION_ID) {
             let debrief_prompt = "Run /minutes-debrief for CURRENT_MEETING.md.";
@@ -7832,7 +7833,7 @@ fn write_notice_prompt(command: &str, plain_text: &str) -> String {
 fn artifact_switch_prompt(command: &str, artifact_name: Option<&str>) -> String {
     let plain_text = match artifact_name {
         Some(name) => format!(
-            "Minutes opened artifact {name}. Read CURRENT_ARTIFACT.md and your assistant instructions (CLAUDE.md or AGENTS.md). The user has this file open in the left pane and may want help editing it. If you update it on disk, the viewer will refresh live."
+            "Minutes opened artifact {name}. Read CURRENT_ARTIFACT.md and your assistant instructions (CLAUDE.md or AGENTS.md). The user has this file open in the document pane beside this chat and may want help editing it. If you update it on disk, the viewer will refresh live."
         ),
         None => "Minutes cleared the open artifact focus. Ignore CURRENT_ARTIFACT.md unless it reappears. If CURRENT_MEETING.md exists, prioritize it; otherwise continue in general assistant mode."
             .into(),
@@ -9619,6 +9620,7 @@ pub fn spawn_terminal(
     mode: &str,
     meeting_path: Option<&str>,
     agent_override: Option<&str>,
+    theme_dark: Option<bool>,
 ) -> Result<(String, String), String> {
     let config = Config::load();
     let title = terminal_title_for_mode(mode, meeting_path)?;
@@ -9654,6 +9656,7 @@ pub fn spawn_terminal(
                 context_dir: workspace.clone(),
                 title: title.clone(),
                 target_window: "main".into(),
+                theme_dark,
             },
             120,
             30,
@@ -12026,6 +12029,7 @@ pub fn cmd_spawn_terminal(
     mode: String,
     meeting_path: Option<String>,
     agent: Option<String>,
+    theme_dark: Option<bool>,
 ) -> Result<String, String> {
     let (session_id, _) = spawn_terminal(
         &app,
@@ -12033,6 +12037,7 @@ pub fn cmd_spawn_terminal(
         &mode,
         meeting_path.as_deref(),
         agent.as_deref(),
+        theme_dark,
     )?;
     Ok(session_id)
 }

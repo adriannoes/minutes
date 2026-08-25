@@ -2659,6 +2659,7 @@ fn main() {
                                     "assistant",
                                     None,
                                     None,
+                                    None,
                                 ) {
                                     commands::show_user_notification(
                                         &app_handle,

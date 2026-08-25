@@ -85,6 +85,10 @@ pub struct SpawnConfig {
     /// Tauri window label to emit PTY data events to. Defaults to "main"
     /// so the embedded Recall panel receives output.
     pub target_window: String,
+    /// Effective UI theme at spawn time (`Some(true)` = dark). Exported to the
+    /// child as `COLORFGBG` so TUIs can pick a matching palette without a
+    /// terminal round trip. `None` leaves it unset.
+    pub theme_dark: Option<bool>,
 }
 
 #[derive(Default)]
@@ -159,6 +163,21 @@ impl PtyManager {
 
         for (name, value) in assistant_process_environment() {
             cmd.env(name, value);
+        }
+        // Identify the host the way real terminals do. Codex's terminal
+        // detection keys on TERM_PROGRAM (Ghostty, iTerm, Warp, kitty, ...)
+        // and consults COLORFGBG; with neither set it fell back to a light
+        // palette inside the dark app. The trailing COLORFGBG field is the
+        // background: 0 = dark, 15 = light.
+        cmd.env("TERM_PROGRAM", "Minutes");
+        // The app version from tauri.conf, not the crate's -- this package
+        // is versioned 0.1.0 and the app is not.
+        cmd.env(
+            "TERM_PROGRAM_VERSION",
+            cfg.app_handle.package_info().version.to_string(),
+        );
+        if let Some(dark) = cfg.theme_dark {
+            cmd.env("COLORFGBG", if dark { "15;0" } else { "0;15" });
         }
 
         let child = pair
