@@ -123,7 +123,7 @@ Limits for v1:
 - pending draft audio snapshots: 1, newest replaces pending;
 - finalized sidecar utterances: existing capacity 3;
 - draft cadence: first snapshot after one second, then every two seconds;
-- draft cost ceiling: existing `partial_max_secs`, default 30 seconds;
+- draft cost ceiling: existing `partial_max_secs`, default 30 seconds; longer uninterrupted speech keeps refreshing from the newest bounded window while final transcription retains the complete audio;
 - reader replay: bounded by relay buffer and a short quiet window, never a continuous poll.
 
 If final work is pending, it is selected before another draft job. Superseded results are rejected. Recording stop raises Whisper's abort signal, seals the WAV and any stems before joining the optional sidecar, and never waits for repeated draft work. The WAV writer and capture stop deadline remain authoritative.

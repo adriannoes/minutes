@@ -1963,6 +1963,7 @@ const SIDECAR_FIRST_DRAFT_SAMPLES: usize = 16000;
 struct SidecarDraftJob {
     utterance_sequence: u64,
     samples: Vec<f32>,
+    offset_ms: u64,
     audio_snapshot_at: Instant,
 }
 
@@ -1970,7 +1971,18 @@ struct SidecarDraftJob {
 struct SidecarDraftResult {
     utterance_sequence: u64,
     text: String,
+    offset_ms: u64,
     audio_snapshot_at: Instant,
+}
+
+#[cfg(feature = "whisper")]
+fn sidecar_draft_window(samples: &[f32], max_samples: usize) -> (&[f32], usize) {
+    let start = if max_samples == 0 {
+        0
+    } else {
+        samples.len().saturating_sub(max_samples)
+    };
+    (&samples[start..], start)
 }
 
 /// A capacity-one, newest-wins handoff. Both lock holders only swap an Option;
@@ -2832,6 +2844,7 @@ fn run_sidecar_inner_mpsc(
                                 draft_results.offer_latest(SidecarDraftResult {
                                     utterance_sequence: job.utterance_sequence,
                                     text,
+                                    offset_ms: job.offset_ms,
                                     audio_snapshot_at: job.audio_snapshot_at,
                                 });
                             }
@@ -2894,7 +2907,7 @@ fn run_sidecar_inner_mpsc(
                 if let Some(publisher) = partial_publisher.as_mut() {
                     let _ = publisher.try_publish_for_snapshot(
                         result.text.clone(),
-                        utterance_start_offset_ms,
+                        result.offset_ms,
                         result.audio_snapshot_at,
                     );
                 }
@@ -2970,17 +2983,18 @@ fn run_sidecar_inner_mpsc(
             was_speaking = true;
             utterance.extend_from_slice(&samples);
 
-            if partial_publisher.is_some()
-                && utterance.len() >= next_draft_at
-                && (draft_max_samples == 0 || utterance.len() <= draft_max_samples)
-            {
+            if partial_publisher.is_some() && utterance.len() >= next_draft_at {
                 let utterance_sequence = partial_publisher
                     .as_ref()
                     .map(LivePartialPublisher::current_utterance_sequence)
                     .unwrap_or(0);
+                let (draft_window, window_start) =
+                    sidecar_draft_window(&utterance, draft_max_samples);
                 draft_jobs.offer_latest(SidecarDraftJob {
                     utterance_sequence,
-                    samples: utterance.clone(),
+                    samples: draft_window.to_vec(),
+                    offset_ms: utterance_start_offset_ms
+                        .saturating_add(samples_to_ms(window_start)),
                     audio_snapshot_at: Instant::now(),
                 });
                 next_draft_at = next_draft_at.saturating_add(SIDECAR_DRAFT_INTERVAL_SAMPLES);
@@ -3480,11 +3494,13 @@ mod tests {
         mailbox.offer_latest(SidecarDraftJob {
             utterance_sequence: 1,
             samples: vec![0.1; 1600],
+            offset_ms: 0,
             audio_snapshot_at: Instant::now(),
         });
         mailbox.offer_latest(SidecarDraftJob {
             utterance_sequence: 1,
             samples: vec![0.2; 3200],
+            offset_ms: 0,
             audio_snapshot_at: Instant::now(),
         });
 
@@ -3492,6 +3508,17 @@ mod tests {
         assert_eq!(pending.samples.len(), 3200);
         assert_eq!(mailbox.replaced.load(Ordering::Relaxed), 1);
         assert!(mailbox.take().is_none());
+    }
+
+    #[test]
+    fn long_sidecar_drafts_roll_forward_with_bounded_audio() {
+        let samples: Vec<f32> = (0..48_000).map(|sample| sample as f32).collect();
+        let (window, start) = sidecar_draft_window(&samples, 32_000);
+
+        assert_eq!(start, 16_000);
+        assert_eq!(window.len(), 32_000);
+        assert_eq!(window.first(), Some(&16_000.0));
+        assert_eq!(window.last(), Some(&47_999.0));
     }
 
     #[test]
