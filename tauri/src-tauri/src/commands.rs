@@ -7232,6 +7232,8 @@ fn status_value(state: &AppState, include_readiness: bool) -> serde_json::Value 
         minutes_core::capture::audio_level(),
         chrono::Utc::now(),
     );
+    let recording_live_status =
+        recording_active.then(minutes_core::live_transcript::session_status);
 
     let mut value = serde_json::json!({
         "recording": recording || (status.recording && !processing),
@@ -7258,6 +7260,14 @@ fn status_value(state: &AppState, include_readiness: bool) -> serde_json::Value 
             "markerCount": session.markers.len(),
         })),
         "audioLevel": audio_level,
+        "liveTranscript": recording_live_status.as_ref().map(|live| serde_json::json!({
+            "active": live.active,
+            "lineCount": live.line_count,
+            "durationSecs": live.duration_secs,
+            "latestFinalAgeSecs": live.latest_final_age_secs,
+            "source": live.source.as_ref(),
+            "diagnostic": live.diagnostic.as_deref(),
+        })),
     });
 
     if include_readiness {
@@ -14970,6 +14980,7 @@ mod tests {
                 "pid",
                 "elapsed",
                 "audioLevel",
+                "liveTranscript",
             ] {
                 assert!(capture.get(key).is_some(), "capture status missing {key}");
             }
@@ -15055,6 +15066,21 @@ mod tests {
 
         assert_eq!(capture_status_audio_level(true, None, 47, now), 47);
         assert_eq!(capture_status_audio_level(false, None, 47, now), 0);
+    }
+
+    #[test]
+    fn capture_ui_uses_human_live_transcript_states() {
+        let html = include_str!("../../src/index.html");
+        for expected in [
+            "id=\"recording-transcript-state\" role=\"status\" aria-live=\"polite\"",
+            "Speech in progress",
+            "Transcript current",
+            "Last transcript update",
+            "Recording safely · Live transcript unavailable",
+        ] {
+            assert!(html.contains(expected), "missing live state: {expected}");
+        }
+        assert!(html.contains("function transcriptEvidenceText"));
     }
 
     #[test]
@@ -20878,6 +20904,7 @@ pub fn cmd_live_transcript_status(state: tauri::State<AppState>) -> serde_json::
         "active": in_app_active || status.active,
         "line_count": status.line_count,
         "duration_secs": status.duration_secs,
+        "latestFinalAgeSecs": status.latest_final_age_secs,
         "audioLevel": audio_level,
         "source": status.source,
         "diagnostic": status.diagnostic,

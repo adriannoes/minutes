@@ -1408,6 +1408,12 @@
       margin-top: 2px;
     }
 
+    .recording-transcript-state {
+      font-size: var(--text-meta);
+      color: var(--text-secondary);
+      margin-top: 6px;
+    }
+
     .live-level {
       height: 3px;
       margin: 6px 0 8px;
@@ -5782,6 +5788,7 @@
         <span class="call-health-chip" id="recording-health-mic">Mic waiting</span>
         <span class="call-health-chip" id="recording-health-audio">Call audio waiting</span>
       </div>
+      <div class="recording-transcript-state" id="recording-transcript-state" role="status" aria-live="polite">Listening…</div>
       <div class="audio-viz" id="audio-viz"></div>
       <div class="recording-actions">
         <button class="btn btn-secondary btn-sm coach-toggle" id="btn-coach-recording" type="button" aria-pressed="false">Coach</button>
@@ -7390,6 +7397,7 @@
     const recordingBar = document.getElementById('recording-bar');
     const recordingLabel = document.getElementById('recording-label');
     const recordingSourceHealth = document.getElementById('recording-source-health');
+    const recordingTranscriptState = document.getElementById('recording-transcript-state');
     const recordingHealthMic = document.getElementById('recording-health-mic');
     const recordingHealthAudio = document.getElementById('recording-health-audio');
     const processingBar = document.getElementById('processing-bar');
@@ -8292,6 +8300,43 @@
       jobsScroll.appendChild(list);
     }
 
+    function elapsedClockSeconds(value) {
+      const parts = String(value || '').split(':').map(Number);
+      if (parts.length !== 2 || parts.some(part => !Number.isFinite(part))) return 0;
+      return Math.max(0, (parts[0] * 60) + parts[1]);
+    }
+
+    function transcriptEvidenceText({
+      audioLevel = 0,
+      lineCount = 0,
+      latestFinalAgeSecs = null,
+      diagnostic = '',
+      elapsedSecs = 0,
+      recording = false,
+      stopping = false,
+    } = {}) {
+      if (stopping) return 'Finishing transcript…';
+      if (diagnostic) {
+        if (recording && elapsedSecs < 4) return 'Preparing transcript…';
+        return recording
+          ? 'Recording safely · Live transcript unavailable'
+          : 'Live transcript unavailable';
+      }
+
+      const lines = Math.max(0, Number(lineCount) || 0);
+      const lineLabel = `${lines} line${lines === 1 ? '' : 's'} captured`;
+      if ((Number(audioLevel) || 0) >= 4) {
+        return lines > 0 ? `Speech in progress · ${lineLabel}` : 'Speech in progress…';
+      }
+      if (lines === 0) return 'Listening…';
+
+      const finalAge = Number(latestFinalAgeSecs);
+      if (!Number.isFinite(finalAge) || finalAge <= 3) {
+        return `Transcript current · ${lineLabel}`;
+      }
+      return `Last transcript update ${Math.round(finalAge)}s ago · ${lineLabel}`;
+    }
+
     // ── Status polling ──
     let statusCheckInFlight = false;
 
@@ -8387,6 +8432,16 @@
           setFooterCaptureMode(true, 'recording');
           if (status.elapsed) recordingTime.textContent = status.elapsed;
           updateViz(status.audioLevel || 0);
+          const recordingLive = status.liveTranscript || {};
+          recordingTranscriptState.textContent = transcriptEvidenceText({
+            audioLevel: status.audioLevel,
+            lineCount: recordingLive.lineCount,
+            latestFinalAgeSecs: recordingLive.latestFinalAgeSecs,
+            diagnostic: recordingLive.diagnostic || (!recordingLive.active ? 'unavailable' : ''),
+            elapsedSecs: elapsedClockSeconds(status.elapsed),
+            recording: true,
+            stopping: stopRequested,
+          });
           document.getElementById('btn-stop').disabled = !!stopRequested;
 
           // Speed up polling when recording starts
@@ -8474,10 +8529,13 @@
               // broken", and the term means nothing to the person using it. A
               // user reported exactly that: "it says zero utterances even though
               // the green bar is moving" / "that goes over my head".
-              document.getElementById('live-utterances').textContent = n === 0
-                ? 'Listening…'
-                : `${n} line${n !== 1 ? 's' : ''} captured`;
               const lvl = Math.min(100, liveStatus.audioLevel || 0);
+              document.getElementById('live-utterances').textContent = transcriptEvidenceText({
+                audioLevel: lvl,
+                lineCount: n,
+                latestFinalAgeSecs: liveStatus.latestFinalAgeSecs,
+                diagnostic: liveStatus.diagnostic,
+              });
               document.getElementById('live-level-fill').style.width = lvl + '%';
               if (!wasLive) startFastPoll();
             } else {

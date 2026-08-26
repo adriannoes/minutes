@@ -284,6 +284,10 @@ pub struct SessionStatus {
     pub pid: Option<u32>,
     pub line_count: usize,
     pub duration_secs: f64,
+    /// Seconds since the end of the newest finalized line. Current drafts are
+    /// intentionally excluded; this is safe human-facing freshness evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_final_age_secs: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     pub jsonl_path: Option<String>,
@@ -3165,10 +3169,22 @@ fn derive_session_status(
     // perfectly healthy — gating on it would re-introduce the #258 flicker.
     let standalone_active = lt_pid_state.is_active();
 
-    let (sidecar_active, diagnostic) = if recording_pid.is_some() {
+    let (sidecar_active, sidecar_diagnostic) = if recording_pid.is_some() {
         evaluate_recording_sidecar_status(live_status.as_ref(), now)
     } else {
         (false, None)
+    };
+    let diagnostic = if standalone_active {
+        live_status.as_ref().and_then(|status| {
+            (status.state == LiveStatusState::Failed).then(|| {
+                status
+                    .diagnostic
+                    .clone()
+                    .unwrap_or_else(|| "live transcript failed".into())
+            })
+        })
+    } else {
+        sidecar_diagnostic
     };
 
     let active = standalone_active || sidecar_active;
@@ -3196,12 +3212,23 @@ fn derive_session_status(
     } else {
         None
     };
+    let latest_final_age_secs = live_status.as_ref().and_then(|status| {
+        (status.line_count > 0).then(|| {
+            let latest_final_end_secs = status
+                .last_offset_ms
+                .saturating_add(status.last_duration_ms)
+                as f64
+                / 1000.0;
+            (duration_secs - latest_final_end_secs).max(0.0)
+        })
+    });
 
     SessionStatus {
         active,
         pid,
         line_count,
         duration_secs,
+        latest_final_age_secs,
         session_id: live_status
             .as_ref()
             .and_then(|status| status.session_id.clone()),
@@ -4574,6 +4601,28 @@ mod tests {
 
     #[cfg(all(feature = "whisper", feature = "streaming"))]
     #[test]
+    fn session_status_reports_final_freshness_without_provisional_text() {
+        let dir = tempdir().unwrap();
+        let status_path = dir.path().join("live-status.json");
+        let mut live_status = live_status_with_state(LiveStatusState::Healthy);
+        live_status.start_time = Local::now() - ChronoDuration::seconds(10);
+        std::fs::write(&status_path, serde_json::to_string(&live_status).unwrap()).unwrap();
+
+        let status = derive_session_status(
+            pid::PidFileState::Inactive,
+            Some(std::process::id()),
+            &status_path,
+            &dir.path().join("live.jsonl"),
+        );
+
+        let age = status
+            .latest_final_age_secs
+            .expect("final freshness should be available");
+        assert!((8.0..=9.0).contains(&age), "unexpected final age: {age}");
+    }
+
+    #[cfg(all(feature = "whisper", feature = "streaming"))]
+    #[test]
     fn sidecar_failed_state_overrides_active_recording() {
         let dir = tempdir().unwrap();
         let status_path = dir.path().join("live-status.json");
@@ -4591,6 +4640,27 @@ mod tests {
         assert!(!status.active);
         assert_eq!(status.source, None);
         assert_eq!(status.diagnostic.as_deref(), Some("sidecar failed"));
+    }
+
+    #[cfg(all(feature = "whisper", feature = "streaming"))]
+    #[test]
+    fn standalone_failed_state_is_visible_to_status_readers() {
+        let dir = tempdir().unwrap();
+        let status_path = dir.path().join("live-status.json");
+        let mut live_status = live_status_with_state(LiveStatusState::Failed);
+        live_status.diagnostic = Some("recognizer unavailable".into());
+        std::fs::write(&status_path, serde_json::to_string(&live_status).unwrap()).unwrap();
+
+        let status = derive_session_status(
+            pid::PidFileState::Active(std::process::id()),
+            None,
+            &status_path,
+            &dir.path().join("live.jsonl"),
+        );
+
+        assert!(status.active);
+        assert_eq!(status.source, Some(TranscriptSource::Standalone));
+        assert_eq!(status.diagnostic.as_deref(), Some("recognizer unavailable"));
     }
 
     #[test]
