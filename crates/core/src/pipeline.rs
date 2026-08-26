@@ -6044,12 +6044,24 @@ where
         if status == Some(OutputStatus::NoSpeech) {
             "Untitled Recording".into()
         } else {
-            // Prefer calendar event title over transcript-derived title
-            calendar_event_title
-                .as_deref()
-                .and_then(title_from_context)
-                .map(finalize_title)
-                .unwrap_or_else(|| generate_title(&transcript, pre_context.as_deref()))
+            let calendar_title = if config.calendar.use_event_title_for_meeting_title {
+                // Opt-in: use the calendar event's title verbatim (whitespace-
+                // normalized + length-capped), bypassing the context heuristic
+                // that can otherwise reject an otherwise-valid event title.
+                calendar_event_title
+                    .as_deref()
+                    .map(normalize_space)
+                    .filter(|s| !s.is_empty())
+                    .map(finalize_title)
+            } else {
+                // Default: derive a title from the calendar event via the context
+                // heuristic (which may reject generic names).
+                calendar_event_title
+                    .as_deref()
+                    .and_then(title_from_context)
+                    .map(finalize_title)
+            };
+            calendar_title.unwrap_or_else(|| generate_title(&transcript, pre_context.as_deref()))
         }
     });
     let entities_started = std::time::Instant::now();
@@ -6089,9 +6101,11 @@ where
         .iter()
         .map(|entity| entity.label.clone())
         .collect();
-    let title_generation = maybe_refine_title_with_llm(
+    let title_generation = title_generation_decision(
         &auto_title,
         title,
+        calendar_event_title.as_deref(),
+        status != Some(OutputStatus::NoSpeech),
         summary.as_deref(),
         raw_summary.as_ref(),
         &entities,
@@ -6508,6 +6522,61 @@ where
             llm_duration_ms,
         },
     }
+}
+
+/// Decide the meeting title, honoring the opt-in "calendar event title wins"
+/// behavior before falling back to the LLM refine + deterministic paths.
+///
+/// When `[calendar] use_event_title_for_meeting_title` is enabled and a recording
+/// overlaps a scheduled calendar event — and there is no explicit title and
+/// speech was captured — the calendar event's title (already resolved into
+/// `auto_title`) is used verbatim and the LLM refine step is skipped. Otherwise
+/// this defers to [`maybe_refine_title_with_llm`], preserving existing behavior.
+#[allow(clippy::too_many_arguments)]
+fn title_generation_decision<F>(
+    auto_title: &str,
+    explicit_title: Option<&str>,
+    calendar_event_title: Option<&str>,
+    has_speech: bool,
+    summary_text: Option<&str>,
+    raw_summary: Option<&summarize::Summary>,
+    entities: &markdown::EntityLinks,
+    config: &Config,
+    refine: F,
+) -> TitleGenerationDecision
+where
+    F: FnOnce(
+        &str,
+        &summarize::Summary,
+        &markdown::EntityLinks,
+        &Config,
+    ) -> Result<summarize::TitleRefinement, Box<dyn std::error::Error>>,
+{
+    if explicit_title.is_none()
+        && has_speech
+        && config.calendar.use_event_title_for_meeting_title
+        && calendar_event_title.is_some()
+    {
+        return TitleGenerationDecision {
+            final_title: auto_title.to_string(),
+            refined_title: None,
+            outcome: "calendar",
+            model: None,
+            input_chars: 0,
+            detail: Some("calendar-event-title".into()),
+            llm_duration_ms: 0,
+        };
+    }
+
+    maybe_refine_title_with_llm(
+        auto_title,
+        explicit_title,
+        summary_text,
+        raw_summary,
+        entities,
+        config,
+        refine,
+    )
 }
 
 fn apply_title_generation(
@@ -9135,6 +9204,129 @@ mod tests {
         assert_eq!(decision.final_title, "Roadmap Review");
         assert_eq!(decision.refined_title, None);
         assert_eq!(decision.outcome, "fallback");
+    }
+
+    #[test]
+    fn calendar_title_wins_when_toggle_enabled() {
+        let summary = sample_summary();
+        let mut config = Config::default();
+        config.calendar.use_event_title_for_meeting_title = true;
+        let decision = title_generation_decision(
+            "Team Weekly Sync",
+            None,
+            Some("Team Weekly Sync"),
+            true,
+            Some("Weekly team status and planning."),
+            Some(&summary),
+            &markdown::EntityLinks::default(),
+            &config,
+            |_, _, _, _| panic!("LLM refine must not run when the calendar title wins"),
+        );
+
+        assert_eq!(decision.final_title, "Team Weekly Sync");
+        assert_eq!(decision.refined_title, None);
+        assert_eq!(decision.outcome, "calendar");
+        assert_eq!(decision.detail.as_deref(), Some("calendar-event-title"));
+    }
+
+    #[test]
+    fn calendar_title_ignored_when_toggle_disabled() {
+        let summary = sample_summary();
+        // Default config leaves the toggle off.
+        let decision = title_generation_decision(
+            "Team Weekly Sync",
+            None,
+            Some("Team Weekly Sync"),
+            true,
+            Some("Weekly team status and planning."),
+            Some(&summary),
+            &markdown::EntityLinks::default(),
+            &Config::default(),
+            |_, _, _, _| {
+                Ok(summarize::TitleRefinement {
+                    title: "Q3 Roadmap Planning".into(),
+                    model: "agent:codex".into(),
+                    input_chars: 64,
+                })
+            },
+        );
+
+        assert_eq!(decision.final_title, "Q3 Roadmap Planning");
+        assert_eq!(decision.outcome, "llm");
+    }
+
+    #[test]
+    fn calendar_title_toggle_skipped_without_matched_event() {
+        let summary = sample_summary();
+        let mut config = Config::default();
+        config.calendar.use_event_title_for_meeting_title = true;
+        let decision = title_generation_decision(
+            "Untitled Recording",
+            None,
+            None, // no overlapping calendar event
+            true,
+            Some("Weekly team status and planning."),
+            Some(&summary),
+            &markdown::EntityLinks::default(),
+            &config,
+            |_, _, _, _| {
+                Ok(summarize::TitleRefinement {
+                    title: "Q3 Roadmap Planning".into(),
+                    model: "agent:codex".into(),
+                    input_chars: 64,
+                })
+            },
+        );
+
+        assert_eq!(decision.final_title, "Q3 Roadmap Planning");
+        assert_eq!(decision.outcome, "llm");
+    }
+
+    #[test]
+    fn explicit_title_beats_calendar_toggle() {
+        let summary = sample_summary();
+        let mut config = Config::default();
+        config.calendar.use_event_title_for_meeting_title = true;
+        let decision = title_generation_decision(
+            "Team Weekly Sync",
+            Some("Manually Set Title"),
+            Some("Team Weekly Sync"),
+            true,
+            Some("Weekly team status and planning."),
+            Some(&summary),
+            &markdown::EntityLinks::default(),
+            &config,
+            |_, _, _, _| panic!("LLM refine must not run when an explicit title is set"),
+        );
+
+        assert_eq!(decision.outcome, "fallback");
+        assert_eq!(decision.detail.as_deref(), Some("explicit-title"));
+    }
+
+    #[test]
+    fn calendar_title_toggle_skipped_without_speech() {
+        let summary = sample_summary();
+        let mut config = Config::default();
+        config.calendar.use_event_title_for_meeting_title = true;
+        let decision = title_generation_decision(
+            "Team Weekly Sync",
+            None,
+            Some("Team Weekly Sync"),
+            false, // no speech captured
+            Some("Weekly team status and planning."),
+            Some(&summary),
+            &markdown::EntityLinks::default(),
+            &config,
+            |_, _, _, _| {
+                Ok(summarize::TitleRefinement {
+                    title: "Q3 Roadmap Planning".into(),
+                    model: "agent:codex".into(),
+                    input_chars: 64,
+                })
+            },
+        );
+
+        assert_eq!(decision.outcome, "llm");
     }
 
     #[test]

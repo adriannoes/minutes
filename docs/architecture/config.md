@@ -445,6 +445,7 @@ For real desktop validation of the Windows and Linux collectors, use
 | key | default | meaning |
 |---|---|---|
 | `enabled` | `true` | Read upcoming meetings from the system calendar |
+| `use_event_title_for_meeting_title` | `false` | When a recording overlaps a scheduled calendar event, use that event's title as the meeting title instead of the AI-generated one (skips the LLM title refine for that meeting) |
 
 ### `output_dir` — top-level
 
