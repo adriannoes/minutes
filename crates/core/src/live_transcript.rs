@@ -1979,6 +1979,116 @@ struct SidecarDraftResult {
     audio_snapshot_at: Instant,
 }
 
+/// Provisional current speech deliberately has its own cheap gate instead of
+/// inheriting the finalized live transcript's VAD. The finalized path may use
+/// an optional model, fall back, or segment quiet audio differently; none of
+/// those choices should starve the replaceable draft or change durable output.
+#[cfg(feature = "whisper")]
+struct RecordingDraftGate {
+    vad: Vad,
+    was_speaking: bool,
+    utterance: Vec<f32>,
+    utterance_samples: usize,
+    utterance_start_offset_ms: u64,
+    next_draft_at: usize,
+    max_window_samples: usize,
+    stats: SidecarGatingStats,
+}
+
+#[cfg(feature = "whisper")]
+enum RecordingDraftGateEvent {
+    None,
+    Snapshot(SidecarDraftJob),
+    SpeechEnded,
+}
+
+#[cfg(feature = "whisper")]
+impl RecordingDraftGate {
+    fn new(config: &Config) -> Self {
+        Self {
+            vad: Vad::new(),
+            was_speaking: false,
+            utterance: Vec::new(),
+            utterance_samples: 0,
+            utterance_start_offset_ms: 0,
+            next_draft_at: SIDECAR_FIRST_DRAFT_SAMPLES,
+            max_window_samples: (config.transcription.partial_max_secs as usize)
+                .saturating_mul(16000)
+                .max(SIDECAR_FIRST_DRAFT_SAMPLES),
+            stats: SidecarGatingStats::default(),
+        }
+    }
+
+    fn process(
+        &mut self,
+        samples: &[f32],
+        rms: f32,
+        samples_received: usize,
+        publisher: &mut LivePartialPublisher,
+    ) -> RecordingDraftGateEvent {
+        let decision = self.vad.process(rms);
+        self.stats.observe(samples.len(), decision.speaking);
+
+        if decision.speaking {
+            if !self.was_speaking {
+                self.utterance.clear();
+                self.utterance_samples = 0;
+                self.utterance_start_offset_ms = samples_to_ms(samples_received);
+                self.next_draft_at = SIDECAR_FIRST_DRAFT_SAMPLES;
+                publisher.begin_utterance(Instant::now());
+            }
+            self.was_speaking = true;
+            self.utterance.extend_from_slice(samples);
+            self.utterance_samples = self.utterance_samples.saturating_add(samples.len());
+
+            if self.utterance_samples >= self.next_draft_at {
+                let (window, window_start) =
+                    sidecar_draft_window(&self.utterance, self.max_window_samples);
+                let snapshot = SidecarDraftJob {
+                    utterance_sequence: publisher.current_utterance_sequence(),
+                    samples: window.to_vec(),
+                    offset_ms: self
+                        .utterance_start_offset_ms
+                        .saturating_add(samples_to_ms(window_start)),
+                    audio_snapshot_at: Instant::now(),
+                };
+
+                // Once the cost ceiling is reached, retain only the bounded
+                // window. The total counter keeps cadence monotonic while the
+                // base offset advances with the discarded prefix.
+                if window_start > 0 {
+                    self.utterance.drain(..window_start);
+                    self.utterance_start_offset_ms = self
+                        .utterance_start_offset_ms
+                        .saturating_add(samples_to_ms(window_start));
+                }
+                self.next_draft_at = self
+                    .next_draft_at
+                    .saturating_add(SIDECAR_DRAFT_INTERVAL_SAMPLES);
+                return RecordingDraftGateEvent::Snapshot(snapshot);
+            }
+        } else if self.was_speaking {
+            self.reset_utterance();
+            publisher.supersede_current(SupersessionReason::Finalizing);
+            return RecordingDraftGateEvent::SpeechEnded;
+        }
+
+        RecordingDraftGateEvent::None
+    }
+
+    fn stop(&mut self, publisher: &mut LivePartialPublisher) {
+        self.reset_utterance();
+        publisher.supersede_current(SupersessionReason::Discarded);
+    }
+
+    fn reset_utterance(&mut self) {
+        self.was_speaking = false;
+        self.utterance.clear();
+        self.utterance_samples = 0;
+        self.next_draft_at = SIDECAR_FIRST_DRAFT_SAMPLES;
+    }
+}
+
 #[cfg(feature = "whisper")]
 fn sidecar_draft_window(samples: &[f32], max_samples: usize) -> (&[f32], usize) {
     let start = if max_samples == 0 {
@@ -2063,17 +2173,8 @@ fn finish_sidecar_utterance(
     job_tx: &std::sync::mpsc::SyncSender<Vec<f32>>,
     samples: Vec<f32>,
     counters: &QueueCounters,
-    partial_publisher: Option<&mut LivePartialPublisher>,
 ) {
-    let outcome = enqueue_sidecar_utterance(job_tx, samples, counters);
-    if let Some(publisher) = partial_publisher {
-        publisher.supersede_current(match outcome {
-            EnqueueResult::Queued => SupersessionReason::Finalizing,
-            EnqueueResult::DroppedFull | EnqueueResult::Disconnected => {
-                SupersessionReason::Discarded
-            }
-        });
-    }
+    enqueue_sidecar_utterance(job_tx, samples, counters);
 }
 
 /// Engine dispatch for one finalized utterance on the sidecar's transcription
@@ -2844,7 +2945,10 @@ fn run_sidecar_inner_mpsc(
                                 ctx,
                                 config.transcription.language.clone(),
                                 Some(&stop_flag),
-                            ) {
+                            )
+                            .and_then(|(text, duration)| {
+                                normalize_live_transcript_text(&text).map(|text| (text, duration))
+                            }) {
                                 draft_results.offer_latest(SidecarDraftResult {
                                     utterance_sequence: job.utterance_sequence,
                                     text,
@@ -2891,9 +2995,9 @@ fn run_sidecar_inner_mpsc(
     };
 
     let mut samples_received = 0usize;
-    let mut utterance_start_offset_ms = 0u64;
-    let mut next_draft_at = SIDECAR_FIRST_DRAFT_SAMPLES;
-    let draft_max_samples = (config.transcription.partial_max_secs as usize).saturating_mul(16000);
+    let mut draft_gate = partial_publisher
+        .as_ref()
+        .map(|_| RecordingDraftGate::new(config));
     let mut last_draft_text = String::new();
 
     tracing::info!(
@@ -2905,7 +3009,7 @@ fn run_sidecar_inner_mpsc(
         if let Some(result) = draft_results.take() {
             if partial_publisher.as_ref().is_some_and(|publisher| {
                 publisher.current_utterance_sequence() == result.utterance_sequence
-            }) && was_speaking
+            }) && draft_gate.as_ref().is_some_and(|gate| gate.was_speaking)
                 && result.text != last_draft_text
             {
                 if let Some(publisher) = partial_publisher.as_mut() {
@@ -2942,8 +3046,9 @@ fn run_sidecar_inner_mpsc(
         }
         if stop_flag.load(Ordering::Relaxed) {
             draft_jobs.clear();
-            if let Some(publisher) = partial_publisher.as_mut() {
-                publisher.supersede_current(SupersessionReason::Discarded);
+            if let (Some(gate), Some(publisher)) = (draft_gate.as_mut(), partial_publisher.as_mut())
+            {
+                gate.stop(publisher);
             }
             let _ =
                 enqueue_sidecar_utterance(&job_tx, std::mem::take(&mut utterance), &queue_counters);
@@ -2955,12 +3060,12 @@ fn run_sidecar_inner_mpsc(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 draft_jobs.clear();
-                finish_sidecar_utterance(
-                    &job_tx,
-                    std::mem::take(&mut utterance),
-                    &queue_counters,
-                    partial_publisher.as_mut(),
-                );
+                if let (Some(gate), Some(publisher)) =
+                    (draft_gate.as_mut(), partial_publisher.as_mut())
+                {
+                    gate.stop(publisher);
+                }
+                finish_sidecar_utterance(&job_tx, std::mem::take(&mut utterance), &queue_counters);
                 break;
             }
         };
@@ -2972,60 +3077,32 @@ fn run_sidecar_inner_mpsc(
             (sum_sq / samples.len() as f32).sqrt()
         };
 
+        if let (Some(gate), Some(publisher)) = (draft_gate.as_mut(), partial_publisher.as_mut()) {
+            match gate.process(&samples, rms, samples_received, publisher) {
+                RecordingDraftGateEvent::Snapshot(job) => draft_jobs.offer_latest(job),
+                RecordingDraftGateEvent::SpeechEnded => {
+                    draft_jobs.clear();
+                    last_draft_text.clear();
+                }
+                RecordingDraftGateEvent::None => {}
+            }
+        }
+
         let vad_result = vad.process(&samples, rms);
         gating_stats.observe(samples.len(), vad_result.speaking);
 
         if vad_result.speaking {
-            if !was_speaking {
-                utterance_start_offset_ms = samples_to_ms(samples_received);
-                next_draft_at = SIDECAR_FIRST_DRAFT_SAMPLES;
-                last_draft_text.clear();
-                if let Some(publisher) = partial_publisher.as_mut() {
-                    publisher.begin_utterance(Instant::now());
-                }
-            }
             was_speaking = true;
             utterance.extend_from_slice(&samples);
 
-            if partial_publisher.is_some() && utterance.len() >= next_draft_at {
-                let utterance_sequence = partial_publisher
-                    .as_ref()
-                    .map(LivePartialPublisher::current_utterance_sequence)
-                    .unwrap_or(0);
-                let (draft_window, window_start) =
-                    sidecar_draft_window(&utterance, draft_max_samples);
-                draft_jobs.offer_latest(SidecarDraftJob {
-                    utterance_sequence,
-                    samples: draft_window.to_vec(),
-                    offset_ms: utterance_start_offset_ms
-                        .saturating_add(samples_to_ms(window_start)),
-                    audio_snapshot_at: Instant::now(),
-                });
-                next_draft_at = next_draft_at.saturating_add(SIDECAR_DRAFT_INTERVAL_SAMPLES);
-            }
-
             if utterance.len() >= max_utterance_samples {
                 tracing::info!("sidecar: max utterance duration, force-finalizing");
-                draft_jobs.clear();
-                finish_sidecar_utterance(
-                    &job_tx,
-                    std::mem::take(&mut utterance),
-                    &queue_counters,
-                    partial_publisher.as_mut(),
-                );
+                finish_sidecar_utterance(&job_tx, std::mem::take(&mut utterance), &queue_counters);
                 was_speaking = false;
-                last_draft_text.clear();
             }
         } else if was_speaking && !utterance.is_empty() {
-            draft_jobs.clear();
-            finish_sidecar_utterance(
-                &job_tx,
-                std::mem::take(&mut utterance),
-                &queue_counters,
-                partial_publisher.as_mut(),
-            );
+            finish_sidecar_utterance(&job_tx, std::mem::take(&mut utterance), &queue_counters);
             was_speaking = false;
-            last_draft_text.clear();
         }
         samples_received = samples_received.saturating_add(samples.len());
     }
@@ -3050,6 +3127,16 @@ fn run_sidecar_inner_mpsc(
         silence_windows = gating_stats.silence_windows,
         "live sidecar gating summary"
     );
+    if let Some(gate) = draft_gate.as_ref() {
+        tracing::info!(
+            vad_mode = "energy",
+            samples_fed = gate.stats.samples_fed,
+            samples_gated = gate.stats.samples_gated,
+            speaking_windows = gate.stats.speaking_windows,
+            silence_windows = gate.stats.silence_windows,
+            "live draft gating summary"
+        );
+    }
     tracing::info!(
         lines = lines,
         duration_secs = format!("{:.1}", duration),
@@ -3549,17 +3636,39 @@ mod tests {
     }
 
     #[test]
-    fn queued_final_immediately_supersedes_the_visible_draft() {
-        let (tx, _rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(1);
-        let counters = QueueCounters::default();
+    fn draft_gate_speech_end_immediately_supersedes_the_visible_draft() {
+        let config = Config::default();
+        let mut gate = RecordingDraftGate::new(&config);
         let (mut publisher, mut subscriber) = crate::live_partials::channel(9, 2);
-        publisher.begin_utterance(Instant::now());
+        let samples = vec![0.006; 1600];
+        let mut snapshot = None;
+        for chunk in 0..10 {
+            if let RecordingDraftGateEvent::Snapshot(job) =
+                gate.process(&samples, 0.006, chunk * samples.len(), &mut publisher)
+            {
+                snapshot = Some(job);
+            }
+        }
+        let snapshot = snapshot.expect("one second of quiet speech should schedule a draft");
+        assert_eq!(snapshot.samples.len(), SIDECAR_FIRST_DRAFT_SAMPLES);
         assert_eq!(
             publisher.try_publish("provisional".into(), 0),
             crate::live_partials::PartialPublishOutcome::Published
         );
+        let crate::live_partials::LivePartialEvent::Partial(_) = subscriber.try_recv().unwrap()
+        else {
+            panic!("published draft should be visible before speech ends");
+        };
 
-        finish_sidecar_utterance(&tx, vec![0.1; 1600], &counters, Some(&mut publisher));
+        let silence = vec![0.0; 1600];
+        let mut ended = false;
+        for chunk in 0..6 {
+            ended |= matches!(
+                gate.process(&silence, 0.0, (10 + chunk) * silence.len(), &mut publisher,),
+                RecordingDraftGateEvent::SpeechEnded
+            );
+        }
+        assert!(ended, "energy hangover should eventually end the draft");
 
         let crate::live_partials::LivePartialEvent::Superseded(signal) =
             subscriber.try_recv().unwrap()
@@ -3568,6 +3677,47 @@ mod tests {
         };
         assert_eq!(signal.reason, SupersessionReason::Finalizing);
         assert!(subscriber.try_recv().is_none());
+    }
+
+    #[test]
+    fn draft_gate_does_not_schedule_silence() {
+        let config = Config::default();
+        let mut gate = RecordingDraftGate::new(&config);
+        let (mut publisher, mut subscriber) = crate::live_partials::channel(10, 2);
+        let samples = vec![0.0002; 1600];
+
+        for chunk in 0..20 {
+            assert!(matches!(
+                gate.process(&samples, 0.0002, chunk * samples.len(), &mut publisher,),
+                RecordingDraftGateEvent::None
+            ));
+        }
+
+        assert!(subscriber.try_recv().is_none());
+        assert!(!gate.was_speaking);
+    }
+
+    #[test]
+    fn draft_gate_keeps_long_speech_audio_bounded() {
+        let mut config = Config::default();
+        config.transcription.partial_max_secs = 1;
+        let mut gate = RecordingDraftGate::new(&config);
+        let (mut publisher, _subscriber) = crate::live_partials::channel(11, 2);
+        let samples = vec![0.02; 1600];
+        let mut snapshots = 0;
+
+        for chunk in 0..50 {
+            if let RecordingDraftGateEvent::Snapshot(job) =
+                gate.process(&samples, 0.02, chunk * samples.len(), &mut publisher)
+            {
+                snapshots += 1;
+                assert!(job.samples.len() <= 16_000);
+                assert!(gate.utterance.len() <= 16_000);
+            }
+        }
+
+        assert_eq!(snapshots, 3);
+        assert!(gate.utterance.len() <= 16_000);
     }
 
     #[test]

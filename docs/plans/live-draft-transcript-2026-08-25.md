@@ -110,8 +110,8 @@ Normal Recording uses this sequence:
 
 1. Create the existing bounded `LivePartialPublisher` and `LivePartialSubscriber` pair.
 2. Give the subscriber to the capture owner's authenticated relay.
-3. Give the publisher to the already isolated recording-sidecar VAD consumer.
-4. While speech continues, the sidecar offers a full-utterance snapshot to a capacity-one latest-only draft mailbox after the first second of speech, then at a two-second cadence, up to the existing partial cost ceiling.
+3. Give the publisher to the already isolated recording-sidecar consumer. Draft speech boundaries use a separate adaptive energy gate so an optional or unavailable final-transcript VAD cannot starve provisional current speech. The final-transcript VAD and its durable segmentation remain unchanged.
+4. While the draft gate reports speech, the sidecar offers a full-utterance snapshot to a capacity-one latest-only draft mailbox after the first second of speech, then at a two-second cadence, up to the existing partial cost ceiling. Draft text passes the same noise-placeholder filter as finalized live text before it can reach the relay.
 5. Recognition runs only on the sidecar inference worker. A pending older snapshot may be replaced. A busy or failed worker causes a skipped draft, not queued audio growth.
 6. The VAD consumer publishes completed draft results without waiting. At speech end it advances the supersession watermark immediately and separately queues the final utterance through the existing bounded final path.
 
@@ -136,6 +136,7 @@ The following are release-blocking invariants:
 - No draft code can open a microphone. An attaching assistant uses the capture owner's relay or refuses attachment.
 - Relay start failure, draft worker spawn failure, missing model, inference error, panic, full mailbox, full partial queue, slow reader, disconnect, or stale heartbeat cannot stop recording.
 - Draft work may be skipped under pressure. WAV samples and final batch processing may not be skipped to preserve a draft.
+- Draft gating is independent of finalized live-transcript segmentation. A draft-gate miss or false positive may suppress or waste one provisional recognition attempt, but it cannot change a finalized line, meeting artifact, or WAV.
 - Final sidecar utterances keep priority over new draft jobs.
 - Stop, device reconnect, silence, forced utterance cap, queue drop, and engine fallback all invalidate the affected draft.
 - Draft text is excluded from durable logs, including diagnostic logging. Metrics contain timing and counts only.
