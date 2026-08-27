@@ -827,11 +827,18 @@ pub struct AssistantConfig {
 #[serde(default)]
 pub struct CalendarConfig {
     pub enabled: bool,
+    /// When true, and a recording overlaps a scheduled calendar event, use that
+    /// event's title as the meeting title (overriding the AI-generated title).
+    /// Opt-in; defaults to false to preserve existing behavior.
+    pub use_event_title_for_meeting_title: bool,
 }
 
 impl Default for CalendarConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            use_event_title_for_meeting_title: false,
+        }
     }
 }
 
