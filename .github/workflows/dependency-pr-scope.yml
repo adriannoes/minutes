@@ -60,7 +60,11 @@ jobs:
           echo "Branch: $HEAD_REF"
           echo
 
-          changed=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+          # Diff from the merge base, not the base branch tip. A dependabot
+          # branch that is behind main would otherwise "change" every file
+          # main gained since the branch was cut and fail its own check.
+          merge_base=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
+          changed=$(git diff --name-only "$merge_base" "$HEAD_SHA")
           if [ -z "$changed" ]; then
             echo "No changed files."
             exit 0
