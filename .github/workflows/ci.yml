@@ -6,6 +6,13 @@ on:
   pull_request:
     branches: [main]
 
+# One live run per PR: a new push supersedes the previous run's results, so
+# cancel it instead of letting it hold runners for 30+ minutes. Pushes to
+# main keep every run (each merge commit is worth a full result).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
 
