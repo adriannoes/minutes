@@ -244,7 +244,13 @@ const SIBLING_STEM_GRACE: std::time::Duration = std::time::Duration::from_secs(3
 /// not let the stalled source block the healthy source forever. This also
 /// covers a header-only microphone stem when macOS grants capture but delivers
 /// no microphone frames.
-const STEM_STALL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+const STEM_STALL_GRACE_SECS: u64 = 2;
+const STEM_STALL_GRACE: std::time::Duration = std::time::Duration::from_secs(STEM_STALL_GRACE_SECS);
+
+/// Require the healthy sibling to have advanced through the full stall grace
+/// before excluding the other source. A single late frame must not turn a
+/// momentary two-source pause into a permanent one-source transcript.
+const STEM_STALL_MIN_ADVANCE_SAMPLES: usize = TARGET_RATE as usize * STEM_STALL_GRACE_SECS as usize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StalledSource {
@@ -338,24 +344,34 @@ fn feed_from_stems(
 
     while !stop_flag.load(Ordering::Relaxed) {
         if let Some(voice) = voice.as_mut() {
-            match voice.poll() {
-                Ok(samples) => {
-                    if !samples.is_empty() {
-                        voice_last_progress = std::time::Instant::now();
-                        voice_pending.extend_from_slice(&samples);
-                    }
+            match poll_source(
+                voice,
+                &mut has_voice,
+                &mut voice_pending,
+                &mut voice_last_progress,
+            ) {
+                Ok(true) => {
+                    tracing::info!(
+                        "voice stem resumed producing frames; re-attaching it to the live transcript mix"
+                    );
                 }
+                Ok(false) => {}
                 Err(error) => tracing::debug!(%error, "voice stem poll failed; continuing"),
             }
         }
         if let Some(system) = system.as_mut() {
-            match system.poll() {
-                Ok(samples) => {
-                    if !samples.is_empty() {
-                        system_last_progress = std::time::Instant::now();
-                        system_pending.extend_from_slice(&samples);
-                    }
+            match poll_source(
+                system,
+                &mut has_system,
+                &mut system_pending,
+                &mut system_last_progress,
+            ) {
+                Ok(true) => {
+                    tracing::info!(
+                        "system stem resumed producing frames; re-attaching it to the live transcript mix"
+                    );
                 }
+                Ok(false) => {}
                 Err(error) => tracing::debug!(%error, "system stem poll failed; continuing"),
             }
         }
@@ -371,18 +387,16 @@ fn feed_from_stems(
         ) {
             Some(StalledSource::Voice) => {
                 has_voice = false;
-                voice = None;
                 voice_pending.clear();
                 tracing::warn!(
-                    "voice stem stopped producing frames; live transcript is continuing with system audio only"
+                    "voice stem stopped producing frames; live transcript is continuing with system audio only and will re-attach voice if frames resume"
                 );
             }
             Some(StalledSource::System) => {
                 has_system = false;
-                system = None;
                 system_pending.clear();
                 tracing::warn!(
-                    "system stem stopped producing frames; live transcript is continuing with voice audio only"
+                    "system stem stopped producing frames; live transcript is continuing with voice audio only and will re-attach system audio if frames resume"
                 );
             }
             None => {}
@@ -470,13 +484,46 @@ fn stalled_source_to_drop(
     if !(has_voice && has_system) {
         return None;
     }
-    if voice_pending == 0 && system_pending > 0 && voice_idle >= STEM_STALL_GRACE {
+    if voice_pending == 0
+        && system_pending >= STEM_STALL_MIN_ADVANCE_SAMPLES
+        && voice_idle >= STEM_STALL_GRACE
+    {
         return Some(StalledSource::Voice);
     }
-    if system_pending == 0 && voice_pending > 0 && system_idle >= STEM_STALL_GRACE {
+    if system_pending == 0
+        && voice_pending >= STEM_STALL_MIN_ADVANCE_SAMPLES
+        && system_idle >= STEM_STALL_GRACE
+    {
         return Some(StalledSource::System);
     }
     None
+}
+
+/// Re-enable a source in the live mix as soon as its still-open tail produces
+/// frames again. The tail itself is deliberately retained while excluded so a
+/// transient device or route interruption cannot silence that source for the
+/// rest of the call.
+fn reattach_resumed_source(has_source: &mut bool) -> bool {
+    if !*has_source {
+        *has_source = true;
+        return true;
+    }
+    false
+}
+
+fn poll_source(
+    tail: &mut StemTail,
+    has_source: &mut bool,
+    pending: &mut Vec<f32>,
+    last_progress: &mut std::time::Instant,
+) -> Result<bool, String> {
+    let samples = tail.poll()?;
+    if samples.is_empty() {
+        return Ok(false);
+    }
+    *last_progress = std::time::Instant::now();
+    pending.extend_from_slice(&samples);
+    Ok(reattach_resumed_source(has_source))
 }
 
 /// Wait for at least one stem to exist and carry a parseable header.
@@ -728,7 +775,7 @@ mod tests {
                 true,
                 true,
                 0,
-                16_000,
+                STEM_STALL_MIN_ADVANCE_SAMPLES,
                 STEM_STALL_GRACE,
                 std::time::Duration::ZERO,
             ),
@@ -742,7 +789,7 @@ mod tests {
             stalled_source_to_drop(
                 true,
                 true,
-                16_000,
+                STEM_STALL_MIN_ADVANCE_SAMPLES,
                 0,
                 std::time::Duration::ZERO,
                 STEM_STALL_GRACE,
@@ -758,12 +805,84 @@ mod tests {
                 true,
                 true,
                 0,
-                16_000,
+                STEM_STALL_MIN_ADVANCE_SAMPLES,
                 STEM_STALL_GRACE - std::time::Duration::from_millis(1),
                 std::time::Duration::ZERO,
             ),
             None
         );
+    }
+
+    #[test]
+    fn less_than_a_grace_window_of_sibling_audio_does_not_drop_a_source() {
+        assert_eq!(
+            stalled_source_to_drop(
+                true,
+                true,
+                0,
+                STEM_STALL_MIN_ADVANCE_SAMPLES - 1,
+                STEM_STALL_GRACE,
+                std::time::Duration::ZERO,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn stalled_voice_rejoins_the_mix_when_frames_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let voice_path = dir.path().join("voice.wav");
+        write_growing_stem(&voice_path, 1, TARGET_RATE, Encoding::F32);
+        let mut voice_tail = StemTail::open(&voice_path).unwrap();
+        let mut has_voice = true;
+        let has_system = true;
+        let mut voice_pending = Vec::new();
+        let mut system_pending = vec![0.4; STEM_STALL_MIN_ADVANCE_SAMPLES];
+        let mut voice_last_progress = std::time::Instant::now();
+
+        assert_eq!(
+            stalled_source_to_drop(
+                has_voice,
+                has_system,
+                voice_pending.len(),
+                system_pending.len(),
+                STEM_STALL_GRACE,
+                std::time::Duration::ZERO,
+            ),
+            Some(StalledSource::Voice)
+        );
+        has_voice = false;
+        voice_pending.clear();
+
+        let system_only = take_audio(
+            &mut voice_pending,
+            &mut system_pending,
+            has_voice,
+            has_system,
+        );
+        assert_eq!(system_only.len(), STEM_STALL_MIN_ADVANCE_SAMPLES);
+
+        append_f32(&voice_path, &[0.25]);
+        system_pending.push(0.5);
+        assert!(
+            poll_source(
+                &mut voice_tail,
+                &mut has_voice,
+                &mut voice_pending,
+                &mut voice_last_progress,
+            )
+            .unwrap(),
+            "the retained tail must report that voice re-attached"
+        );
+        assert!(has_voice, "voice must participate again in the same round");
+
+        let rejoined = take_audio(
+            &mut voice_pending,
+            &mut system_pending,
+            has_voice,
+            has_system,
+        );
+        assert_eq!(rejoined, vec![0.75]);
     }
 
     #[test]
