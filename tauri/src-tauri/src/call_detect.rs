@@ -1036,41 +1036,15 @@ impl CallDetector {
         want_teams: bool,
     ) -> BrowserMeetProbe {
         let running_lower: Vec<String> = running.iter().map(|s| s.to_lowercase()).collect();
-        let mut saw_browser = false;
+        let matched = browsers_to_probe(&running_lower);
+        let saw_browser = !matched.is_empty();
 
-        for (proc_fragment, app_name, kind, exact) in &[
-            (
-                "google chrome",
-                "Google Chrome",
-                BrowserKind::ChromeLike,
-                false,
-            ),
-            (
-                "chrome canary",
-                "Google Chrome Canary",
-                BrowserKind::ChromeLike,
-                false,
-            ),
-            ("chromium", "Chromium", BrowserKind::ChromeLike, false),
-            // Arc's binary is exactly "Arc"; substring match would catch
-            // searchpartyd / searchpartyuseragent / TrialArchivingService.
-            ("arc", "Arc", BrowserKind::ChromeLike, true),
-            ("safari", "Safari", BrowserKind::Safari, false),
-        ] {
-            let proc_match = if *exact {
-                running_lower.iter().any(|p| p == proc_fragment)
-            } else {
-                running_lower.iter().any(|p| p.contains(proc_fragment))
-            };
-            if !proc_match {
-                continue;
-            }
-            saw_browser = true;
+        for (app_name, kind) in matched {
             if !self.browser_probe_allowed_for(app_name) {
                 continue;
             }
 
-            match query_browser_tabs(app_name, *kind) {
+            match query_browser_tabs(app_name, kind) {
                 AppleScriptProbe::Tabs(tabs) => {
                     for tab in &tabs {
                         if want_meet && looks_like_google_meet_meeting_url(&tab.url) {
@@ -1088,7 +1062,7 @@ impl CallDetector {
                 AppleScriptProbe::PermissionDenied => {
                     self.defer_browser_probe_for(app_name, "apple_events_permission_denied");
                     return BrowserMeetProbe::PermissionDenied {
-                        browser_app: (*app_name).to_string(),
+                        browser_app: app_name.to_string(),
                     };
                 }
                 AppleScriptProbe::Error { stderr } => {
@@ -1126,7 +1100,49 @@ fn display_name_for(process: &str) -> String {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+/// Select the browsers whose tabs the AppleScript meeting probe may inspect,
+/// given a lowercased snapshot of running process names. Entries flagged
+/// exact must match a process name in full: the probe launches the app when
+/// it is not already running, so a substring hit on an unrelated background
+/// process would open a browser the user never started.
+fn browsers_to_probe(running_lower: &[String]) -> Vec<(&'static str, BrowserKind)> {
+    const BROWSERS: &[(&str, &str, BrowserKind, bool)] = &[
+        (
+            "google chrome",
+            "Google Chrome",
+            BrowserKind::ChromeLike,
+            false,
+        ),
+        (
+            "chrome canary",
+            "Google Chrome Canary",
+            BrowserKind::ChromeLike,
+            false,
+        ),
+        ("chromium", "Chromium", BrowserKind::ChromeLike, false),
+        // Arc's binary is exactly "Arc"; substring match would catch
+        // searchpartyd / searchpartyuseragent / TrialArchivingService.
+        ("arc", "Arc", BrowserKind::ChromeLike, true),
+        // Safari's binary is exactly "Safari"; substring match would catch
+        // always-running system agents (SafariBookmarksSyncAgent,
+        // SafariLaunchAgent, com.apple.Safari.History, ...), so the probe
+        // would launch Safari even when the user never opened it.
+        ("safari", "Safari", BrowserKind::Safari, true),
+    ];
+    BROWSERS
+        .iter()
+        .filter(|(fragment, _, _, exact)| {
+            if *exact {
+                running_lower.iter().any(|p| p == fragment)
+            } else {
+                running_lower.iter().any(|p| p.contains(fragment))
+            }
+        })
+        .map(|(_, app_name, kind, _)| (*app_name, *kind))
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BrowserKind {
     ChromeLike,
     Safari,
@@ -1570,6 +1586,43 @@ mod tests {
             stop_when_call_ends: false,
             call_end_stop_countdown_secs: 30,
         }
+    }
+
+    #[test]
+    fn safari_background_agents_alone_do_not_select_safari_for_probe() {
+        // macOS runs Safari-named agents even when Safari itself is closed;
+        // a substring hit on one of them would make the tab probe launch
+        // Safari via AppleScript.
+        let running: Vec<String> = [
+            "safaribookmarkssyncagent",
+            "safarilaunchagent",
+            "com.apple.safari.history",
+            "com.apple.safari.safebrowsing.service",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert!(browsers_to_probe(&running).is_empty());
+    }
+
+    #[test]
+    fn safari_app_process_selects_safari_for_probe() {
+        let running = vec!["safari".to_string()];
+        assert_eq!(
+            browsers_to_probe(&running),
+            vec![("Safari", BrowserKind::Safari)]
+        );
+    }
+
+    #[test]
+    fn chrome_helper_processes_still_select_chrome() {
+        // Chrome helper processes contain the parent name; the substring
+        // match is intentional for the ChromeLike entries.
+        let running = vec!["google chrome helper (renderer)".to_string()];
+        assert_eq!(
+            browsers_to_probe(&running),
+            vec![("Google Chrome", BrowserKind::ChromeLike)]
+        );
     }
 
     #[test]
