@@ -9525,13 +9525,16 @@ life (qmd://life/)
     }
 
     #[test]
-    fn json_envelope_includes_schema_metadata() {
-        let envelope = json_envelope("minutes health", json!({ "engine": "parakeet" }));
+    fn health_json_envelope_includes_effective_transcription_metadata() {
+        let report = health_json_report(&Config::default(), &[]);
+        let envelope = json_envelope("minutes health", report);
         let value = serde_json::to_value(envelope).unwrap();
         assert_eq!(value["ok"], true);
         assert_eq!(value["command"], "minutes health");
         assert_eq!(value["meta"]["schemaVersion"], 1);
-        assert_eq!(value["data"]["engine"], "parakeet");
+        assert!(value["data"]["engine"].is_string());
+        assert!(value["data"]["effective_engine"].is_string());
+        assert!(value["data"]["model"].is_string());
         assert!(value["meta"]["generatedAt"].is_string());
     }
 
@@ -16526,16 +16529,7 @@ fn cmd_health(json: bool) -> Result<()> {
     let items = minutes_core::health::check_all(&config);
 
     if json {
-        let attention_count = items
-            .iter()
-            .filter(|item| item.state == "attention")
-            .count();
-        let report = serde_json::json!({
-            "engine": config.transcription.engine,
-            "all_ready": attention_count == 0,
-            "attention_count": attention_count,
-            "items": items,
-        });
+        let report = health_json_report(&config, &items);
         let envelope = json_envelope("minutes health", report);
         println!("{}", serde_json::to_string_pretty(&envelope)?);
     } else {
@@ -16563,6 +16557,24 @@ fn cmd_health(json: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn health_json_report(
+    config: &Config,
+    items: &[minutes_core::health::HealthItem],
+) -> serde_json::Value {
+    let attention_count = items
+        .iter()
+        .filter(|item| item.state == "attention")
+        .count();
+    serde_json::json!({
+        "engine": config.transcription.engine,
+        "effective_engine": minutes_core::transcribe::effective_transcription_engine(config),
+        "model": config.transcription.model,
+        "all_ready": attention_count == 0,
+        "attention_count": attention_count,
+        "items": items,
+    })
 }
 
 // ──────────────────────────────────────────────────────────────

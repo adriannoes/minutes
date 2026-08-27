@@ -70,7 +70,7 @@ import {
   realpathSync,
   statSync,
 } from "fs";
-import { mkdir, readFile, rm, stat, writeFile } from "fs/promises";
+import { access, mkdir, readFile, rm, stat, writeFile } from "fs/promises";
 import { basename, delimiter, dirname, extname, isAbsolute, join, relative, resolve } from "path";
 import { fileURLToPath } from "url";
 import { homedir } from "os";
@@ -2458,8 +2458,11 @@ export type HealthItem = {
 };
 
 export type HealthOutput = {
+  ok: boolean;
   items: HealthItem[] | null;
   engine?: string;
+  effectiveEngine?: string;
+  model?: string;
 };
 
 function isHealthItem(value: unknown): value is HealthItem {
@@ -2471,64 +2474,53 @@ export function parseHealthOutput(stdout: string): HealthOutput {
   try {
     parsed = JSON.parse(stdout);
   } catch {
-    return { items: null };
+    return { ok: false, items: null };
   }
 
   if (Array.isArray(parsed)) {
-    return parsed.every(isHealthItem) ? { items: parsed } : { items: null };
+    return parsed.every(isHealthItem)
+      ? { ok: true, items: parsed }
+      : { ok: false, items: null };
   }
 
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    return { items: null };
+    return { ok: false, items: null };
   }
 
-  const data = (parsed as Record<string, unknown>).data;
+  const envelope = parsed as Record<string, unknown>;
+  if (envelope.ok !== true) {
+    return { ok: false, items: null };
+  }
+
+  const data = envelope.data;
   if (typeof data !== "object" || data === null || Array.isArray(data)) {
-    return { items: null };
+    return { ok: false, items: null };
   }
 
   const dataRecord = data as Record<string, unknown>;
   const items = dataRecord.items;
-  if (
-    !Array.isArray(items) ||
-    !items.every(isHealthItem) ||
-    typeof dataRecord.engine !== "string"
-  ) {
-    return { items: null };
+  if (!Array.isArray(items) || !items.every(isHealthItem)) {
+    return { ok: false, items: null };
   }
 
   return {
+    ok: true,
     items,
-    engine: dataRecord.engine,
+    ...(typeof dataRecord.engine === "string" ? { engine: dataRecord.engine } : {}),
+    ...(typeof dataRecord.effective_engine === "string"
+      ? { effectiveEngine: dataRecord.effective_engine }
+      : {}),
+    ...(typeof dataRecord.model === "string" ? { model: dataRecord.model } : {}),
   };
 }
 
-export function parseConfiguredTranscriptionModel(configContent: string): string | null {
-  let inTranscriptionSection = false;
-  for (const line of configContent.split(/\r?\n/)) {
-    const section = line.match(/^\s*\[([^\]]+)\]\s*(?:#.*)?$/);
-    if (section) {
-      inTranscriptionSection = section[1].trim() === "transcription";
-      continue;
-    }
-    if (!inTranscriptionSection) continue;
-
-    const model = line.match(
-      /^\s*model\s*=\s*["']([^"'\r\n]+)["']\s*(?:#.*)?$/
-    )?.[1].trim();
-    if (model) return model;
-  }
-  return null;
-}
-
-async function readConfiguredTranscriptionModel(): Promise<string | null> {
+async function configFileExists(): Promise<boolean> {
   const configRoot = process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
   try {
-    return parseConfiguredTranscriptionModel(
-      await readFile(join(configRoot, "minutes", "config.toml"), "utf8")
-    );
+    await access(join(configRoot, "minutes", "config.toml"));
+    return true;
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
     throw error;
   }
 }
@@ -2538,7 +2530,7 @@ type WhisperModelCheckState = { done: boolean };
 export type EnsureWhisperModelOptions = {
   checkState?: WhisperModelCheckState;
   health?: () => Promise<string>;
-  readConfiguredModel?: () => Promise<string | null>;
+  configFileExists?: () => Promise<boolean>;
   setup?: (model: string) => Promise<void>;
   log?: (message: string) => void;
 };
@@ -2565,8 +2557,7 @@ export async function ensureWhisperModel(
       env: mcpCliChildEnv(),
     });
   });
-  const readConfiguredModel =
-    options.readConfiguredModel ?? readConfiguredTranscriptionModel;
+  const doesConfigFileExist = options.configFileExists ?? configFileExists;
 
   let healthOutput: HealthOutput;
   try {
@@ -2579,37 +2570,61 @@ export async function ensureWhisperModel(
     return;
   }
 
-  if (healthOutput.items === null) {
+  if (!healthOutput.ok || healthOutput.items === null) {
     log("[Minutes] Unrecognized health --json output — skipping Whisper auto-setup");
     return;
   }
 
   const modelItem = healthOutput.items.find((item) => item.label === "Speech model");
-  if (modelItem?.state === "ready") {
+  if (!modelItem) {
+    log("[Minutes] unrecognized health items — skipping Whisper auto-setup");
+    return;
+  }
+
+  if (modelItem.state === "ready") {
     log("[Minutes] Whisper model ready");
     return;
   }
 
-  if (healthOutput.engine !== undefined && healthOutput.engine !== "whisper") {
-    log(`[Minutes] Transcription engine is ${healthOutput.engine} — skipping Whisper auto-setup`);
-    return;
-  }
-
-  let configuredModel: string | null;
-  try {
-    configuredModel = await readConfiguredModel();
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+  if (modelItem.state !== "attention") {
     log(
-      `[Minutes] Unable to read the configured transcription model — skipping Whisper auto-setup: ${message}`
+      `[Minutes] Speech model health state is ${String(modelItem.state)} — skipping Whisper auto-setup`
     );
     return;
   }
 
-  const model = configuredModel ?? "tiny";
-  if (configuredModel) {
+  const engineForDecision = healthOutput.effectiveEngine ?? healthOutput.engine;
+  if (engineForDecision !== undefined && engineForDecision.toLowerCase() !== "whisper") {
+    const upgradeGuidance = healthOutput.effectiveEngine === undefined
+      ? "; upgrade the CLI to let auto-setup resolve the effective engine"
+      : "";
+    log(
+      `[Minutes] Transcription engine is ${engineForDecision} — skipping Whisper auto-setup${upgradeGuidance}`
+    );
+    return;
+  }
+
+  let model = healthOutput.model;
+  if (model !== undefined) {
     log(`[Minutes] Whisper model ${model} is configured but not ready — downloading it...`);
   } else {
+    let configExists: boolean;
+    try {
+      configExists = await doesConfigFileExist();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      log(
+        `[Minutes] Unable to check for an existing config — skipping Whisper auto-setup: ${message}`
+      );
+      return;
+    }
+    if (configExists) {
+      log(
+        "[Minutes] config exists but this CLI does not report the configured model; run `minutes setup --model <your model>` or upgrade the CLI"
+      );
+      return;
+    }
+    model = "tiny";
     log("[Minutes] No Whisper model is configured — downloading tiny model (~75MB)...");
   }
 

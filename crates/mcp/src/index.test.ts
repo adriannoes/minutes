@@ -110,7 +110,6 @@ import {
   parseCopilotStatusOutput,
   parseKnowledgeConfig,
   parseDictationModelMissingError,
-  parseConfiguredTranscriptionModel,
   parseHealthOutput,
   parseMeetingsRootSnapshot,
   parseLiveEventsResourceUri,
@@ -206,15 +205,19 @@ describe("Whisper model auto-setup", () => {
 
   async function runModelCheck(input: {
     health: unknown;
-    configuredModel?: string | null;
+    configExists?: boolean;
   }): Promise<{ setups: string[]; logs: string[] }> {
     const setups: string[] = [];
     const logs: string[] = [];
     await ensureWhisperModel({
       checkState: { done: false },
-      health: async () =>
-        typeof input.health === "string" ? input.health : JSON.stringify(input.health),
-      readConfiguredModel: async () => input.configuredModel ?? null,
+      health: async () => {
+        if (input.health instanceof Error) throw input.health;
+        return typeof input.health === "string"
+          ? input.health
+          : JSON.stringify(input.health);
+      },
+      configFileExists: async () => input.configExists ?? false,
       setup: async (model) => {
         setups.push(model);
       },
@@ -223,7 +226,56 @@ describe("Whisper model auto-setup", () => {
     return { setups, logs };
   }
 
-  it("parses the current health envelope and skips setup when the model is ready", async () => {
+  it("parses legacy and current health output shapes", () => {
+    expect(parseHealthOutput(JSON.stringify([readyItem]))).toEqual({
+      ok: true,
+      items: [readyItem],
+    });
+    expect(
+      parseHealthOutput(
+        JSON.stringify({
+          ok: true,
+          data: {
+            engine: "parakeet",
+            effective_engine: "whisper",
+            model: "small",
+            items: [missingItem],
+          },
+        })
+      )
+    ).toEqual({
+      ok: true,
+      items: [missingItem],
+      engine: "parakeet",
+      effectiveEngine: "whisper",
+      model: "small",
+    });
+  });
+
+  it.each([
+    ["a failed health command", new Error("health failed")],
+    ["an ok:false envelope", { ok: false, data: { items: [missingItem] } }],
+    ["invalid health items", { ok: true, data: { items: ["invalid"] } }],
+  ])("fails closed for %s", async (_label, health) => {
+    const result = await runModelCheck({ health });
+
+    expect(result.setups).toEqual([]);
+    expect(result.logs).toHaveLength(1);
+  });
+
+  it.each([
+    ["an empty legacy array", []],
+    ["an array without the speech model item", [{ label: "CLI", state: "ready" }]],
+  ])("fails closed for %s", async (_label, health) => {
+    const result = await runModelCheck({ health });
+
+    expect(result.setups).toEqual([]);
+    expect(result.logs).toContain(
+      "[Minutes] unrecognized health items — skipping Whisper auto-setup"
+    );
+  });
+
+  it("skips setup when the speech model is ready", async () => {
     const result = await runModelCheck({
       health: { ok: true, data: { engine: "whisper", items: [readyItem] } },
     });
@@ -239,64 +291,105 @@ describe("Whisper model auto-setup", () => {
     expect(result.logs).toContain("[Minutes] Whisper model ready");
   });
 
-  it("skips Whisper setup for a non-Whisper transcription engine", async () => {
+  it("fails closed for an unknown speech model state", async () => {
     const result = await runModelCheck({
-      health: { ok: true, data: { engine: "parakeet", items: [missingItem] } },
-      configuredModel: "medium",
+      health: {
+        ok: true,
+        data: { engine: "whisper", items: [{ ...missingItem, state: "unknown" }] },
+      },
     });
 
     expect(result.setups).toEqual([]);
     expect(result.logs).toContain(
-      "[Minutes] Transcription engine is parakeet — skipping Whisper auto-setup"
+      "[Minutes] Speech model health state is unknown — skipping Whisper auto-setup"
     );
   });
 
-  it("downloads the configured Whisper model without downgrading it", async () => {
+  it("uses the effective engine and reported model when configured parakeet resolves to Whisper", async () => {
     const result = await runModelCheck({
-      health: { ok: true, data: { engine: "whisper", items: [missingItem] } },
-      configuredModel: "medium",
+      health: {
+        ok: true,
+        data: {
+          engine: "parakeet",
+          effective_engine: "whisper",
+          model: "small",
+          items: [missingItem],
+        },
+      },
+    });
+
+    expect(result.setups).toEqual(["small"]);
+  });
+
+  it("skips setup when the effective engine is non-Whisper", async () => {
+    const result = await runModelCheck({
+      health: {
+        ok: true,
+        data: {
+          engine: "parakeet",
+          effective_engine: "parakeet",
+          items: [missingItem],
+        },
+      },
+    });
+
+    expect(result.setups).toEqual([]);
+    expect(result.logs.join("\n")).toContain("skipping Whisper auto-setup");
+  });
+
+  it("conservatively skips an old CLI non-Whisper engine with upgrade guidance", async () => {
+    const result = await runModelCheck({
+      health: { ok: true, data: { engine: "parakeet", items: [missingItem] } },
+    });
+
+    expect(result.setups).toEqual([]);
+    expect(result.logs.join("\n")).toContain(
+      "upgrade the CLI to let auto-setup resolve the effective engine"
+    );
+  });
+
+  it("treats a capitalized effective Whisper engine as Whisper", async () => {
+    const result = await runModelCheck({
+      health: {
+        ok: true,
+        data: { effective_engine: "Whisper", model: "medium", items: [missingItem] },
+      },
     });
 
     expect(result.setups).toEqual(["medium"]);
   });
 
-  it("keeps the zero-touch tiny download when no Whisper model is configured", async () => {
+  it("uses the reported model as the only mutation path for an existing config", async () => {
     const result = await runModelCheck({
-      health: { ok: true, data: { engine: "whisper", items: [missingItem] } },
-      configuredModel: null,
+      health: {
+        ok: true,
+        data: { effective_engine: "whisper", model: "large-v3", items: [missingItem] },
+      },
+      configExists: true,
     });
 
-    expect(result.setups).toEqual(["tiny"]);
+    expect(result.setups).toEqual(["large-v3"]);
   });
 
-  it("fails safe without setup when health output is unparsable", async () => {
-    const result = await runModelCheck({ health: "not json" });
+  it("does not mutate an existing config when an old CLI omits the model", async () => {
+    const result = await runModelCheck({
+      health: { ok: true, data: { engine: "whisper", items: [missingItem] } },
+      configExists: true,
+    });
 
     expect(result.setups).toEqual([]);
     expect(result.logs).toContain(
-      "[Minutes] Unrecognized health --json output — skipping Whisper auto-setup"
+      "[Minutes] config exists but this CLI does not report the configured model; run `minutes setup --model <your model>` or upgrade the CLI"
     );
-    expect(result.logs).toHaveLength(1);
   });
 
-  it("extracts health items and engine from both supported JSON shapes", () => {
-    expect(parseHealthOutput(JSON.stringify([readyItem]))).toEqual({ items: [readyItem] });
-    expect(
-      parseHealthOutput(
-        JSON.stringify({ data: { engine: "whisper", items: [missingItem] } })
-      )
-    ).toEqual({ items: [missingItem], engine: "whisper" });
-    expect(parseHealthOutput(JSON.stringify({ data: { items: [missingItem] } }))).toEqual({
-      items: null,
+  it("keeps zero-touch tiny setup for an old CLI on a fresh machine", async () => {
+    const result = await runModelCheck({
+      health: { ok: true, data: { engine: "whisper", items: [missingItem] } },
+      configExists: false,
     });
-  });
 
-  it("reads only the model in the transcription TOML section", () => {
-    expect(
-      parseConfiguredTranscriptionModel(
-        '[dictation]\nmodel = "small"\n\n[transcription]\nmodel = "medium" # keep quality\n'
-      )
-    ).toBe("medium");
+    expect(result.setups).toEqual(["tiny"]);
   });
 });
 
