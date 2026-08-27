@@ -2444,41 +2444,181 @@ async function checkCliVersion(): Promise<void> {
   }
 }
 
-// ── Auto-setup: download whisper model if missing ───────────
-// Recording needs a whisper model (~75MB for tiny). If the CLI is
-// available but the model isn't downloaded, trigger setup automatically
-// in the background so the first "start recording" just works.
+// ── Auto-setup: download configured whisper model if missing ───────────
+// Whisper recording needs a model. If Whisper is configured but its model
+// isn't downloaded, trigger setup automatically in the background so the
+// first "start recording" just works without changing the user's choice.
 
 let modelCheckDone = false;
 
-async function ensureWhisperModel(): Promise<void> {
-  if (modelCheckDone) return;
-  modelCheckDone = true;
+export type HealthItem = {
+  label?: unknown;
+  state?: unknown;
+  [key: string]: unknown;
+};
 
+export type HealthOutput = {
+  items: HealthItem[] | null;
+  engine?: string;
+};
+
+function isHealthItem(value: unknown): value is HealthItem {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+export function parseHealthOutput(stdout: string): HealthOutput {
+  let parsed: unknown;
   try {
-    // health --json returns an array of { label, state, detail, optional } items.
-    // The "Speech model" item has state "ready" when downloaded.
-    const { stdout } = await execFileAsync(MINUTES_BIN, ["health", "--json"], { timeout: 10000, env: mcpCliChildEnv() });
-    const items = JSON.parse(stdout);
-    const modelItem = Array.isArray(items) && items.find((i: any) => i.label === "Speech model");
-    if (modelItem && modelItem.state === "ready") {
-      console.error("[Minutes] Whisper model ready");
-      return;
-    }
+    parsed = JSON.parse(stdout);
   } catch {
-    // health command may not exist in older CLI versions — fall through to setup
+    return { items: null };
   }
 
-  // Model not found — download tiny model in background
-  console.error("[Minutes] Whisper model not found — downloading tiny model (~75MB)...");
+  if (Array.isArray(parsed)) {
+    return parsed.every(isHealthItem) ? { items: parsed } : { items: null };
+  }
+
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return { items: null };
+  }
+
+  const data = (parsed as Record<string, unknown>).data;
+  if (typeof data !== "object" || data === null || Array.isArray(data)) {
+    return { items: null };
+  }
+
+  const dataRecord = data as Record<string, unknown>;
+  const items = dataRecord.items;
+  if (
+    !Array.isArray(items) ||
+    !items.every(isHealthItem) ||
+    typeof dataRecord.engine !== "string"
+  ) {
+    return { items: null };
+  }
+
+  return {
+    items,
+    engine: dataRecord.engine,
+  };
+}
+
+export function parseConfiguredTranscriptionModel(configContent: string): string | null {
+  let inTranscriptionSection = false;
+  for (const line of configContent.split(/\r?\n/)) {
+    const section = line.match(/^\s*\[([^\]]+)\]\s*(?:#.*)?$/);
+    if (section) {
+      inTranscriptionSection = section[1].trim() === "transcription";
+      continue;
+    }
+    if (!inTranscriptionSection) continue;
+
+    const model = line.match(
+      /^\s*model\s*=\s*["']([^"'\r\n]+)["']\s*(?:#.*)?$/
+    )?.[1].trim();
+    if (model) return model;
+  }
+  return null;
+}
+
+async function readConfiguredTranscriptionModel(): Promise<string | null> {
+  const configRoot = process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
   try {
-    await execFileAsync(MINUTES_BIN, ["setup", "--model", "tiny"], { timeout: 300000, env: mcpCliChildEnv() });
-    console.error("[Minutes] ✓ Whisper tiny model downloaded — recording is ready");
-  } catch (e: any) {
-    console.error(
-      `[Minutes] Model download failed: ${e.message || e}. ` +
-      `Run manually: minutes setup --model tiny`
+    return parseConfiguredTranscriptionModel(
+      await readFile(join(configRoot, "minutes", "config.toml"), "utf8")
     );
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+type WhisperModelCheckState = { done: boolean };
+
+export type EnsureWhisperModelOptions = {
+  checkState?: WhisperModelCheckState;
+  health?: () => Promise<string>;
+  readConfiguredModel?: () => Promise<string | null>;
+  setup?: (model: string) => Promise<void>;
+  log?: (message: string) => void;
+};
+
+export async function ensureWhisperModel(
+  options: EnsureWhisperModelOptions = {}
+): Promise<void> {
+  const checkState = options.checkState;
+  if (checkState ? checkState.done : modelCheckDone) return;
+  if (checkState) checkState.done = true;
+  else modelCheckDone = true;
+
+  const log = options.log ?? ((message: string) => console.error(message));
+  const health = options.health ?? (async () => {
+    const { stdout } = await execFileAsync(MINUTES_BIN, ["health", "--json"], {
+      timeout: 10000,
+      env: mcpCliChildEnv(),
+    });
+    return stdout;
+  });
+  const setup = options.setup ?? (async (model: string) => {
+    await execFileAsync(MINUTES_BIN, ["setup", "--model", model], {
+      timeout: 300000,
+      env: mcpCliChildEnv(),
+    });
+  });
+  const readConfiguredModel =
+    options.readConfiguredModel ?? readConfiguredTranscriptionModel;
+
+  let healthOutput: HealthOutput;
+  try {
+    healthOutput = parseHealthOutput(await health());
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    log(
+      `[Minutes] Unable to check speech model status — skipping Whisper auto-setup: ${message}`
+    );
+    return;
+  }
+
+  if (healthOutput.items === null) {
+    log("[Minutes] Unrecognized health --json output — skipping Whisper auto-setup");
+    return;
+  }
+
+  const modelItem = healthOutput.items.find((item) => item.label === "Speech model");
+  if (modelItem?.state === "ready") {
+    log("[Minutes] Whisper model ready");
+    return;
+  }
+
+  if (healthOutput.engine !== undefined && healthOutput.engine !== "whisper") {
+    log(`[Minutes] Transcription engine is ${healthOutput.engine} — skipping Whisper auto-setup`);
+    return;
+  }
+
+  let configuredModel: string | null;
+  try {
+    configuredModel = await readConfiguredModel();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    log(
+      `[Minutes] Unable to read the configured transcription model — skipping Whisper auto-setup: ${message}`
+    );
+    return;
+  }
+
+  const model = configuredModel ?? "tiny";
+  if (configuredModel) {
+    log(`[Minutes] Whisper model ${model} is configured but not ready — downloading it...`);
+  } else {
+    log("[Minutes] No Whisper model is configured — downloading tiny model (~75MB)...");
+  }
+
+  try {
+    await setup(model);
+    log(`[Minutes] ✓ Whisper ${model} model downloaded — recording is ready`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    log(`[Minutes] Model download failed: ${message}. Run manually: minutes setup --model ${model}`);
   }
 }
 

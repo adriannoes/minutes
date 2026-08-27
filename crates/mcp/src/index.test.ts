@@ -110,6 +110,8 @@ import {
   parseCopilotStatusOutput,
   parseKnowledgeConfig,
   parseDictationModelMissingError,
+  parseConfiguredTranscriptionModel,
+  parseHealthOutput,
   parseMeetingsRootSnapshot,
   parseLiveEventsResourceUri,
   parsePolicyVerifiedMeeting,
@@ -128,6 +130,7 @@ import {
   readVerifiedScreenImage,
   createCapabilityRepairCoordinator,
   repairCliCapabilities,
+  ensureWhisperModel,
   researchTopicProjection,
   runAgentToolPolicies,
   stopCopilotBeforeStatusRead,
@@ -194,6 +197,106 @@ describe("dictation model preflight errors", () => {
 
   it("ignores unrelated startup errors", () => {
     expect(parseDictationModelMissingError("microphone permission denied")).toBeNull();
+  });
+});
+
+describe("Whisper model auto-setup", () => {
+  const readyItem = { label: "Speech model", state: "ready", detail: "medium" };
+  const missingItem = { label: "Speech model", state: "attention", detail: "missing" };
+
+  async function runModelCheck(input: {
+    health: unknown;
+    configuredModel?: string | null;
+  }): Promise<{ setups: string[]; logs: string[] }> {
+    const setups: string[] = [];
+    const logs: string[] = [];
+    await ensureWhisperModel({
+      checkState: { done: false },
+      health: async () =>
+        typeof input.health === "string" ? input.health : JSON.stringify(input.health),
+      readConfiguredModel: async () => input.configuredModel ?? null,
+      setup: async (model) => {
+        setups.push(model);
+      },
+      log: (message) => logs.push(message),
+    });
+    return { setups, logs };
+  }
+
+  it("parses the current health envelope and skips setup when the model is ready", async () => {
+    const result = await runModelCheck({
+      health: { ok: true, data: { engine: "whisper", items: [readyItem] } },
+    });
+
+    expect(result.setups).toEqual([]);
+    expect(result.logs).toContain("[Minutes] Whisper model ready");
+  });
+
+  it("keeps accepting the legacy bare health-item array", async () => {
+    const result = await runModelCheck({ health: [readyItem] });
+
+    expect(result.setups).toEqual([]);
+    expect(result.logs).toContain("[Minutes] Whisper model ready");
+  });
+
+  it("skips Whisper setup for a non-Whisper transcription engine", async () => {
+    const result = await runModelCheck({
+      health: { ok: true, data: { engine: "parakeet", items: [missingItem] } },
+      configuredModel: "medium",
+    });
+
+    expect(result.setups).toEqual([]);
+    expect(result.logs).toContain(
+      "[Minutes] Transcription engine is parakeet — skipping Whisper auto-setup"
+    );
+  });
+
+  it("downloads the configured Whisper model without downgrading it", async () => {
+    const result = await runModelCheck({
+      health: { ok: true, data: { engine: "whisper", items: [missingItem] } },
+      configuredModel: "medium",
+    });
+
+    expect(result.setups).toEqual(["medium"]);
+  });
+
+  it("keeps the zero-touch tiny download when no Whisper model is configured", async () => {
+    const result = await runModelCheck({
+      health: { ok: true, data: { engine: "whisper", items: [missingItem] } },
+      configuredModel: null,
+    });
+
+    expect(result.setups).toEqual(["tiny"]);
+  });
+
+  it("fails safe without setup when health output is unparsable", async () => {
+    const result = await runModelCheck({ health: "not json" });
+
+    expect(result.setups).toEqual([]);
+    expect(result.logs).toContain(
+      "[Minutes] Unrecognized health --json output — skipping Whisper auto-setup"
+    );
+    expect(result.logs).toHaveLength(1);
+  });
+
+  it("extracts health items and engine from both supported JSON shapes", () => {
+    expect(parseHealthOutput(JSON.stringify([readyItem]))).toEqual({ items: [readyItem] });
+    expect(
+      parseHealthOutput(
+        JSON.stringify({ data: { engine: "whisper", items: [missingItem] } })
+      )
+    ).toEqual({ items: [missingItem], engine: "whisper" });
+    expect(parseHealthOutput(JSON.stringify({ data: { items: [missingItem] } }))).toEqual({
+      items: null,
+    });
+  });
+
+  it("reads only the model in the transcription TOML section", () => {
+    expect(
+      parseConfiguredTranscriptionModel(
+        '[dictation]\nmodel = "small"\n\n[transcription]\nmodel = "medium" # keep quality\n'
+      )
+    ).toBe("medium");
   });
 });
 
