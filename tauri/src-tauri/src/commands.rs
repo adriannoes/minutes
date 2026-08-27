@@ -1934,12 +1934,12 @@ fn is_assistant_instruction_file(path: &Path) -> bool {
 /// upcoming meeting as "prepped"; the Documents list did not, so a brief the
 /// assistant had just written was invisible in the sidebar -- and no restart
 /// would surface it, because the folder was never a scan root.
-fn append_prep_documents(
+fn append_prep_documents_from(
     documents: &mut Vec<DocumentView>,
     seen: &mut std::collections::HashSet<PathBuf>,
+    preps_dir: &Path,
 ) {
-    let preps_dir = Config::minutes_dir().join("preps");
-    let Ok(entries) = std::fs::read_dir(&preps_dir) else {
+    let Ok(entries) = std::fs::read_dir(preps_dir) else {
         return;
     };
     for entry in entries.flatten() {
@@ -2088,6 +2088,23 @@ fn list_documents_for_roots_with_recent_state(
     limit: usize,
     recent_state_path: &Path,
 ) -> Vec<DocumentView> {
+    let preps_dir = Config::minutes_dir().join("preps");
+    list_documents_for_roots_with_recent_state_and_preps(
+        config,
+        assistant_dir,
+        limit,
+        recent_state_path,
+        &preps_dir,
+    )
+}
+
+fn list_documents_for_roots_with_recent_state_and_preps(
+    config: &Config,
+    assistant_dir: &Path,
+    limit: usize,
+    recent_state_path: &Path,
+    preps_dir: &Path,
+) -> Vec<DocumentView> {
     let mut documents = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
@@ -2105,7 +2122,7 @@ fn list_documents_for_roots_with_recent_state(
     }
 
     append_assistant_documents(&mut documents, &mut seen, assistant_dir);
-    append_prep_documents(&mut documents, &mut seen);
+    append_prep_documents_from(&mut documents, &mut seen, preps_dir);
     documents.sort_by(|a, b| {
         b.mtime
             .cmp(&a.mtime)
@@ -3448,6 +3465,37 @@ impl Drop for LiveTranscriptStopGuard {
     }
 }
 
+/// Keep Recall's live-transcript instructions aligned with a native call
+/// recording. The generic microphone recording path already updates this
+/// context, but native ScreenCaptureKit capture returns through a separate
+/// function and previously skipped the marker entirely.
+#[cfg(target_os = "macos")]
+struct AssistantLiveContextGuard(Option<PathBuf>);
+
+#[cfg(target_os = "macos")]
+impl AssistantLiveContextGuard {
+    fn start(config: &Config, live_transcript_started: bool) -> Self {
+        if !live_transcript_started {
+            return Self(None);
+        }
+
+        let workspace = crate::context::create_workspace(config).ok();
+        if let Some(workspace) = workspace.as_deref() {
+            update_assistant_live_context(workspace, true);
+        }
+        Self(workspace)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for AssistantLiveContextGuard {
+    fn drop(&mut self) {
+        if let Some(workspace) = self.0.as_deref() {
+            update_assistant_live_context(workspace, false);
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 fn start_native_call_recording(
@@ -3594,6 +3642,8 @@ fn start_native_call_recording(
             _ => false,
         }
     };
+    let _assistant_live_context_guard =
+        AssistantLiveContextGuard::start(config, live_transcript_started);
 
     let mut capabilities = vec![
         "native-call.capture".to_string(),
@@ -15337,8 +15387,7 @@ mod tests {
     fn update_assistant_live_context_updates_both_instruction_files() {
         let temp = TempDir::new().unwrap();
         let workspace = temp.path();
-        std::fs::write(workspace.join("CLAUDE.md"), "# Minutes Assistant\n").unwrap();
-        std::fs::write(workspace.join("AGENTS.md"), "# Minutes Assistant\n").unwrap();
+        crate::context::write_deferred_assistant_context(workspace).unwrap();
 
         update_assistant_live_context(workspace, true);
 
@@ -15346,6 +15395,14 @@ mod tests {
         let agents = std::fs::read_to_string(workspace.join("AGENTS.md")).unwrap();
         assert!(claude.contains("## Live Transcript Active"));
         assert!(agents.contains("## Live Transcript Active"));
+        assert!(claude.contains("gates stored meeting context, not an active live transcript"));
+        assert!(agents.contains("gates stored meeting context, not an active live transcript"));
+        assert!(
+            claude.contains("read this live transcript even when `CURRENT_MEETING.md` is absent")
+        );
+        assert!(
+            agents.contains("read this live transcript even when `CURRENT_MEETING.md` is absent")
+        );
 
         update_assistant_live_context(workspace, false);
 
@@ -15353,6 +15410,8 @@ mod tests {
         let agents = std::fs::read_to_string(workspace.join("AGENTS.md")).unwrap();
         assert!(!claude.contains("## Live Transcript Active"));
         assert!(!agents.contains("## Live Transcript Active"));
+        assert!(claude.contains("## Deferred meeting context"));
+        assert!(agents.contains("## Deferred meeting context"));
     }
 
     /// Arms that have no current caller but are deliberately kept pending a
@@ -18126,9 +18185,11 @@ mod tests {
         let assistant = temp.path().join("assistant");
         let assistant_artifacts = assistant.join("artifacts");
         let meetings = temp.path().join("meetings");
+        let preps = temp.path().join("preps");
         let state_path = temp.path().join("recent-artifacts.json");
         std::fs::create_dir_all(&assistant_artifacts).unwrap();
         std::fs::create_dir_all(&meetings).unwrap();
+        std::fs::create_dir_all(&preps).unwrap();
 
         let older = assistant.join("prep.md");
         std::fs::write(&older, "# Prep").unwrap();
@@ -18155,8 +18216,13 @@ mod tests {
         };
         record_recent_artifact_canonical_with_limit(&meeting, 8, &state_path);
 
-        let docs =
-            list_documents_for_roots_with_recent_state(&config, &assistant, 200, &state_path);
+        let docs = list_documents_for_roots_with_recent_state_and_preps(
+            &config,
+            &assistant,
+            200,
+            &state_path,
+            &preps,
+        );
         let names: Vec<_> = docs.iter().map(|doc| doc.filename.as_str()).collect();
 
         assert_eq!(names.len(), 3);
@@ -18167,8 +18233,13 @@ mod tests {
         assert!(!names.contains(&"outside-secret.md"));
         assert!(!names.contains(&"linked-secret.md"));
 
-        let capped =
-            list_documents_for_roots_with_recent_state(&config, &assistant, 2, &state_path);
+        let capped = list_documents_for_roots_with_recent_state_and_preps(
+            &config,
+            &assistant,
+            2,
+            &state_path,
+            &preps,
+        );
         let capped_names: Vec<_> = capped.iter().map(|doc| doc.filename.as_str()).collect();
         assert_eq!(
             capped_names,
@@ -18198,11 +18269,12 @@ mod tests {
             let non_utf8_path = assistant.join(non_utf8_name);
             match std::fs::write(&non_utf8_path, "# Non UTF-8") {
                 Ok(()) => {
-                    let docs = list_documents_for_roots_with_recent_state(
+                    let docs = list_documents_for_roots_with_recent_state_and_preps(
                         &config,
                         &assistant,
                         200,
                         &state_path,
+                        &preps,
                     );
                     assert!(docs
                         .iter()
@@ -21307,6 +21379,11 @@ fn update_assistant_live_context_file(path: &std::path::Path, live_active: bool)
             ## Live Transcript Active\n\
             \n\
             A live meeting transcript is being recorded right now.\n\
+            \n\
+            This section is exact-session live evidence. When the user explicitly asks about the \
+            current call, read this live transcript even when `CURRENT_MEETING.md` is absent. The \
+            missing file means stored meeting metadata and verified speaker identities are \
+            unavailable; it does not block bounded live-transcript coaching.\n\
             \n\
             **JSONL file:** `{path}`\n\
             \n\

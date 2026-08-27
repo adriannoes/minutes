@@ -2999,6 +2999,7 @@ fn run_sidecar_inner_mpsc(
         .as_ref()
         .map(|_| RecordingDraftGate::new(config));
     let mut last_draft_text = String::new();
+    let mut input_disconnected_unexpectedly = false;
 
     tracing::info!(
         current_speech_drafts = partial_publisher.is_some(),
@@ -3059,6 +3060,7 @@ fn run_sidecar_inner_mpsc(
             Ok(s) => s,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                input_disconnected_unexpectedly = !stop_flag.load(Ordering::Relaxed);
                 draft_jobs.clear();
                 if let (Some(gate), Some(publisher)) =
                     (draft_gate.as_mut(), partial_publisher.as_mut())
@@ -3117,8 +3119,6 @@ fn run_sidecar_inner_mpsc(
         Some(w) => w.finalize(),
         None => (0, 0.0, PathBuf::new()),
     };
-    // Clean up status file so session_status() doesn't report stale data
-    clear_status_file();
     tracing::info!(
         vad_mode = vad.mode_name(),
         samples_fed = gating_stats.samples_fed,
@@ -3144,6 +3144,19 @@ fn run_sidecar_inner_mpsc(
         draft_results_replaced = draft_results.replaced.load(Ordering::Relaxed),
         "live sidecar ended (recording mode)"
     );
+
+    if input_disconnected_unexpectedly {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "live transcript audio feeder disconnected while recording was still active",
+        )
+        .into());
+    }
+
+    // A normal recording stop should not leave stale sidecar state. Unexpected
+    // disconnects return an error above so the outer boundary can persist a
+    // Failed status and diagnostic instead of erasing the evidence.
+    clear_status_file();
 
     Ok(())
 }
@@ -4790,6 +4803,42 @@ mod tests {
         assert!(!status.active);
         assert_eq!(status.source, None);
         assert_eq!(status.diagnostic.as_deref(), Some("sidecar failed"));
+    }
+
+    #[cfg(feature = "whisper")]
+    #[test]
+    fn unexpected_sidecar_input_disconnect_preserves_failure_diagnostic() {
+        with_temp_home(|| {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(1);
+            drop(tx);
+            let stop = Arc::new(AtomicBool::new(false));
+
+            run_sidecar_mpsc(rx, stop, &Config::default(), None);
+
+            let status = read_live_status(&pid::live_transcript_status_path())
+                .expect("unexpected disconnect should leave a status file");
+            assert_eq!(status.state, LiveStatusState::Failed);
+            assert!(status.diagnostic.as_deref().is_some_and(|message| {
+                message.contains("audio feeder disconnected while recording was still active")
+            }));
+        });
+    }
+
+    #[cfg(feature = "whisper")]
+    #[test]
+    fn expected_sidecar_stop_clears_status_file() {
+        with_temp_home(|| {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(1);
+            drop(tx);
+            let stop = Arc::new(AtomicBool::new(true));
+
+            run_sidecar_mpsc(rx, stop, &Config::default(), None);
+
+            assert!(
+                !pid::live_transcript_status_path().exists(),
+                "a normal recording stop must not leave stale sidecar state"
+            );
+        });
     }
 
     #[cfg(all(feature = "whisper", feature = "streaming"))]
