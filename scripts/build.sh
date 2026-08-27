@@ -148,10 +148,18 @@ from pathlib import Path
 print(json.loads(Path("tauri/src-tauri/tauri.conf.json").read_text())["version"])
 PY
 )"
+# Local installs treat the DMG window cosmetics as best-effort: a Finder
+# AppleEvent failure must not block installing the app that was just built.
+# The ${arr[@]+...} guard keeps set -u happy on the bash 3.2 macOS ships.
+DMG_LAYOUT_ARGS=()
+if [[ " $* " == *" --install "* ]]; then
+    DMG_LAYOUT_ARGS=(--layout-best-effort)
+fi
 ./scripts/create-branded-dmg.sh \
     --app target/release/bundle/macos/Minutes.app \
     --version "$APP_VERSION" \
-    --output "target/release/bundle/dmg/Minutes_${APP_VERSION}_aarch64.dmg"
+    --output "target/release/bundle/dmg/Minutes_${APP_VERSION}_aarch64.dmg" \
+    ${DMG_LAYOUT_ARGS[@]+"${DMG_LAYOUT_ARGS[@]}"}
 
 echo "=== Signing + Installing CLI ==="
 mkdir -p ~/.local/bin

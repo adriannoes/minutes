@@ -8,18 +8,23 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: scripts/create-branded-dmg.sh --app <application.app> --version <x.y.z> --output <path.dmg>
+Usage: scripts/create-branded-dmg.sh --app <application.app> --version <x.y.z> --output <path.dmg> [--layout-best-effort]
 
 Creates a signed-app installer DMG with:
   - the supplied application on the left
   - /Applications symlink on the right
   - the generated Minutes DMG background
+
+With --layout-best-effort, a failure in the Finder window-layout step is a
+warning instead of an error: the DMG is still produced, just without the
+arranged window. Local installs pass this; release packaging does not.
 EOF
 }
 
 APP_PATH=""
 VERSION=""
 OUTPUT_PATH=""
+LAYOUT_BEST_EFFORT=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -34,6 +39,10 @@ while [[ $# -gt 0 ]]; do
     --output)
       OUTPUT_PATH="$2"
       shift 2
+      ;;
+    --layout-best-effort)
+      LAYOUT_BEST_EFFORT=1
+      shift
       ;;
     -h|--help)
       usage
@@ -165,7 +174,7 @@ if command -v SetFile >/dev/null 2>&1; then
 fi
 chflags hidden "$MOUNT_DIR/.background" "$MOUNT_DIR/.VolumeIcon.icns" || true
 
-osascript - "$MOUNT_DIR" "$APP_NAME" <<'APPLESCRIPT'
+if ! osascript - "$MOUNT_DIR" "$APP_NAME" <<'APPLESCRIPT'
 on run argv
   set mountPath to item 1 of argv
   set appName to item 2 of argv
@@ -194,6 +203,14 @@ on run argv
   end tell
 end run
 APPLESCRIPT
+then
+  if [[ "$LAYOUT_BEST_EFFORT" -eq 1 ]]; then
+    echo "Finder window layout failed; continuing without DMG cosmetics (--layout-best-effort)." >&2
+  else
+    echo "Finder window layout failed." >&2
+    exit 1
+  fi
+fi
 
 echo "Flushing Finder metadata..."
 sync
