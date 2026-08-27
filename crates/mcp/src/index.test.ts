@@ -110,6 +110,7 @@ import {
   parseCopilotStatusOutput,
   parseKnowledgeConfig,
   parseDictationModelMissingError,
+  parseHealthOutput,
   parseMeetingsRootSnapshot,
   parseLiveEventsResourceUri,
   parsePolicyVerifiedMeeting,
@@ -128,6 +129,7 @@ import {
   readVerifiedScreenImage,
   createCapabilityRepairCoordinator,
   repairCliCapabilities,
+  ensureWhisperModel,
   researchTopicProjection,
   runAgentToolPolicies,
   stopCopilotBeforeStatusRead,
@@ -194,6 +196,200 @@ describe("dictation model preflight errors", () => {
 
   it("ignores unrelated startup errors", () => {
     expect(parseDictationModelMissingError("microphone permission denied")).toBeNull();
+  });
+});
+
+describe("Whisper model auto-setup", () => {
+  const readyItem = { label: "Speech model", state: "ready", detail: "medium" };
+  const missingItem = { label: "Speech model", state: "attention", detail: "missing" };
+
+  async function runModelCheck(input: {
+    health: unknown;
+    configExists?: boolean;
+  }): Promise<{ setups: string[]; logs: string[] }> {
+    const setups: string[] = [];
+    const logs: string[] = [];
+    await ensureWhisperModel({
+      checkState: { done: false },
+      health: async () => {
+        if (input.health instanceof Error) throw input.health;
+        return typeof input.health === "string"
+          ? input.health
+          : JSON.stringify(input.health);
+      },
+      configFileExists: async () => input.configExists ?? false,
+      setup: async (model) => {
+        setups.push(model);
+      },
+      log: (message) => logs.push(message),
+    });
+    return { setups, logs };
+  }
+
+  it("parses legacy and current health output shapes", () => {
+    expect(parseHealthOutput(JSON.stringify([readyItem]))).toEqual({
+      ok: true,
+      items: [readyItem],
+    });
+    expect(
+      parseHealthOutput(
+        JSON.stringify({
+          ok: true,
+          data: {
+            engine: "parakeet",
+            effective_engine: "whisper",
+            model: "small",
+            items: [missingItem],
+          },
+        })
+      )
+    ).toEqual({
+      ok: true,
+      items: [missingItem],
+      engine: "parakeet",
+      effectiveEngine: "whisper",
+      model: "small",
+    });
+  });
+
+  it.each([
+    ["a failed health command", new Error("health failed")],
+    ["an ok:false envelope", { ok: false, data: { items: [missingItem] } }],
+    ["invalid health items", { ok: true, data: { items: ["invalid"] } }],
+  ])("fails closed for %s", async (_label, health) => {
+    const result = await runModelCheck({ health });
+
+    expect(result.setups).toEqual([]);
+    expect(result.logs).toHaveLength(1);
+  });
+
+  it.each([
+    ["an empty legacy array", []],
+    ["an array without the speech model item", [{ label: "CLI", state: "ready" }]],
+  ])("fails closed for %s", async (_label, health) => {
+    const result = await runModelCheck({ health });
+
+    expect(result.setups).toEqual([]);
+    expect(result.logs).toContain(
+      "[Minutes] unrecognized health items — skipping Whisper auto-setup"
+    );
+  });
+
+  it("skips setup when the speech model is ready", async () => {
+    const result = await runModelCheck({
+      health: { ok: true, data: { engine: "whisper", items: [readyItem] } },
+    });
+
+    expect(result.setups).toEqual([]);
+    expect(result.logs).toContain("[Minutes] Whisper model ready");
+  });
+
+  it("keeps accepting the legacy bare health-item array", async () => {
+    const result = await runModelCheck({ health: [readyItem] });
+
+    expect(result.setups).toEqual([]);
+    expect(result.logs).toContain("[Minutes] Whisper model ready");
+  });
+
+  it("fails closed for an unknown speech model state", async () => {
+    const result = await runModelCheck({
+      health: {
+        ok: true,
+        data: { engine: "whisper", items: [{ ...missingItem, state: "unknown" }] },
+      },
+    });
+
+    expect(result.setups).toEqual([]);
+    expect(result.logs).toContain(
+      "[Minutes] Speech model health state is unknown — skipping Whisper auto-setup"
+    );
+  });
+
+  it("uses the effective engine and reported model when configured parakeet resolves to Whisper", async () => {
+    const result = await runModelCheck({
+      health: {
+        ok: true,
+        data: {
+          engine: "parakeet",
+          effective_engine: "whisper",
+          model: "small",
+          items: [missingItem],
+        },
+      },
+    });
+
+    expect(result.setups).toEqual(["small"]);
+  });
+
+  it("skips setup when the effective engine is non-Whisper", async () => {
+    const result = await runModelCheck({
+      health: {
+        ok: true,
+        data: {
+          engine: "parakeet",
+          effective_engine: "parakeet",
+          items: [missingItem],
+        },
+      },
+    });
+
+    expect(result.setups).toEqual([]);
+    expect(result.logs.join("\n")).toContain("skipping Whisper auto-setup");
+  });
+
+  it("conservatively skips an old CLI non-Whisper engine with upgrade guidance", async () => {
+    const result = await runModelCheck({
+      health: { ok: true, data: { engine: "parakeet", items: [missingItem] } },
+    });
+
+    expect(result.setups).toEqual([]);
+    expect(result.logs.join("\n")).toContain(
+      "upgrade the CLI to let auto-setup resolve the effective engine"
+    );
+  });
+
+  it("treats a capitalized effective Whisper engine as Whisper", async () => {
+    const result = await runModelCheck({
+      health: {
+        ok: true,
+        data: { effective_engine: "Whisper", model: "medium", items: [missingItem] },
+      },
+    });
+
+    expect(result.setups).toEqual(["medium"]);
+  });
+
+  it("uses the reported model as the only mutation path for an existing config", async () => {
+    const result = await runModelCheck({
+      health: {
+        ok: true,
+        data: { effective_engine: "whisper", model: "large-v3", items: [missingItem] },
+      },
+      configExists: true,
+    });
+
+    expect(result.setups).toEqual(["large-v3"]);
+  });
+
+  it("does not mutate an existing config when an old CLI omits the model", async () => {
+    const result = await runModelCheck({
+      health: { ok: true, data: { engine: "whisper", items: [missingItem] } },
+      configExists: true,
+    });
+
+    expect(result.setups).toEqual([]);
+    expect(result.logs).toContain(
+      "[Minutes] config exists but this CLI does not report the configured model; run `minutes setup --model <your model>` or upgrade the CLI"
+    );
+  });
+
+  it("keeps zero-touch tiny setup for an old CLI on a fresh machine", async () => {
+    const result = await runModelCheck({
+      health: { ok: true, data: { engine: "whisper", items: [missingItem] } },
+      configExists: false,
+    });
+
+    expect(result.setups).toEqual(["tiny"]);
   });
 });
 

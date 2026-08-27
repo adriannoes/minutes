@@ -488,6 +488,12 @@ pub(crate) fn effective_batch_engine(config: &Config) -> &str {
     }
 }
 
+/// Return the transcription engine that batch/default transcription will
+/// actually use after resolving unavailable or unsupported configured engines.
+pub fn effective_transcription_engine(config: &Config) -> &str {
+    effective_batch_engine(config)
+}
+
 #[cfg(feature = "parakeet")]
 const PARAKEET_LONG_AUDIO_CHUNK_THRESHOLD_SECS: f64 = 60.0;
 #[cfg(feature = "parakeet")]
@@ -4335,6 +4341,21 @@ mod tests {
             ChunkTranscriptionStrategy::DispatchPerChunk
         };
         assert_eq!(chunk_transcription_strategy(&config), expected);
+    }
+
+    #[test]
+    #[cfg(not(feature = "parakeet"))]
+    fn effective_transcription_engine_reports_resolved_engine() {
+        let mut config = Config::default();
+
+        config.transcription.engine = "parakeet".into();
+        assert_eq!(effective_transcription_engine(&config), "whisper");
+
+        config.transcription.engine = "whisper".into();
+        assert_eq!(effective_transcription_engine(&config), "whisper");
+
+        config.transcription.engine = "WHISPER".into();
+        assert_eq!(effective_transcription_engine(&config), "WHISPER");
     }
 
     #[test]
