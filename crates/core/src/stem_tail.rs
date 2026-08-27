@@ -234,6 +234,24 @@ const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250)
 /// so this only has to outlast process startup.
 const HEADER_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Give the sibling stem a brief chance to publish its header after the first
+/// source becomes usable. The native helper normally creates both together,
+/// but their first writes can race. After this grace period, start with the
+/// usable source instead of sacrificing the entire live transcript.
+const SIBLING_STEM_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// If one opened stem stops producing frames while its sibling advances, do
+/// not let the stalled source block the healthy source forever. This also
+/// covers a header-only microphone stem when macOS grants capture but delivers
+/// no microphone frames.
+const STEM_STALL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StalledSource {
+    Voice,
+    System,
+}
+
 /// Feed the live-transcription sidecar from native call-capture stems.
 ///
 /// Native capture writes audio to WAV stems rather than handing samples to the
@@ -279,38 +297,103 @@ pub fn spawn_live_transcription_from_stems(
     }
 }
 
-/// Open both stems, then forward mixed audio until asked to stop.
+/// Open whichever stems are usable, then forward audio until asked to stop.
 fn feed_from_stems(
     voice_stem: PathBuf,
     system_stem: Option<PathBuf>,
     live_tx: &std::sync::mpsc::SyncSender<Vec<f32>>,
     stop_flag: &Arc<AtomicBool>,
 ) {
-    let Some(mut voice) = wait_for_stem(&voice_stem, stop_flag) else {
+    let Some((mut voice, mut system)) = wait_for_stems(
+        &voice_stem,
+        system_stem.as_deref(),
+        stop_flag,
+        SIBLING_STEM_GRACE,
+    ) else {
         return;
     };
-    let mut system = system_stem
-        .as_deref()
-        .and_then(|path| wait_for_stem(path, stop_flag));
+    let mut has_voice = voice.is_some();
+    let mut has_system = system.is_some();
+
+    if !has_voice {
+        tracing::warn!(
+            stem = %voice_stem.display(),
+            "voice stem unavailable; live transcript is using system audio only"
+        );
+    }
+    if let Some(system_stem) = system_stem.as_deref().filter(|_| !has_system) {
+        tracing::warn!(
+            stem = %system_stem.display(),
+            "system stem unavailable; live transcript is using voice audio only"
+        );
+    }
 
     // Per-stem residue: the stems advance independently, so each round mixes the
     // overlapping prefix and keeps the rest for the next one.
     let mut voice_pending: Vec<f32> = Vec::new();
     let mut system_pending: Vec<f32> = Vec::new();
+    let started_at = std::time::Instant::now();
+    let mut voice_last_progress = started_at;
+    let mut system_last_progress = started_at;
 
     while !stop_flag.load(Ordering::Relaxed) {
-        match voice.poll() {
-            Ok(samples) => voice_pending.extend_from_slice(&samples),
-            Err(error) => tracing::debug!(%error, "voice stem poll failed; continuing"),
+        if let Some(voice) = voice.as_mut() {
+            match voice.poll() {
+                Ok(samples) => {
+                    if !samples.is_empty() {
+                        voice_last_progress = std::time::Instant::now();
+                        voice_pending.extend_from_slice(&samples);
+                    }
+                }
+                Err(error) => tracing::debug!(%error, "voice stem poll failed; continuing"),
+            }
         }
         if let Some(system) = system.as_mut() {
             match system.poll() {
-                Ok(samples) => system_pending.extend_from_slice(&samples),
+                Ok(samples) => {
+                    if !samples.is_empty() {
+                        system_last_progress = std::time::Instant::now();
+                        system_pending.extend_from_slice(&samples);
+                    }
+                }
                 Err(error) => tracing::debug!(%error, "system stem poll failed; continuing"),
             }
         }
 
-        let chunk = take_mixed(&mut voice_pending, &mut system_pending, system.is_some());
+        let now = std::time::Instant::now();
+        match stalled_source_to_drop(
+            has_voice,
+            has_system,
+            voice_pending.len(),
+            system_pending.len(),
+            now.duration_since(voice_last_progress),
+            now.duration_since(system_last_progress),
+        ) {
+            Some(StalledSource::Voice) => {
+                has_voice = false;
+                voice = None;
+                voice_pending.clear();
+                tracing::warn!(
+                    "voice stem stopped producing frames; live transcript is continuing with system audio only"
+                );
+            }
+            Some(StalledSource::System) => {
+                has_system = false;
+                system = None;
+                system_pending.clear();
+                tracing::warn!(
+                    "system stem stopped producing frames; live transcript is continuing with voice audio only"
+                );
+            }
+            None => {}
+        }
+
+        let chunk = take_audio(
+            &mut voice_pending,
+            &mut system_pending,
+            has_voice,
+            has_system,
+        );
         if !chunk.is_empty() && live_tx.send(chunk).is_err() {
             // The sidecar is gone; nothing left to feed.
             return;
@@ -320,27 +403,49 @@ fn feed_from_stems(
     }
 
     // Final sweep so the tail of the call is not lost to the stop race.
-    if let Ok(samples) = voice.poll() {
-        voice_pending.extend_from_slice(&samples);
+    if let Some(voice) = voice.as_mut() {
+        if let Ok(samples) = voice.poll() {
+            voice_pending.extend_from_slice(&samples);
+        }
     }
     if let Some(system) = system.as_mut() {
         if let Ok(samples) = system.poll() {
             system_pending.extend_from_slice(&samples);
         }
     }
-    let tail = take_mixed(&mut voice_pending, &mut system_pending, system.is_some());
+    let mut tail = take_audio(
+        &mut voice_pending,
+        &mut system_pending,
+        has_voice,
+        has_system,
+    );
+    // At stop there will be no later sibling frames to align with, so preserve
+    // the longer stem's remaining suffix instead of silently discarding it.
+    // One of these buffers is empty after `take_audio` mixes the overlap.
+    tail.extend(std::mem::take(&mut voice_pending));
+    tail.extend(std::mem::take(&mut system_pending));
     if !tail.is_empty() {
         let _ = live_tx.send(tail);
     }
 }
 
-/// Mix the overlapping prefix of both stems, leaving any surplus buffered.
+/// Return audio for the selected source plan.
 ///
-/// With no system stem the voice audio passes through untouched. Sums are
-/// clamped rather than scaled so a quiet side is not attenuated by a loud one.
-fn take_mixed(voice: &mut Vec<f32>, system: &mut Vec<f32>, has_system: bool) -> Vec<f32> {
-    if !has_system {
-        return std::mem::take(voice);
+/// A single usable stem passes through untouched. With both stems, mix only
+/// their overlapping prefix and buffer any surplus so the sources stay
+/// aligned. Sums are clamped rather than scaled so a quiet side is not
+/// attenuated by a loud one.
+fn take_audio(
+    voice: &mut Vec<f32>,
+    system: &mut Vec<f32>,
+    has_voice: bool,
+    has_system: bool,
+) -> Vec<f32> {
+    match (has_voice, has_system) {
+        (true, false) => return std::mem::take(voice),
+        (false, true) => return std::mem::take(system),
+        (false, false) => return Vec::new(),
+        (true, true) => {}
     }
     let n = voice.len().min(system.len());
     if n == 0 {
@@ -354,21 +459,75 @@ fn take_mixed(voice: &mut Vec<f32>, system: &mut Vec<f32>, has_system: bool) -> 
     mixed
 }
 
-/// Wait for a stem to exist and carry a parseable header.
-fn wait_for_stem(path: &Path, stop_flag: &Arc<AtomicBool>) -> Option<StemTail> {
+fn stalled_source_to_drop(
+    has_voice: bool,
+    has_system: bool,
+    voice_pending: usize,
+    system_pending: usize,
+    voice_idle: std::time::Duration,
+    system_idle: std::time::Duration,
+) -> Option<StalledSource> {
+    if !(has_voice && has_system) {
+        return None;
+    }
+    if voice_pending == 0 && system_pending > 0 && voice_idle >= STEM_STALL_GRACE {
+        return Some(StalledSource::Voice);
+    }
+    if system_pending == 0 && voice_pending > 0 && system_idle >= STEM_STALL_GRACE {
+        return Some(StalledSource::System);
+    }
+    None
+}
+
+/// Wait for at least one stem to exist and carry a parseable header.
+///
+/// Voice and system are probed in parallel. Once either is ready, the sibling
+/// gets a short grace period to avoid dropping one side because of a startup
+/// race. A missing voice stem must not suppress healthy system audio.
+fn wait_for_stems(
+    voice_path: &Path,
+    system_path: Option<&Path>,
+    stop_flag: &Arc<AtomicBool>,
+    sibling_grace: std::time::Duration,
+) -> Option<(Option<StemTail>, Option<StemTail>)> {
     let deadline = std::time::Instant::now() + HEADER_WAIT;
+    let mut voice = None;
+    let mut system = None;
+    let mut first_ready_at = None;
+
     while std::time::Instant::now() < deadline {
         if stop_flag.load(Ordering::Relaxed) {
             return None;
         }
-        match StemTail::open(path) {
-            Ok(tail) => return Some(tail),
-            Err(_) => std::thread::sleep(POLL_INTERVAL),
+
+        if voice.is_none() {
+            voice = StemTail::open(voice_path).ok();
         }
+        if system.is_none() {
+            system = system_path.and_then(|path| StemTail::open(path).ok());
+        }
+
+        let any_ready = voice.is_some() || system.is_some();
+        let all_expected_ready = voice.is_some() && (system_path.is_none() || system.is_some());
+        if all_expected_ready {
+            return Some((voice, system));
+        }
+        if any_ready {
+            let ready_at = first_ready_at.get_or_insert_with(std::time::Instant::now);
+            if ready_at.elapsed() >= sibling_grace {
+                return Some((voice, system));
+            }
+        }
+
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    if voice.is_some() || system.is_some() {
+        return Some((voice, system));
     }
     tracing::warn!(
-        stem = %path.display(),
-        "stem header never appeared; live transcript will not run for this capture"
+        voice_stem = %voice_path.display(),
+        system_stem = system_path.map(|path| path.display().to_string()),
+        "no usable stem header appeared; live transcript will not run for this capture"
     );
     None
 }
@@ -516,7 +675,7 @@ mod tests {
         let mut voice = vec![0.1, 0.2, 0.3];
         let mut system = vec![0.4];
 
-        let mixed = take_mixed(&mut voice, &mut system, true);
+        let mixed = take_audio(&mut voice, &mut system, true, true);
         assert_eq!(mixed.len(), 1, "only the overlapping prefix is emitted");
         assert!((mixed[0] - 0.5).abs() < 1e-6);
         assert_eq!(voice.len(), 2, "unmatched voice audio stays buffered");
@@ -527,9 +686,18 @@ mod tests {
     fn mixing_passes_voice_through_when_there_is_no_system_stem() {
         let mut voice = vec![0.1, 0.2];
         let mut system = Vec::new();
-        let out = take_mixed(&mut voice, &mut system, false);
+        let out = take_audio(&mut voice, &mut system, true, false);
         assert_eq!(out, vec![0.1, 0.2]);
         assert!(voice.is_empty(), "everything is consumed");
+    }
+
+    #[test]
+    fn mixing_passes_system_through_when_voice_is_unavailable() {
+        let mut voice = Vec::new();
+        let mut system = vec![0.3, 0.4];
+        let out = take_audio(&mut voice, &mut system, false, true);
+        assert_eq!(out, vec![0.3, 0.4]);
+        assert!(system.is_empty(), "everything is consumed");
     }
 
     #[test]
@@ -537,12 +705,90 @@ mod tests {
         // Two loud sides must not produce out-of-range samples.
         let mut voice = vec![0.9];
         let mut system = vec![0.9];
-        let out = take_mixed(&mut voice, &mut system, true);
+        let out = take_audio(&mut voice, &mut system, true, true);
         assert_eq!(out, vec![1.0]);
     }
 
     #[test]
-    fn waiting_for_a_stem_gives_up_when_asked_to_stop() {
+    fn final_mix_can_preserve_the_longer_stem_suffix() {
+        let mut voice = vec![0.1, 0.2, 0.3];
+        let mut system = vec![0.4];
+
+        let mut tail = take_audio(&mut voice, &mut system, true, true);
+        tail.extend(std::mem::take(&mut voice));
+        tail.extend(std::mem::take(&mut system));
+
+        assert_eq!(tail, vec![0.5, 0.2, 0.3]);
+    }
+
+    #[test]
+    fn header_only_voice_does_not_block_advancing_system_audio() {
+        assert_eq!(
+            stalled_source_to_drop(
+                true,
+                true,
+                0,
+                16_000,
+                STEM_STALL_GRACE,
+                std::time::Duration::ZERO,
+            ),
+            Some(StalledSource::Voice)
+        );
+    }
+
+    #[test]
+    fn header_only_system_does_not_block_advancing_voice_audio() {
+        assert_eq!(
+            stalled_source_to_drop(
+                true,
+                true,
+                16_000,
+                0,
+                std::time::Duration::ZERO,
+                STEM_STALL_GRACE,
+            ),
+            Some(StalledSource::System)
+        );
+    }
+
+    #[test]
+    fn sibling_startup_grace_prevents_premature_source_drop() {
+        assert_eq!(
+            stalled_source_to_drop(
+                true,
+                true,
+                0,
+                16_000,
+                STEM_STALL_GRACE - std::time::Duration::from_millis(1),
+                std::time::Duration::ZERO,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn waiting_for_stems_accepts_system_only_audio() {
+        let dir = tempfile::tempdir().unwrap();
+        let voice = dir.path().join("missing-voice.wav");
+        let system = dir.path().join("system.wav");
+        write_growing_stem(&system, 2, 48_000, Encoding::F32);
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let start = std::time::Instant::now();
+        let (voice_tail, system_tail) =
+            wait_for_stems(&voice, Some(&system), &stop, std::time::Duration::ZERO)
+                .expect("the healthy system stem should be sufficient");
+
+        assert!(voice_tail.is_none());
+        assert!(system_tail.is_some());
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "system-only startup should not wait for the missing voice stem"
+        );
+    }
+
+    #[test]
+    fn waiting_for_stems_gives_up_when_asked_to_stop() {
         // Failure isolation: a capture that stops before the helper writes a
         // header must not leave this thread parked for the full timeout.
         let dir = tempfile::tempdir().unwrap();
@@ -550,7 +796,7 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(true));
 
         let start = std::time::Instant::now();
-        let result = wait_for_stem(&missing, &stop);
+        let result = wait_for_stems(&missing, None, &stop, std::time::Duration::ZERO);
         assert!(result.is_none());
         assert!(
             start.elapsed() < std::time::Duration::from_secs(2),

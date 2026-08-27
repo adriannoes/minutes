@@ -513,41 +513,38 @@ fn write_atomic(path: &Path, content: &str) -> Result<(), String> {
     })
 }
 
+fn merge_live_transcript_section(base: &str, existing: &str, live_active: bool) -> String {
+    if !live_active {
+        return base.to_string();
+    }
+
+    let marker_start = "<!-- LIVE_TRANSCRIPT_START -->";
+    let marker_end = "<!-- LIVE_TRANSCRIPT_END -->";
+    let live_section = if let (Some(start), Some(end)) =
+        (existing.find(marker_start), existing.find(marker_end))
+    {
+        (start < end).then(|| existing[start..end + marker_end.len()].to_string())
+    } else {
+        None
+    };
+
+    match live_section {
+        Some(section) => format!("{}\n{}\n", base.trim_end(), section),
+        None => base.to_string(),
+    }
+}
+
+fn live_transcript_active() -> bool {
+    // Covers standalone Live and a recording-owned sidecar. PID-only checks
+    // miss the latter and can strip valid instructions during a recording.
+    minutes_core::live_transcript::session_status().active
+}
+
 pub fn write_assistant_context(workspace: &Path, config: &Config) -> Result<(), String> {
     let claude_md_path = workspace.join("CLAUDE.md");
     let assistant_md = generate_assistant_context(config)?;
-
-    // Preserve live transcript markers only if a session is actually active (V3).
-    // Don't trust stale markers in the file — verify via PID. `inspect_pid_file`
-    // so a session holding the PID under a mandatory Windows lock isn't misread as
-    // inactive (which would strip the live markers mid-session). See #258.
-    let lt_pid = minutes_core::pid::live_transcript_pid_path();
-    let live_actually_active = minutes_core::pid::inspect_pid_file(&lt_pid).is_active();
-
-    let content = if live_actually_active {
-        let marker_start = "<!-- LIVE_TRANSCRIPT_START -->";
-        let marker_end = "<!-- LIVE_TRANSCRIPT_END -->";
-        let existing = std::fs::read_to_string(&claude_md_path).unwrap_or_default();
-        let live_section = if let (Some(start), Some(end)) =
-            (existing.find(marker_start), existing.find(marker_end))
-        {
-            if start < end {
-                Some(existing[start..end + marker_end.len()].to_string())
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        if let Some(section) = live_section {
-            format!("{}\n{}\n", assistant_md.trim_end(), section)
-        } else {
-            assistant_md.clone()
-        }
-    } else {
-        assistant_md
-    };
+    let existing = std::fs::read_to_string(&claude_md_path).unwrap_or_default();
+    let content = merge_live_transcript_section(&assistant_md, &existing, live_transcript_active());
 
     for file_name in ASSISTANT_INSTRUCTION_FILES {
         write_atomic(&workspace.join(file_name), &content)?;
@@ -564,17 +561,25 @@ pub fn write_assistant_context(workspace: &Path, config: &Config) -> Result<(), 
 /// meeting is materialized into `CURRENT_MEETING.md` only after the user sends
 /// a non-slash question and the provider's authentication has been verified.
 pub fn write_deferred_assistant_context(workspace: &Path) -> Result<(), String> {
-    let content = format!(
+    let deferred = format!(
         "# Minutes Assistant\n\n\
 You are running inside Minutes Recall. No meeting context has been loaded yet.\n\n\
 ## Deferred meeting context\n\n\
 Before answering every user question, check whether `{ACTIVE_MEETING_FILE}` exists in this directory. \
-If it exists, read it first and treat it as the current meeting focus. If it does not exist, explain \
-that Minutes has not shared a meeting with this session yet.\n\n\
+If it exists, read it first and treat it as the current stored meeting focus. If it does not exist and \
+there is no `Live Transcript Active` section below, explain that Minutes has not shared stored meeting \
+context with this session yet.\n\n\
+`{ACTIVE_MEETING_FILE}` gates stored meeting context, not an active live transcript. If a \
+`Live Transcript Active` section exists and the user explicitly asks about the current call, use one \
+bounded read from the exact transcript path or supported CLI named in that section even when \
+`{ACTIVE_MEETING_FILE}` is absent. In that case, the missing file means stored metadata and verified \
+speaker identities are unavailable; it does not mean the live transcript is unavailable.\n\n\
 Slash commands such as `/login` are account controls, not meeting questions. Never claim a meeting \
 was loaded merely because an account command succeeded.\n\n\
 Do not attribute a statement to a named person unless the meeting context verifies that identity.\n"
     );
+    let existing = std::fs::read_to_string(workspace.join("CLAUDE.md")).unwrap_or_default();
+    let content = merge_live_transcript_section(&deferred, &existing, live_transcript_active());
 
     for file_name in ASSISTANT_INSTRUCTION_FILES {
         write_atomic(&workspace.join(file_name), &content)?;
@@ -689,10 +694,38 @@ mod tests {
             let content = std::fs::read_to_string(workspace.path().join(file_name)).unwrap();
             assert!(content.contains(ACTIVE_MEETING_FILE));
             assert!(content.contains("No meeting context has been loaded yet"));
+            assert!(content.contains("gates stored meeting context, not an active live transcript"));
+            assert!(content.contains("it does not mean the live transcript is unavailable"));
             assert!(content.contains("/login"));
             assert!(!content.contains("## Recent Meetings"));
             assert!(!content.contains("## Open Action Items"));
         }
+    }
+
+    #[test]
+    fn active_live_section_survives_context_rewrites() {
+        let existing = "# Old context\n<!-- LIVE_TRANSCRIPT_START -->\n## Live Transcript Active\nexact session\n<!-- LIVE_TRANSCRIPT_END -->\n";
+        let merged = merge_live_transcript_section("# New context\n", existing, true);
+
+        assert!(merged.starts_with("# New context"));
+        assert!(merged.contains("## Live Transcript Active"));
+        assert!(merged.contains("exact session"));
+        assert_eq!(merged.matches("LIVE_TRANSCRIPT_START").count(), 1);
+    }
+
+    #[test]
+    fn inactive_or_malformed_live_sections_are_not_preserved() {
+        let valid = "<!-- LIVE_TRANSCRIPT_START -->live<!-- LIVE_TRANSCRIPT_END -->";
+        let malformed = "<!-- LIVE_TRANSCRIPT_END -->live<!-- LIVE_TRANSCRIPT_START -->";
+
+        assert_eq!(
+            merge_live_transcript_section("# Base\n", valid, false),
+            "# Base\n"
+        );
+        assert_eq!(
+            merge_live_transcript_section("# Base\n", malformed, true),
+            "# Base\n"
+        );
     }
 
     #[test]
