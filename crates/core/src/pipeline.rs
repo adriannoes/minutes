@@ -4782,10 +4782,7 @@ fn write_transcript_artifact_with_authority(
         if status == Some(OutputStatus::NoSpeech) {
             "Untitled Recording".into()
         } else {
-            calendar_event_title
-                .as_deref()
-                .and_then(title_from_context)
-                .map(finalize_title)
+            calendar_meeting_title(config, calendar_event_title.as_deref())
                 .unwrap_or_else(|| generate_title(&transcript, context.pre_context.as_deref()))
         }
     });
@@ -5374,9 +5371,15 @@ where
         .iter()
         .map(|entity| entity.label.clone())
         .collect();
-    let title_generation = maybe_refine_title_with_llm(
+    // `status == NoSpeech` returned early above, so speech was captured here.
+    // The calendar event matched in phase 1 travels on the artifact's
+    // frontmatter, which is what lets the opt-in calendar title survive the
+    // refine step on the desktop two-phase path.
+    let title_generation = title_generation_decision(
         &artifact.frontmatter.title,
         context.requested_title.as_deref(),
+        artifact.frontmatter.calendar_event.as_deref(),
+        true,
         summary.as_deref(),
         raw_summary.as_ref(),
         &entities,
@@ -6044,24 +6047,8 @@ where
         if status == Some(OutputStatus::NoSpeech) {
             "Untitled Recording".into()
         } else {
-            let calendar_title = if config.calendar.use_event_title_for_meeting_title {
-                // Opt-in: use the calendar event's title verbatim (whitespace-
-                // normalized + length-capped), bypassing the context heuristic
-                // that can otherwise reject an otherwise-valid event title.
-                calendar_event_title
-                    .as_deref()
-                    .map(normalize_space)
-                    .filter(|s| !s.is_empty())
-                    .map(finalize_title)
-            } else {
-                // Default: derive a title from the calendar event via the context
-                // heuristic (which may reject generic names).
-                calendar_event_title
-                    .as_deref()
-                    .and_then(title_from_context)
-                    .map(finalize_title)
-            };
-            calendar_title.unwrap_or_else(|| generate_title(&transcript, pre_context.as_deref()))
+            calendar_meeting_title(config, calendar_event_title.as_deref())
+                .unwrap_or_else(|| generate_title(&transcript, pre_context.as_deref()))
         }
     });
     let entities_started = std::time::Instant::now();
@@ -6524,6 +6511,26 @@ where
     }
 }
 
+/// Resolve the title a matched calendar event contributes, if any.
+///
+/// With `[calendar] use_event_title_for_meeting_title` enabled the event title
+/// is used verbatim (whitespace-normalized, length-capped), bypassing the
+/// `title_from_context` heuristic that rejects generic names like "Meeting".
+/// Otherwise the heuristic decides, matching the long-standing default. Both
+/// the single-pass `process` path and the desktop two-phase path
+/// (`write_transcript_artifact` → `enrich_transcript_artifact`) go through
+/// here so the toggle means the same thing everywhere.
+fn calendar_meeting_title(config: &Config, calendar_event_title: Option<&str>) -> Option<String> {
+    let event_title = calendar_event_title?;
+    if config.calendar.use_event_title_for_meeting_title {
+        Some(normalize_space(event_title))
+            .filter(|title| !title.is_empty())
+            .map(finalize_title)
+    } else {
+        title_from_context(event_title).map(finalize_title)
+    }
+}
+
 /// Decide the meeting title, honoring the opt-in "calendar event title wins"
 /// behavior before falling back to the LLM refine + deterministic paths.
 ///
@@ -6555,7 +6562,7 @@ where
     if explicit_title.is_none()
         && has_speech
         && config.calendar.use_event_title_for_meeting_title
-        && calendar_event_title.is_some()
+        && calendar_meeting_title(config, calendar_event_title).is_some()
     {
         return TitleGenerationDecision {
             final_title: auto_title.to_string(),
@@ -9327,6 +9334,132 @@ mod tests {
         );
 
         assert_eq!(decision.outcome, "llm");
+    }
+
+    #[test]
+    fn calendar_title_toggle_ignores_blank_event_title() {
+        let summary = sample_summary();
+        let mut config = Config::default();
+        config.calendar.use_event_title_for_meeting_title = true;
+        let decision = title_generation_decision(
+            "First Words Of The Transcript",
+            None,
+            Some("   "), // matched event with a blank title
+            true,
+            Some("Weekly team status and planning."),
+            Some(&summary),
+            &markdown::EntityLinks::default(),
+            &config,
+            |_, _, _, _| {
+                Ok(summarize::TitleRefinement {
+                    title: "Q3 Roadmap Planning".into(),
+                    model: "agent:codex".into(),
+                    input_chars: 64,
+                })
+            },
+        );
+
+        // A blank event title contributes nothing, so this must not be logged
+        // as a calendar outcome nor skip the refine.
+        assert_eq!(decision.outcome, "llm");
+        assert_eq!(decision.final_title, "Q3 Roadmap Planning");
+    }
+
+    #[test]
+    fn calendar_meeting_title_toggle_bypasses_generic_rejection() {
+        let mut config = Config::default();
+        assert_eq!(calendar_meeting_title(&config, Some("Meeting")), None);
+        assert_eq!(
+            calendar_meeting_title(&config, Some("Team  Weekly Sync")).as_deref(),
+            Some("Team Weekly Sync")
+        );
+
+        config.calendar.use_event_title_for_meeting_title = true;
+        assert_eq!(
+            calendar_meeting_title(&config, Some("Meeting")).as_deref(),
+            Some("Meeting")
+        );
+        assert_eq!(
+            calendar_meeting_title(&config, Some("  Team  Weekly   Sync ")).as_deref(),
+            Some("Team Weekly Sync")
+        );
+        assert_eq!(calendar_meeting_title(&config, Some("   ")), None);
+        assert_eq!(calendar_meeting_title(&config, None), None);
+    }
+
+    #[test]
+    fn calendar_title_toggle_applies_on_two_phase_path() {
+        // The desktop app records through write_transcript_artifact →
+        // enrich_transcript_artifact, not process(). The toggle has to hold
+        // across both phases: phase 1 resolves the title, phase 2 must not
+        // let the refine step replace it.
+        let dir = tempfile::TempDir::new().unwrap();
+        let audio_path = dir.path().join("standup.wav");
+        std::fs::write(&audio_path, vec![0u8; 64_044]).unwrap();
+
+        let mut config = Config {
+            output_dir: dir.path().join("meetings"),
+            ..Config::default()
+        };
+        config.transcription.min_words = 1;
+        config.summarization.engine = "none".into();
+        config.diarization.engine = "none".into();
+        config.calendar.use_event_title_for_meeting_title = true;
+        let context = BackgroundPipelineContext {
+            // "Meeting" is exactly the kind of event title the default
+            // heuristic rejects as generic, so it proves the bypass.
+            calendar_event: Some(crate::calendar::CalendarEvent {
+                title: "Meeting".into(),
+                start: "09:00".into(),
+                minutes_until: 0,
+                attendees: vec![],
+                url: None,
+            }),
+            ..BackgroundPipelineContext::default()
+        };
+        let transcript = "[0:00] Okay let's talk about the pricing decision for Q3.\n";
+
+        let artifact = write_transcript_artifact(
+            &audio_path,
+            ContentType::Meeting,
+            None,
+            &config,
+            &context,
+            None,
+            transcript.into(),
+            crate::transcribe::FilterStats::default(),
+            0,
+        )
+        .unwrap();
+        assert_eq!(artifact.frontmatter.title, "Meeting");
+        assert_eq!(
+            artifact.frontmatter.calendar_event.as_deref(),
+            Some("Meeting")
+        );
+
+        let result =
+            enrich_transcript_artifact(&audio_path, &artifact, &config, &context, |_| {}).unwrap();
+        assert_eq!(result.title, "Meeting");
+        let written = std::fs::read_to_string(&result.path).unwrap();
+        assert!(written.contains("title: Meeting"), "{written}");
+
+        // Same recording with the toggle off keeps today's behavior: the
+        // generic event title is rejected and the transcript names it.
+        let mut config_off = config.clone();
+        config_off.calendar.use_event_title_for_meeting_title = false;
+        let artifact_off = write_transcript_artifact(
+            &audio_path,
+            ContentType::Meeting,
+            None,
+            &config_off,
+            &context,
+            None,
+            transcript.into(),
+            crate::transcribe::FilterStats::default(),
+            0,
+        )
+        .unwrap();
+        assert_ne!(artifact_off.frontmatter.title, "Meeting");
     }
 
     #[test]
