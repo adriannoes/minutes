@@ -8,18 +8,23 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: scripts/create-branded-dmg.sh --app <application.app> --version <x.y.z> --output <path.dmg>
+Usage: scripts/create-branded-dmg.sh --app <application.app> --version <x.y.z> --output <path.dmg> [--layout-best-effort]
 
 Creates a signed-app installer DMG with:
   - the supplied application on the left
   - /Applications symlink on the right
   - the generated Minutes DMG background
+
+With --layout-best-effort, a failure in the Finder window-layout step is a
+warning instead of an error: the DMG is still produced, just without the
+arranged window. Local installs pass this; release packaging does not.
 EOF
 }
 
 APP_PATH=""
 VERSION=""
 OUTPUT_PATH=""
+LAYOUT_BEST_EFFORT=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -34,6 +39,10 @@ while [[ $# -gt 0 ]]; do
     --output)
       OUTPUT_PATH="$2"
       shift 2
+      ;;
+    --layout-best-effort)
+      LAYOUT_BEST_EFFORT=1
+      shift
       ;;
     -h|--help)
       usage
@@ -89,10 +98,40 @@ STAGING_DIR="$WORK_DIR/staging"
 MOUNT_DIR="$WORK_DIR/mount"
 RW_DMG="$WORK_DIR/Minutes-${VERSION}.rw.dmg"
 
-cleanup() {
-  if mount | grep -Fq "$MOUNT_DIR"; then
-    hdiutil detach "$MOUNT_DIR" -force -quiet || true
+# Detach whatever is mounted at $1, retrying with force while Finder settles.
+# Resolves the physical path first: macOS TMPDIR lives under /var, a symlink
+# to /private/var, and `mount` prints resolved paths, so an unresolved
+# comparison never matches (#859). Returns 0 when nothing is mounted there or
+# the detach succeeded; the not-mounted early exit keeps the EXIT trap cheap
+# on successful runs and on failures before the attach.
+detach_mount_dir() {
+  local mount_dir="$1"
+  local real_dir
+  real_dir="$(cd "$mount_dir" 2>/dev/null && pwd -P)" || return 0
+  if ! mount | grep -Fq " on $real_dir ("; then
+    return 0
   fi
+
+  osascript -e 'tell application "Finder" to quit' >/dev/null 2>&1 || true
+
+  local attempt
+  for attempt in 1 2 3 4 5; do
+    if hdiutil detach "$real_dir" -quiet; then
+      return 0
+    fi
+
+    echo "DMG detach attempt ${attempt} failed; retrying with force after Finder settles..." >&2
+    diskutil unmount force "$real_dir" >/dev/null 2>&1 || true
+    if hdiutil detach "$real_dir" -force -quiet; then
+      return 0
+    fi
+    sleep "$((attempt * 2))"
+  done
+  return 1
+}
+
+cleanup() {
+  detach_mount_dir "$MOUNT_DIR" || true
   rm -rf "$WORK_DIR" || true
 }
 trap cleanup EXIT
@@ -135,7 +174,7 @@ if command -v SetFile >/dev/null 2>&1; then
 fi
 chflags hidden "$MOUNT_DIR/.background" "$MOUNT_DIR/.VolumeIcon.icns" || true
 
-osascript - "$MOUNT_DIR" "$APP_NAME" <<'APPLESCRIPT'
+if ! osascript - "$MOUNT_DIR" "$APP_NAME" <<'APPLESCRIPT'
 on run argv
   set mountPath to item 1 of argv
   set appName to item 2 of argv
@@ -164,31 +203,21 @@ on run argv
   end tell
 end run
 APPLESCRIPT
+then
+  if [[ "$LAYOUT_BEST_EFFORT" -eq 1 ]]; then
+    echo "Finder window layout failed; continuing without DMG cosmetics (--layout-best-effort)." >&2
+  else
+    echo "Finder window layout failed." >&2
+    exit 1
+  fi
+fi
 
 echo "Flushing Finder metadata..."
 sync
 sleep 2
 
 echo "Detaching DMG..."
-osascript -e 'tell application "Finder" to quit' >/dev/null 2>&1 || true
-
-DETACHED=0
-for attempt in 1 2 3 4 5; do
-  if hdiutil detach "$MOUNT_DIR" -quiet; then
-    DETACHED=1
-    break
-  fi
-
-  echo "DMG detach attempt ${attempt} failed; retrying with force after Finder settles..." >&2
-  diskutil unmount force "$MOUNT_DIR" >/dev/null 2>&1 || true
-  if hdiutil detach "$MOUNT_DIR" -force -quiet; then
-    DETACHED=1
-    break
-  fi
-  sleep "$((attempt * 2))"
-done
-
-if [[ "$DETACHED" -ne 1 ]]; then
+if ! detach_mount_dir "$MOUNT_DIR"; then
   echo "Failed to detach DMG mount after retries: $MOUNT_DIR" >&2
   exit 1
 fi
