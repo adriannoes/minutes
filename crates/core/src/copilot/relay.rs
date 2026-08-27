@@ -34,6 +34,7 @@ const ESTABLISHMENT_RETRY_TIMEOUT: Duration = Duration::from_secs(1);
 const ESTABLISHMENT_RETRY_DELAY: Duration = Duration::from_millis(25);
 const ESTABLISHMENT_RETRY_LIMIT: u8 = 20;
 const FRAME_CAPACITY: usize = 512;
+pub const CURRENT_DRAFT_STALE_AFTER: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -82,6 +83,13 @@ pub enum RelayTranscriptUpdate {
         /// Capture-to-relay time for a partial. Finals use zero because the
         /// durable event contract does not expose a monotonic audio timestamp.
         producer_latency_ms: u64,
+        /// Age of the newest included audio when the relay admitted this
+        /// update. Finals use zero.
+        #[serde(default)]
+        source_audio_age_ms: u64,
+        /// Wall-clock time when the capture owner admitted this update to the
+        /// transient relay. Readers use it to reject stale drafts.
+        observed_at: DateTime<Utc>,
     },
     Superseded {
         session_epoch: u64,
@@ -134,6 +142,146 @@ pub enum RelayFrame {
     Shutdown {
         reason: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayDraftState {
+    Current,
+    None,
+    Finalizing,
+    Superseded,
+    Stale,
+    Unavailable,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayCurrentDraft {
+    pub provisional: bool,
+    pub session_epoch: u64,
+    pub utterance_sequence: u64,
+    pub revision: u64,
+    pub text: String,
+    pub speaker: Option<String>,
+    pub offset_ms: u64,
+    pub producer_latency_ms: u64,
+    pub source_audio_age_ms: u64,
+    pub observed_at: DateTime<Utc>,
+    pub age_ms: u64,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayDraftSnapshot {
+    pub current_draft: Option<RelayCurrentDraft>,
+    pub draft_state: RelayDraftState,
+    #[serde(default)]
+    pub gap: bool,
+}
+
+/// Reduce one bounded relay replay to the single draft a reader may use.
+/// Supersession and gaps fail closed, and old text is never returned merely
+/// because it was the last frame in the buffer.
+pub fn reduce_relay_draft(
+    frames: &[RelayFrame],
+    evidence_mode: CopilotEvidenceMode,
+    now: DateTime<Utc>,
+) -> RelayDraftSnapshot {
+    let mut current: Option<RelayCurrentDraft> = None;
+    let mut state = if evidence_mode == CopilotEvidenceMode::FinalOnly {
+        RelayDraftState::Unsupported
+    } else {
+        RelayDraftState::None
+    };
+    let mut gap = false;
+
+    for frame in frames {
+        match frame {
+            RelayFrame::Transcript {
+                update:
+                    RelayTranscriptUpdate::Utterance {
+                        session_epoch,
+                        utterance,
+                        producer_latency_ms,
+                        source_audio_age_ms,
+                        observed_at,
+                    },
+                ..
+            } if utterance.update_kind == TranscriptUpdateKind::Partial => {
+                let relay_age_ms = now
+                    .signed_duration_since(*observed_at)
+                    .num_milliseconds()
+                    .max(0) as u64;
+                let age_ms = relay_age_ms.saturating_add(*source_audio_age_ms);
+                current = Some(RelayCurrentDraft {
+                    provisional: true,
+                    session_epoch: *session_epoch,
+                    utterance_sequence: utterance.utterance_sequence,
+                    revision: utterance.revision,
+                    text: utterance.text.clone(),
+                    speaker: utterance.speaker.clone(),
+                    offset_ms: utterance.offset_ms,
+                    producer_latency_ms: *producer_latency_ms,
+                    source_audio_age_ms: *source_audio_age_ms,
+                    observed_at: *observed_at,
+                    age_ms,
+                    source: utterance.source.clone(),
+                });
+                state = RelayDraftState::Current;
+            }
+            RelayFrame::Transcript {
+                update:
+                    RelayTranscriptUpdate::Superseded {
+                        session_epoch,
+                        through_utterance_sequence,
+                        reason,
+                        ..
+                    },
+                ..
+            } => {
+                if current.as_ref().is_some_and(|draft| {
+                    draft.session_epoch == *session_epoch
+                        && draft.utterance_sequence <= *through_utterance_sequence
+                }) {
+                    current = None;
+                }
+                state = if reason == "finalizing" {
+                    RelayDraftState::Finalizing
+                } else {
+                    RelayDraftState::Superseded
+                };
+            }
+            RelayFrame::Gap { stream, .. } if stream == "transcript" => {
+                current = None;
+                state = RelayDraftState::Unavailable;
+                gap = true;
+            }
+            RelayFrame::CursorReset { .. } => {
+                current = None;
+                state = RelayDraftState::None;
+            }
+            RelayFrame::Shutdown { .. } | RelayFrame::Error { .. } => {
+                current = None;
+                state = RelayDraftState::Unavailable;
+            }
+            _ => {}
+        }
+    }
+
+    if current
+        .as_ref()
+        .is_some_and(|draft| draft.age_ms > CURRENT_DRAFT_STALE_AFTER.as_millis() as u64)
+    {
+        current = None;
+        state = RelayDraftState::Stale;
+    }
+
+    RelayDraftSnapshot {
+        current_draft: current,
+        draft_state: state,
+        gap,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -534,6 +682,10 @@ impl CaptureRelayClient {
                 )));
             }
         }
+        // PIPE_NOWAIT can report an idle Windows byte-mode pipe as a zero-byte
+        // read, which is indistinguishable from EOF through `Read`. Keep the
+        // handle blocking there and use PeekNamedPipe in `try_recv` instead.
+        #[cfg(not(windows))]
         reader.get_ref().set_nonblocking(true)?;
         Ok(Self {
             discovery_path: discovery_path.to_path_buf(),
@@ -559,6 +711,16 @@ impl CaptureRelayClient {
 
     pub fn try_recv(&mut self) -> Result<Option<RelayFrame>, CaptureRelayError> {
         loop {
+            #[cfg(windows)]
+            match windows_stream_has_data(self.reader.get_ref()) {
+                Ok(false) => return Ok(None),
+                Ok(true) => {}
+                Err(error) if !self.established => {
+                    self.reconnect_during_establishment(CaptureRelayError::Io(error))?;
+                    continue;
+                }
+                Err(error) => return Err(CaptureRelayError::Io(error)),
+            }
             match self.reader.read_line(&mut self.pending_line) {
                 Ok(0) if !self.established => {
                     self.reconnect_during_establishment(connection_closed_error())?;
@@ -663,6 +825,50 @@ fn connection_closed_error() -> CaptureRelayError {
         io::ErrorKind::UnexpectedEof,
         "capture relay closed the connection",
     ))
+}
+
+#[cfg(windows)]
+fn windows_stream_has_data(stream: &Stream) -> io::Result<bool> {
+    use std::os::windows::io::{AsHandle, AsRawHandle};
+    use windows_sys::Win32::Foundation::{
+        ERROR_BAD_PIPE, ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED,
+    };
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+
+    let raw_handle = match stream {
+        Stream::NamedPipe(named_pipe) => named_pipe.as_handle().as_raw_handle(),
+    };
+    let mut available = 0_u32;
+    let success = unsafe {
+        PeekNamedPipe(
+            raw_handle,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            &mut available,
+            std::ptr::null_mut(),
+        )
+    };
+    if success == 0 {
+        let error = io::Error::last_os_error();
+        if matches!(
+            error.raw_os_error(),
+            Some(code)
+                if code == ERROR_BROKEN_PIPE as i32
+                    || code == ERROR_BAD_PIPE as i32
+                    || code == ERROR_NO_DATA as i32
+                    || code == ERROR_PIPE_NOT_CONNECTED as i32
+        ) {
+            Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "capture relay closed the connection",
+            ))
+        } else {
+            Err(error)
+        }
+    } else {
+        Ok(available > 0)
+    }
 }
 
 fn is_unexpected_eof(error: &CaptureRelayError) -> bool {
@@ -781,6 +987,8 @@ fn run_server(
                         duration_ms,
                     },
                     producer_latency_ms: 0,
+                    source_audio_age_ms: 0,
+                    observed_at: Utc::now(),
                 };
                 let mut state = lock_state(&shared);
                 state.push_transcript(update);
@@ -825,13 +1033,16 @@ fn spawn_client(stream: Stream, shared: Arc<SharedRelayState>, auth_token: Strin
 }
 
 fn handle_client(
-    mut stream: Stream,
+    stream: Stream,
     shared: &Arc<SharedRelayState>,
     auth_token: &str,
 ) -> Result<(), CaptureRelayError> {
-    let read_stream = interprocess::TryClone::try_clone(&stream)?;
-    let mut reader = BufReader::new(read_stream);
+    // Read the one client request through the original connection, then recover
+    // that connection for replies. The protocol has exactly one client request,
+    // so a second cloned I/O handle is unnecessary.
+    let mut reader = BufReader::new(stream);
     let hello: ClientHello = read_json_line(&mut reader)?;
+    let mut stream = reader.into_inner();
     if hello.v != RELAY_PROTOCOL_VERSION {
         write_frame(
             &mut stream,
@@ -1001,11 +1212,17 @@ fn relay_partial_update(event: LivePartialEvent) -> RelayTranscriptUpdate {
                 .saturating_duration_since(partial.audio_received_at)
                 .as_millis()
                 .min(u64::MAX as u128) as u64,
+            source_audio_age_ms: partial
+                .partial_published_at
+                .saturating_duration_since(partial.audio_snapshot_at)
+                .as_millis()
+                .min(u64::MAX as u128) as u64,
+            observed_at: Utc::now(),
             utterance: CopilotUtterance {
                 utterance_sequence: partial.utterance_sequence,
                 revision: partial.revision,
                 update_kind: TranscriptUpdateKind::Partial,
-                source: "capture-relay".into(),
+                source: partial.source,
                 text: partial.text,
                 speaker: partial.speaker,
                 speaker_verified: false,
@@ -1019,6 +1236,7 @@ fn relay_partial_update(event: LivePartialEvent) -> RelayTranscriptUpdate {
             last_revision: signal.last_revision,
             reason: match signal.reason {
                 SupersessionReason::Finalized => "finalized",
+                SupersessionReason::Finalizing => "finalizing",
                 SupersessionReason::Discarded => "discarded",
             }
             .into(),
@@ -1240,6 +1458,8 @@ mod tests {
                 duration_ms: 0,
             },
             producer_latency_ms: 12,
+            source_audio_age_ms: 0,
+            observed_at: Utc::now(),
         }
     }
 
@@ -1263,6 +1483,131 @@ mod tests {
             ttl_ms: 12_000,
             supersedes: None,
         }
+    }
+
+    #[test]
+    fn older_relay_frames_without_source_audio_age_remain_readable() {
+        let mut legacy = serde_json::to_value(utterance("legacy frame")).unwrap();
+        legacy
+            .as_object_mut()
+            .expect("relay update should serialize as an object")
+            .remove("source_audio_age_ms");
+
+        let decoded: RelayTranscriptUpdate = serde_json::from_value(legacy).unwrap();
+        let RelayTranscriptUpdate::Utterance {
+            source_audio_age_ms,
+            ..
+        } = decoded
+        else {
+            panic!("expected utterance update")
+        };
+        assert_eq!(source_audio_age_ms, 0);
+    }
+
+    #[test]
+    fn bounded_replay_exposes_only_the_latest_fresh_draft() {
+        let now = Utc::now();
+        let mut first = utterance("first draft");
+        let RelayTranscriptUpdate::Utterance { observed_at, .. } = &mut first else {
+            unreachable!()
+        };
+        *observed_at = now - chrono::Duration::milliseconds(800);
+        let mut second = utterance("corrected draft");
+        let RelayTranscriptUpdate::Utterance {
+            utterance,
+            observed_at,
+            ..
+        } = &mut second
+        else {
+            unreachable!()
+        };
+        utterance.revision = 5;
+        *observed_at = now - chrono::Duration::milliseconds(100);
+
+        let snapshot = reduce_relay_draft(
+            &[
+                RelayFrame::Transcript {
+                    seq: 1,
+                    update: first,
+                },
+                RelayFrame::Transcript {
+                    seq: 2,
+                    update: second,
+                },
+            ],
+            CopilotEvidenceMode::CaptureRelayPartials,
+            now,
+        );
+
+        assert_eq!(snapshot.draft_state, RelayDraftState::Current);
+        let draft = snapshot.current_draft.unwrap();
+        assert_eq!(draft.text, "corrected draft");
+        assert_eq!(draft.revision, 5);
+        assert_eq!(draft.age_ms, 100);
+    }
+
+    #[test]
+    fn supersession_and_age_fail_closed() {
+        let now = Utc::now();
+        let mut stale = utterance("too old");
+        let RelayTranscriptUpdate::Utterance { observed_at, .. } = &mut stale else {
+            unreachable!()
+        };
+        *observed_at = now - chrono::Duration::seconds(4);
+        let stale_snapshot = reduce_relay_draft(
+            &[RelayFrame::Transcript {
+                seq: 1,
+                update: stale,
+            }],
+            CopilotEvidenceMode::CaptureRelayPartials,
+            now,
+        );
+        assert_eq!(stale_snapshot.draft_state, RelayDraftState::Stale);
+        assert!(stale_snapshot.current_draft.is_none());
+
+        let mut slow_result = utterance("slow recognition");
+        let RelayTranscriptUpdate::Utterance {
+            source_audio_age_ms,
+            observed_at,
+            ..
+        } = &mut slow_result
+        else {
+            unreachable!()
+        };
+        *source_audio_age_ms = 4_000;
+        *observed_at = now;
+        let slow_snapshot = reduce_relay_draft(
+            &[RelayFrame::Transcript {
+                seq: 1,
+                update: slow_result,
+            }],
+            CopilotEvidenceMode::CaptureRelayPartials,
+            now,
+        );
+        assert_eq!(slow_snapshot.draft_state, RelayDraftState::Stale);
+        assert!(slow_snapshot.current_draft.is_none());
+
+        let finalizing_snapshot = reduce_relay_draft(
+            &[
+                RelayFrame::Transcript {
+                    seq: 1,
+                    update: utterance("about to finalize"),
+                },
+                RelayFrame::Transcript {
+                    seq: 2,
+                    update: RelayTranscriptUpdate::Superseded {
+                        session_epoch: 7,
+                        through_utterance_sequence: 3,
+                        last_revision: 4,
+                        reason: "finalizing".into(),
+                    },
+                },
+            ],
+            CopilotEvidenceMode::CaptureRelayPartials,
+            now,
+        );
+        assert_eq!(finalizing_snapshot.draft_state, RelayDraftState::Finalizing);
+        assert!(finalizing_snapshot.current_draft.is_none());
     }
 
     fn wait_for_frame(
@@ -1290,6 +1635,68 @@ mod tests {
             }
         }
         panic!("timed out waiting for relay error");
+    }
+
+    #[test]
+    fn recording_style_partial_channel_reaches_relay_and_finalizing_retracts_it() {
+        let dir = TempDir::new().unwrap();
+        let (mut publisher, subscriber) =
+            crate::live_partials::channel_with_source(44, 2, "recording-sidecar");
+        let _server = CaptureRelayServer::start_inner(
+            dir.path(),
+            CopilotEvidenceMode::CaptureRelayPartials,
+            Some(subscriber),
+            false,
+        )
+        .unwrap();
+        let discovery_path = capture_relay_discovery_path_in(dir.path());
+        let mut client =
+            CaptureRelayClient::connect_from(&discovery_path, RelayCursor::default()).unwrap();
+
+        publisher.begin_utterance(Instant::now());
+        publisher.try_publish("current speech".into(), 250);
+        let partial = wait_for_frame(&mut client, |frame| {
+            matches!(
+                frame,
+                RelayFrame::Transcript {
+                    update: RelayTranscriptUpdate::Utterance { utterance, .. },
+                    ..
+                } if utterance.update_kind == TranscriptUpdateKind::Partial
+                    && utterance.text == "current speech"
+            )
+        });
+        let (session_epoch, source) = match &partial {
+            RelayFrame::Transcript {
+                update:
+                    RelayTranscriptUpdate::Utterance {
+                        session_epoch,
+                        utterance,
+                        ..
+                    },
+                ..
+            } => (*session_epoch, utterance.source.as_str()),
+            _ => unreachable!(),
+        };
+        assert_eq!(session_epoch, 44);
+        assert_eq!(source, "recording-sidecar");
+
+        publisher.supersede_current(SupersessionReason::Finalizing);
+        let retracted = wait_for_frame(&mut client, |frame| {
+            matches!(
+                frame,
+                RelayFrame::Transcript {
+                    update: RelayTranscriptUpdate::Superseded { reason, .. },
+                    ..
+                } if reason == "finalizing"
+            )
+        });
+        let snapshot = reduce_relay_draft(
+            &[partial, retracted],
+            CopilotEvidenceMode::CaptureRelayPartials,
+            Utc::now(),
+        );
+        assert_eq!(snapshot.draft_state, RelayDraftState::Finalizing);
+        assert!(snapshot.current_draft.is_none());
     }
 
     #[test]

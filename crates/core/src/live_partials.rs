@@ -24,16 +24,19 @@ pub struct LivePartial {
     pub utterance_sequence: u64,
     pub revision: u64,
     pub is_final: bool,
+    pub source: String,
     pub text: String,
     pub speaker: Option<String>,
     pub offset_ms: u64,
     pub audio_received_at: Instant,
+    pub audio_snapshot_at: Instant,
     pub partial_published_at: Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SupersessionReason {
     Finalized,
+    Finalizing,
     Discarded,
 }
 
@@ -42,12 +45,14 @@ impl SupersessionReason {
         match self {
             Self::Finalized => 1,
             Self::Discarded => 2,
+            Self::Finalizing => 3,
         }
     }
 
     fn decode(value: u8) -> Self {
         match value {
             1 => Self::Finalized,
+            3 => Self::Finalizing,
             _ => Self::Discarded,
         }
     }
@@ -153,6 +158,7 @@ impl ChannelInner {
 /// makes its capture-thread ownership obvious at the type boundary.
 pub struct LivePartialPublisher {
     inner: Arc<ChannelInner>,
+    source: String,
     utterance_sequence: u64,
     revision: u64,
     audio_received_at: Option<Instant>,
@@ -161,6 +167,10 @@ pub struct LivePartialPublisher {
 impl LivePartialPublisher {
     pub fn session_epoch(&self) -> u64 {
         self.inner.epoch
+    }
+
+    pub fn current_utterance_sequence(&self) -> u64 {
+        self.utterance_sequence
     }
 
     /// Record the first audio receipt for the current utterance. Repeated VAD
@@ -175,6 +185,17 @@ impl LivePartialPublisher {
     /// returned to the caller only as `DroppedFull`; no retry or wakeup occurs
     /// on the capture thread.
     pub fn try_publish(&mut self, text: String, offset_ms: u64) -> PartialPublishOutcome {
+        self.try_publish_for_snapshot(text, offset_ms, Instant::now())
+    }
+
+    /// Publish a revision tied to the newest audio included in its recognition
+    /// snapshot. This lets readers include recognition delay in freshness.
+    pub fn try_publish_for_snapshot(
+        &mut self,
+        text: String,
+        offset_ms: u64,
+        audio_snapshot_at: Instant,
+    ) -> PartialPublishOutcome {
         let audio_received_at = self.audio_received_at.unwrap_or_else(Instant::now);
         self.revision = self.revision.saturating_add(1);
 
@@ -197,10 +218,12 @@ impl LivePartialPublisher {
             utterance_sequence: self.utterance_sequence,
             revision: self.revision,
             is_final: false,
+            source: self.source.clone(),
             text,
             speaker: None,
             offset_ms,
             audio_received_at,
+            audio_snapshot_at,
             partial_published_at,
         };
 
@@ -305,6 +328,14 @@ pub fn channel(
     session_epoch: u64,
     capacity: usize,
 ) -> (LivePartialPublisher, LivePartialSubscriber) {
+    channel_with_source(session_epoch, capacity, "in-process-live")
+}
+
+pub fn channel_with_source(
+    session_epoch: u64,
+    capacity: usize,
+    source: impl Into<String>,
+) -> (LivePartialPublisher, LivePartialSubscriber) {
     let inner = Arc::new(ChannelInner {
         epoch: session_epoch,
         partials: ArrayQueue::new(capacity.max(1)),
@@ -318,6 +349,7 @@ pub fn channel(
     (
         LivePartialPublisher {
             inner: Arc::clone(&inner),
+            source: source.into(),
             utterance_sequence: 1,
             revision: 0,
             audio_received_at: None,

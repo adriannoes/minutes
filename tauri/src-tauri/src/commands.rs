@@ -3474,6 +3474,37 @@ fn start_native_call_recording(
         minutes_core::pid::remove().ok();
         return Err(error.to_string());
     }
+    let relay_epoch = chrono::Utc::now().timestamp_millis().unsigned_abs().max(1);
+    let (publisher, subscriber) = minutes_core::live_partials::channel_with_source(
+        relay_epoch,
+        minutes_core::live_partials::DEFAULT_PARTIAL_CHANNEL_CAPACITY,
+        "recording-sidecar",
+    );
+    let mut recording_partial_publisher = Some(publisher);
+    let _capture_relay = match minutes_core::copilot::CaptureRelayServer::start(
+        minutes_core::copilot::CopilotEvidenceMode::CaptureRelayPartials,
+        Some(subscriber),
+    ) {
+        Ok(relay) => Some(relay),
+        Err(minutes_core::copilot::CaptureRelayError::AlreadyOwned(owner_pid)) => {
+            minutes_core::pid::remove().ok();
+            return Err(format!(
+                "Another Minutes process (PID {owner_pid}) already owns capture. Minutes did not open a second recording."
+            ));
+        }
+        Err(minutes_core::copilot::CaptureRelayError::OwnershipBusy) => {
+            minutes_core::pid::remove().ok();
+            return Err(
+                "Another Minutes process is starting or stopping capture. Wait a moment and try again."
+                    .into(),
+            );
+        }
+        Err(error) => {
+            recording_partial_publisher = None;
+            tracing::warn!(error = %error, "native call capture relay unavailable; recording continues");
+            None
+        }
+    };
     // Config written through Settings is already canonical, but older/manual
     // TOML may still contain the picker decoration (sample rate/channels).
     // ScreenCaptureKit resolves AVCaptureDevice.localizedName exactly, so
@@ -3556,6 +3587,7 @@ fn start_native_call_recording(
                     Some(system),
                     config,
                     std::sync::Arc::clone(&live_stop),
+                    recording_partial_publisher,
                 )
                 .is_some()
             }
@@ -7200,6 +7232,8 @@ fn status_value(state: &AppState, include_readiness: bool) -> serde_json::Value 
         minutes_core::capture::audio_level(),
         chrono::Utc::now(),
     );
+    let recording_live_status =
+        recording_active.then(minutes_core::live_transcript::session_status);
 
     let mut value = serde_json::json!({
         "recording": recording || (status.recording && !processing),
@@ -7226,6 +7260,14 @@ fn status_value(state: &AppState, include_readiness: bool) -> serde_json::Value 
             "markerCount": session.markers.len(),
         })),
         "audioLevel": audio_level,
+        "liveTranscript": recording_live_status.as_ref().map(|live| serde_json::json!({
+            "active": live.active,
+            "lineCount": live.line_count,
+            "durationSecs": live.duration_secs,
+            "latestFinalAgeSecs": live.latest_final_age_secs,
+            "source": live.source.as_ref(),
+            "diagnostic": live.diagnostic.as_deref(),
+        })),
     });
 
     if include_readiness {
@@ -14938,6 +14980,7 @@ mod tests {
                 "pid",
                 "elapsed",
                 "audioLevel",
+                "liveTranscript",
             ] {
                 assert!(capture.get(key).is_some(), "capture status missing {key}");
             }
@@ -15023,6 +15066,21 @@ mod tests {
 
         assert_eq!(capture_status_audio_level(true, None, 47, now), 47);
         assert_eq!(capture_status_audio_level(false, None, 47, now), 0);
+    }
+
+    #[test]
+    fn capture_ui_uses_human_live_transcript_states() {
+        let html = include_str!("../../src/index.html");
+        for expected in [
+            "id=\"recording-transcript-state\" role=\"status\" aria-live=\"polite\"",
+            "Speech in progress",
+            "Transcript current",
+            "Last transcript update",
+            "Recording safely · Live transcript unavailable",
+        ] {
+            assert!(html.contains(expected), "missing live state: {expected}");
+        }
+        assert!(html.contains("function transcriptEvidenceText"));
     }
 
     #[test]
@@ -20603,9 +20661,10 @@ fn run_live_session(app: tauri::AppHandle, active: Arc<AtomicBool>, stop_flag: A
     crate::sync_tray_state(&app);
 
     let relay_epoch = chrono::Utc::now().timestamp_millis().unsigned_abs().max(1);
-    let (partial_publisher, partial_subscriber) = minutes_core::live_partials::channel(
+    let (partial_publisher, partial_subscriber) = minutes_core::live_partials::channel_with_source(
         relay_epoch,
         minutes_core::live_partials::DEFAULT_PARTIAL_CHANNEL_CAPACITY,
+        "standalone",
     );
     let _capture_relay = match minutes_core::copilot::CaptureRelayServer::start(
         minutes_core::copilot::CopilotEvidenceMode::CaptureRelayPartials,
@@ -20845,6 +20904,7 @@ pub fn cmd_live_transcript_status(state: tauri::State<AppState>) -> serde_json::
         "active": in_app_active || status.active,
         "line_count": status.line_count,
         "duration_secs": status.duration_secs,
+        "latestFinalAgeSecs": status.latest_final_age_secs,
         "audioLevel": audio_level,
         "source": status.source,
         "diagnostic": status.diagnostic,

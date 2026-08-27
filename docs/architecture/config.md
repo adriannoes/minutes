@@ -118,7 +118,7 @@ explicit `minutes copilot start` may start a foreground session when
 | `nudge_ttl_ms` | `12000` | Lifetime of a rendered nudge in milliseconds. |
 | `target_latency_ms` | `5000` | Fast request timeout/latency target; timeout degrades only the copilot. |
 | `history_grounding` | `true` | Refresh a bounded battle card asynchronously from unrestricted graph, structured intent, and FTS data. |
-| `live_partials` | `true` | Enable ephemeral partial coaching when `minutes copilot start --live` owns a streaming Whisper session in-process. External capture remains `final_only`. |
+| `live_partials` | `true` | Enable ephemeral partial coaching. Standalone Live publishes in process; normal Recording publishes the same replaceable current-speech evidence through its authenticated local capture relay. Finalized transcript lines remain the only durable evidence. |
 | `partial_debounce_ms` | `250` | Coalesce rapid partial corrections before starting the fast model lane. |
 | `depth_refresh_secs` | `60` | Slow strategy refresh cadence, clamped to 30–90 seconds; topic shifts and decisive finals may refresh earlier. |
 | `grounding_refresh_secs` | `15` | Minimum stable-final grounding cadence; topic shifts bypass it. Retrieval never runs on capture or the fast path. |

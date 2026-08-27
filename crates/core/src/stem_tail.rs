@@ -255,8 +255,10 @@ pub fn spawn_live_transcription_from_stems(
     system_stem: Option<PathBuf>,
     config: &Config,
     stop_flag: Arc<AtomicBool>,
+    partial_publisher: Option<crate::live_partials::LivePartialPublisher>,
 ) -> Option<std::thread::JoinHandle<()>> {
-    let (live_tx, sidecar_handle) = crate::capture::start_live_sidecar(config, &stop_flag);
+    let (live_tx, sidecar_handle) =
+        crate::capture::start_live_sidecar(config, &stop_flag, partial_publisher);
     let live_tx = live_tx?;
 
     let feeder = std::thread::Builder::new()

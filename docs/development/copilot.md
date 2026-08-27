@@ -24,14 +24,14 @@ ordinary chat side effect.
 
 | Boundary | Invariant |
 | --- | --- |
-| Capture producer | Lock-free/nonblocking partial publication; a full ring drops a partial. |
+| Capture producer | Normal Recording and standalone Live publish through the same lock-free/nonblocking partial channel; a full ring drops a partial. |
 | Fast lane | One model request at a time; newer evidence cancels/suppresses older advice. |
 | Depth lane | Retrieval and strategy run on an isolated worker and never block the fast or capture paths. |
 | Queues | Command, depth, and event channels are bounded and use `try_send`; saturation sheds Coach work. |
 | Failure | Provider timeouts, worker errors, and poisoned copilot mutexes recover or degrade Coach only. |
 | Persistence | Partials, battle cards, strategy, nudges, and latency timelines remain process-local. |
 
-Do not route Coach through the transcript JSONL, change final-event production, or add a second capture owner. The authoritative durable seam remains `live.utterance.final`; cross-process partials use the capture relay defined by RFC 0004.
+Do not route Coach through the transcript JSONL, change final-event production, or add a second capture owner. The authoritative durable seam remains `live.utterance.final`; normal Recording and standalone Live expose replaceable, non-durable current speech only through the authenticated capture relay. See the accepted [live-draft transcript contract](../plans/live-draft-transcript-2026-08-25.md).
 
 ## Security model
 

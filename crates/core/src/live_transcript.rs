@@ -284,6 +284,10 @@ pub struct SessionStatus {
     pub pid: Option<u32>,
     pub line_count: usize,
     pub duration_secs: f64,
+    /// Seconds since the end of the newest finalized line. Current drafts are
+    /// intentionally excluded; this is safe human-facing freshness evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_final_age_secs: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     pub jsonl_path: Option<String>,
@@ -1317,8 +1321,11 @@ fn run_inner(
                 writer.push_shadow_samples(&chunk.samples);
                 if let Some(sr) = streaming.feed(&chunk.samples, whisper_ctx) {
                     if let Some(publisher) = partial_publisher.as_mut() {
-                        let _ = publisher
-                            .try_publish(sr.text, writer.start_time.elapsed().as_millis() as u64);
+                        let _ = publisher.try_publish_for_snapshot(
+                            sr.text,
+                            writer.start_time.elapsed().as_millis() as u64,
+                            audio_received_at,
+                        );
                         // A full ring drops here. Do not log, wait, retry,
                         // normalize, allocate another queue, or touch the
                         // durable event path from this thread. Text cleanup is
@@ -1915,6 +1922,7 @@ fn transcribe_with_whisper_for_live_sidecar(
     samples: &[f32],
     whisper_ctx: &whisper_rs::WhisperContext,
     language: Option<String>,
+    abort_signal: Option<&Arc<AtomicBool>>,
 ) -> Option<(String, f64)> {
     if samples.is_empty() {
         return None;
@@ -1929,6 +1937,9 @@ fn transcribe_with_whisper_for_live_sidecar(
     // `transcription.partial_max_secs` setting; that knob is for live
     // responsiveness, not for batch fan-in.
     let mut streaming = StreamingWhisper::with_partial_max_secs(language, 1);
+    if let Some(abort_signal) = abort_signal {
+        streaming = streaming.with_abort_signal(Arc::clone(abort_signal));
+    }
     for chunk in samples.chunks(1600) {
         let _ = streaming.feed(chunk, whisper_ctx);
     }
@@ -1943,6 +1954,186 @@ fn transcribe_with_whisper_for_live_sidecar(
 /// the newest utterance and is surfaced via `LiveStatus::dropped_utterances`.
 #[cfg(feature = "whisper")]
 const SIDECAR_UTTERANCE_QUEUE_CAP: usize = 3;
+
+/// Recording-sidecar drafts start after one second of speech, then refresh at
+/// a two-second cadence. Pending work is latest-only: the VAD consumer may
+/// replace a queued snapshot and never waits for recognition.
+#[cfg(feature = "whisper")]
+const SIDECAR_DRAFT_INTERVAL_SAMPLES: usize = 16000 * 2;
+#[cfg(feature = "whisper")]
+const SIDECAR_FIRST_DRAFT_SAMPLES: usize = 16000;
+
+#[cfg(feature = "whisper")]
+struct SidecarDraftJob {
+    utterance_sequence: u64,
+    samples: Vec<f32>,
+    offset_ms: u64,
+    audio_snapshot_at: Instant,
+}
+
+#[cfg(feature = "whisper")]
+struct SidecarDraftResult {
+    utterance_sequence: u64,
+    text: String,
+    offset_ms: u64,
+    audio_snapshot_at: Instant,
+}
+
+/// Provisional current speech deliberately has its own cheap gate instead of
+/// inheriting the finalized live transcript's VAD. The finalized path may use
+/// an optional model, fall back, or segment quiet audio differently; none of
+/// those choices should starve the replaceable draft or change durable output.
+#[cfg(feature = "whisper")]
+struct RecordingDraftGate {
+    vad: Vad,
+    was_speaking: bool,
+    utterance: Vec<f32>,
+    utterance_samples: usize,
+    utterance_start_offset_ms: u64,
+    next_draft_at: usize,
+    max_window_samples: usize,
+    stats: SidecarGatingStats,
+}
+
+#[cfg(feature = "whisper")]
+enum RecordingDraftGateEvent {
+    None,
+    Snapshot(SidecarDraftJob),
+    SpeechEnded,
+}
+
+#[cfg(feature = "whisper")]
+impl RecordingDraftGate {
+    fn new(config: &Config) -> Self {
+        Self {
+            vad: Vad::new(),
+            was_speaking: false,
+            utterance: Vec::new(),
+            utterance_samples: 0,
+            utterance_start_offset_ms: 0,
+            next_draft_at: SIDECAR_FIRST_DRAFT_SAMPLES,
+            max_window_samples: (config.transcription.partial_max_secs as usize)
+                .saturating_mul(16000)
+                .max(SIDECAR_FIRST_DRAFT_SAMPLES),
+            stats: SidecarGatingStats::default(),
+        }
+    }
+
+    fn process(
+        &mut self,
+        samples: &[f32],
+        rms: f32,
+        samples_received: usize,
+        publisher: &mut LivePartialPublisher,
+    ) -> RecordingDraftGateEvent {
+        let decision = self.vad.process(rms);
+        self.stats.observe(samples.len(), decision.speaking);
+
+        if decision.speaking {
+            if !self.was_speaking {
+                self.utterance.clear();
+                self.utterance_samples = 0;
+                self.utterance_start_offset_ms = samples_to_ms(samples_received);
+                self.next_draft_at = SIDECAR_FIRST_DRAFT_SAMPLES;
+                publisher.begin_utterance(Instant::now());
+            }
+            self.was_speaking = true;
+            self.utterance.extend_from_slice(samples);
+            self.utterance_samples = self.utterance_samples.saturating_add(samples.len());
+
+            if self.utterance_samples >= self.next_draft_at {
+                let (window, window_start) =
+                    sidecar_draft_window(&self.utterance, self.max_window_samples);
+                let snapshot = SidecarDraftJob {
+                    utterance_sequence: publisher.current_utterance_sequence(),
+                    samples: window.to_vec(),
+                    offset_ms: self
+                        .utterance_start_offset_ms
+                        .saturating_add(samples_to_ms(window_start)),
+                    audio_snapshot_at: Instant::now(),
+                };
+
+                // Once the cost ceiling is reached, retain only the bounded
+                // window. The total counter keeps cadence monotonic while the
+                // base offset advances with the discarded prefix.
+                if window_start > 0 {
+                    self.utterance.drain(..window_start);
+                    self.utterance_start_offset_ms = self
+                        .utterance_start_offset_ms
+                        .saturating_add(samples_to_ms(window_start));
+                }
+                self.next_draft_at = self
+                    .next_draft_at
+                    .saturating_add(SIDECAR_DRAFT_INTERVAL_SAMPLES);
+                return RecordingDraftGateEvent::Snapshot(snapshot);
+            }
+        } else if self.was_speaking {
+            self.reset_utterance();
+            publisher.supersede_current(SupersessionReason::Finalizing);
+            return RecordingDraftGateEvent::SpeechEnded;
+        }
+
+        RecordingDraftGateEvent::None
+    }
+
+    fn stop(&mut self, publisher: &mut LivePartialPublisher) {
+        self.reset_utterance();
+        publisher.supersede_current(SupersessionReason::Discarded);
+    }
+
+    fn reset_utterance(&mut self) {
+        self.was_speaking = false;
+        self.utterance.clear();
+        self.utterance_samples = 0;
+        self.next_draft_at = SIDECAR_FIRST_DRAFT_SAMPLES;
+    }
+}
+
+#[cfg(feature = "whisper")]
+fn sidecar_draft_window(samples: &[f32], max_samples: usize) -> (&[f32], usize) {
+    let start = if max_samples == 0 {
+        0
+    } else {
+        samples.len().saturating_sub(max_samples)
+    };
+    (&samples[start..], start)
+}
+
+/// A capacity-one, newest-wins handoff. Both lock holders only swap an Option;
+/// recognition and audio copying happen outside the lock.
+#[cfg(feature = "whisper")]
+struct SidecarDraftMailbox<T> {
+    pending: Mutex<Option<T>>,
+    replaced: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(feature = "whisper")]
+impl<T> Default for SidecarDraftMailbox<T> {
+    fn default() -> Self {
+        Self {
+            pending: Mutex::new(None),
+            replaced: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+#[cfg(feature = "whisper")]
+impl<T> SidecarDraftMailbox<T> {
+    fn offer_latest(&self, item: T) {
+        let mut pending = lock_ignore_poison(&self.pending);
+        if pending.replace(item).is_some() {
+            self.replaced.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn take(&self) -> Option<T> {
+        lock_ignore_poison(&self.pending).take()
+    }
+
+    fn clear(&self) {
+        lock_ignore_poison(&self.pending).take();
+    }
+}
 
 /// A poisoned writer mutex means a thread panicked mid-write; the writer's
 /// own failure latches (`jsonl_failed`) already cover torn state, and losing
@@ -1959,11 +2150,12 @@ fn enqueue_sidecar_utterance(
     job_tx: &std::sync::mpsc::SyncSender<Vec<f32>>,
     samples: Vec<f32>,
     counters: &QueueCounters,
-) {
+) -> EnqueueResult {
     if samples.is_empty() {
-        return;
+        return EnqueueResult::Disconnected;
     }
-    match try_send_drop_newest(job_tx, samples, counters) {
+    let outcome = try_send_drop_newest(job_tx, samples, counters);
+    match outcome {
         EnqueueResult::Queued | EnqueueResult::Disconnected => {}
         EnqueueResult::DroppedFull => {
             let total = counters.dropped.load(Ordering::Relaxed);
@@ -1973,6 +2165,16 @@ fn enqueue_sidecar_utterance(
             );
         }
     }
+    outcome
+}
+
+#[cfg(feature = "whisper")]
+fn finish_sidecar_utterance(
+    job_tx: &std::sync::mpsc::SyncSender<Vec<f32>>,
+    samples: Vec<f32>,
+    counters: &QueueCounters,
+) {
+    enqueue_sidecar_utterance(job_tx, samples, counters);
 }
 
 /// Engine dispatch for one finalized utterance on the sidecar's transcription
@@ -1985,6 +2187,7 @@ fn transcribe_utterance_for_sidecar(
     config: &Config,
     whisper_ctx: &mut Option<whisper_rs::WhisperContext>,
     parakeet_enabled: &mut bool,
+    stop_flag: &Arc<AtomicBool>,
 ) -> Option<(String, f64)> {
     #[cfg(feature = "parakeet")]
     if *parakeet_enabled {
@@ -2017,7 +2220,12 @@ fn transcribe_utterance_for_sidecar(
             }
         },
     };
-    transcribe_with_whisper_for_live_sidecar(samples, ctx, config.transcription.language.clone())
+    transcribe_with_whisper_for_live_sidecar(
+        samples,
+        ctx,
+        config.transcription.language.clone(),
+        Some(stop_flag),
+    )
 }
 
 #[cfg(feature = "whisper")]
@@ -2281,6 +2489,7 @@ fn finalize_live_utterance(
                             apple_utterance_samples,
                             whisper_ctx,
                             config.transcription.language.clone(),
+                            None,
                         ))
                     },
                 );
@@ -2328,6 +2537,7 @@ fn finalize_live_utterance(
                                 parakeet_utterance_samples,
                                 whisper_ctx,
                                 config.transcription.language.clone(),
+                                None,
                             )
                         {
                             let ok = writer.write_utterance(&text, duration_secs);
@@ -2463,6 +2673,7 @@ fn finalize_live_utterance(
                                 apple_utterance_samples,
                                 whisper_ctx,
                                 config.transcription.language.clone(),
+                                None,
                             )
                         {
                             let ok = writer.write_utterance(&text, duration_secs);
@@ -2554,9 +2765,10 @@ pub fn run_sidecar_mpsc(
     rx: std::sync::mpsc::Receiver<Vec<f32>>,
     stop_flag: Arc<AtomicBool>,
     config: &Config,
+    partial_publisher: Option<LivePartialPublisher>,
 ) {
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_sidecar_inner_mpsc(rx, stop_flag, config)
+        run_sidecar_inner_mpsc(rx, stop_flag, config, partial_publisher)
     }));
 
     match outcome {
@@ -2589,6 +2801,7 @@ fn run_sidecar_inner_mpsc(
     rx: std::sync::mpsc::Receiver<Vec<f32>>,
     stop_flag: Arc<AtomicBool>,
     config: &Config,
+    mut partial_publisher: Option<LivePartialPublisher>,
 ) -> Result<(), MinutesError> {
     // Guard: don't clobber a standalone live transcript session's JSONL.
     // `inspect_pid_file` (not `check_pid_file`) so a standalone session holding
@@ -2655,11 +2868,16 @@ fn run_sidecar_inner_mpsc(
     // the status file) instead of the whole session.
     let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(SIDECAR_UTTERANCE_QUEUE_CAP);
     let queue_counters = Arc::new(QueueCounters::default());
+    let draft_jobs = Arc::new(SidecarDraftMailbox::<SidecarDraftJob>::default());
+    let draft_results = Arc::new(SidecarDraftMailbox::<SidecarDraftResult>::default());
+    let drafts_enabled = partial_publisher.is_some();
     let worker = {
         let writer = Arc::clone(&writer);
         let config = config.clone();
         let counters = Arc::clone(&queue_counters);
         let stop_flag = Arc::clone(&stop_flag);
+        let draft_jobs = Arc::clone(&draft_jobs);
+        let draft_results = Arc::clone(&draft_results);
         std::thread::Builder::new()
             .name("live-sidecar-transcribe".into())
             .spawn(move || {
@@ -2669,24 +2887,106 @@ fn run_sidecar_inner_mpsc(
                 // the consumer thread, as before) dropped the first ~13s of
                 // every meeting. Parakeet sessions never pay it at all.
                 let mut whisper_ctx: Option<whisper_rs::WhisperContext> = None;
-                while let Ok(samples) = job_rx.recv() {
-                    // After stop, the recording's batch transcription
-                    // supersedes the live transcript; drain instead of
-                    // transcribing so stop stays responsive.
-                    if stop_flag.load(Ordering::Relaxed) {
+                if drafts_enabled {
+                    match load_sidecar_whisper_ctx(&config) {
+                        Ok(ctx) => whisper_ctx = Some(ctx),
+                        Err(error) => tracing::warn!(
+                            error = %error,
+                            "whisper model unavailable for current-speech drafts"
+                        ),
+                    }
+                }
+                let mut finals_disconnected = false;
+                loop {
+                    let final_samples = match job_rx.try_recv() {
+                        Ok(samples) => Some(samples),
+                        Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            finals_disconnected = true;
+                            None
+                        }
+                    };
+                    if let Some(samples) = final_samples {
+                        if stop_flag.load(Ordering::Relaxed) {
+                            counters.pending.fetch_sub(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        let result = transcribe_utterance_for_sidecar(
+                            &samples,
+                            &config,
+                            &mut whisper_ctx,
+                            &mut parakeet_enabled,
+                            &stop_flag,
+                        );
                         counters.pending.fetch_sub(1, Ordering::Relaxed);
+                        if let Some((text, duration_secs)) = result {
+                            if let Some(w) = lock_ignore_poison(&writer).as_mut() {
+                                w.write_utterance(&text, duration_secs);
+                            }
+                        }
                         continue;
                     }
-                    let result = transcribe_utterance_for_sidecar(
-                        &samples,
-                        &config,
-                        &mut whisper_ctx,
-                        &mut parakeet_enabled,
-                    );
-                    counters.pending.fetch_sub(1, Ordering::Relaxed);
-                    if let Some((text, duration_secs)) = result {
-                        if let Some(w) = lock_ignore_poison(&writer).as_mut() {
-                            w.write_utterance(&text, duration_secs);
+
+                    if stop_flag.load(Ordering::Relaxed) {
+                        draft_jobs.clear();
+                    } else if let Some(job) = draft_jobs.take() {
+                        if whisper_ctx.is_none() {
+                            match load_sidecar_whisper_ctx(&config) {
+                                Ok(ctx) => whisper_ctx = Some(ctx),
+                                Err(error) => tracing::warn!(
+                                    error = %error,
+                                    "whisper model unavailable for current-speech drafts"
+                                ),
+                            }
+                        }
+                        if let Some(ctx) = whisper_ctx.as_ref() {
+                            if let Some((text, _)) = transcribe_with_whisper_for_live_sidecar(
+                                &job.samples,
+                                ctx,
+                                config.transcription.language.clone(),
+                                Some(&stop_flag),
+                            )
+                            .and_then(|(text, duration)| {
+                                normalize_live_transcript_text(&text).map(|text| (text, duration))
+                            }) {
+                                draft_results.offer_latest(SidecarDraftResult {
+                                    utterance_sequence: job.utterance_sequence,
+                                    text,
+                                    offset_ms: job.offset_ms,
+                                    audio_snapshot_at: job.audio_snapshot_at,
+                                });
+                            }
+                        }
+                        continue;
+                    }
+
+                    if finals_disconnected {
+                        break;
+                    }
+
+                    match job_rx.recv_timeout(Duration::from_millis(25)) {
+                        Ok(samples) => {
+                            if stop_flag.load(Ordering::Relaxed) {
+                                counters.pending.fetch_sub(1, Ordering::Relaxed);
+                                continue;
+                            }
+                            let result = transcribe_utterance_for_sidecar(
+                                &samples,
+                                &config,
+                                &mut whisper_ctx,
+                                &mut parakeet_enabled,
+                                &stop_flag,
+                            );
+                            counters.pending.fetch_sub(1, Ordering::Relaxed);
+                            if let Some((text, duration_secs)) = result {
+                                if let Some(w) = lock_ignore_poison(&writer).as_mut() {
+                                    w.write_utterance(&text, duration_secs);
+                                }
+                            }
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            finals_disconnected = true;
                         }
                     }
                 }
@@ -2694,9 +2994,35 @@ fn run_sidecar_inner_mpsc(
             .map_err(|e| MinutesError::from(TranscribeError::Io(e)))?
     };
 
-    tracing::info!("live sidecar started (recording mode)");
+    let mut samples_received = 0usize;
+    let mut draft_gate = partial_publisher
+        .as_ref()
+        .map(|_| RecordingDraftGate::new(config));
+    let mut last_draft_text = String::new();
+
+    tracing::info!(
+        current_speech_drafts = partial_publisher.is_some(),
+        "live sidecar started (recording mode)"
+    );
 
     loop {
+        if let Some(result) = draft_results.take() {
+            if partial_publisher.as_ref().is_some_and(|publisher| {
+                publisher.current_utterance_sequence() == result.utterance_sequence
+            }) && draft_gate.as_ref().is_some_and(|gate| gate.was_speaking)
+                && result.text != last_draft_text
+            {
+                if let Some(publisher) = partial_publisher.as_mut() {
+                    let _ = publisher.try_publish_for_snapshot(
+                        result.text.clone(),
+                        result.offset_ms,
+                        result.audio_snapshot_at,
+                    );
+                }
+                last_draft_text = result.text;
+            }
+        }
+
         // The heartbeat must never block behind the worker (which holds the
         // lock across file IO in write_utterance). Skipping a contended tick
         // is fine: the heartbeat interval is 1s and the staleness threshold
@@ -2719,7 +3045,13 @@ fn run_sidecar_inner_mpsc(
             Err(std::sync::TryLockError::WouldBlock) => {}
         }
         if stop_flag.load(Ordering::Relaxed) {
-            enqueue_sidecar_utterance(&job_tx, std::mem::take(&mut utterance), &queue_counters);
+            draft_jobs.clear();
+            if let (Some(gate), Some(publisher)) = (draft_gate.as_mut(), partial_publisher.as_mut())
+            {
+                gate.stop(publisher);
+            }
+            let _ =
+                enqueue_sidecar_utterance(&job_tx, std::mem::take(&mut utterance), &queue_counters);
             break;
         }
 
@@ -2727,7 +3059,13 @@ fn run_sidecar_inner_mpsc(
             Ok(s) => s,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                enqueue_sidecar_utterance(&job_tx, std::mem::take(&mut utterance), &queue_counters);
+                draft_jobs.clear();
+                if let (Some(gate), Some(publisher)) =
+                    (draft_gate.as_mut(), partial_publisher.as_mut())
+                {
+                    gate.stop(publisher);
+                }
+                finish_sidecar_utterance(&job_tx, std::mem::take(&mut utterance), &queue_counters);
                 break;
             }
         };
@@ -2739,6 +3077,17 @@ fn run_sidecar_inner_mpsc(
             (sum_sq / samples.len() as f32).sqrt()
         };
 
+        if let (Some(gate), Some(publisher)) = (draft_gate.as_mut(), partial_publisher.as_mut()) {
+            match gate.process(&samples, rms, samples_received, publisher) {
+                RecordingDraftGateEvent::Snapshot(job) => draft_jobs.offer_latest(job),
+                RecordingDraftGateEvent::SpeechEnded => {
+                    draft_jobs.clear();
+                    last_draft_text.clear();
+                }
+                RecordingDraftGateEvent::None => {}
+            }
+        }
+
         let vad_result = vad.process(&samples, rms);
         gating_stats.observe(samples.len(), vad_result.speaking);
 
@@ -2748,13 +3097,14 @@ fn run_sidecar_inner_mpsc(
 
             if utterance.len() >= max_utterance_samples {
                 tracing::info!("sidecar: max utterance duration, force-finalizing");
-                enqueue_sidecar_utterance(&job_tx, std::mem::take(&mut utterance), &queue_counters);
+                finish_sidecar_utterance(&job_tx, std::mem::take(&mut utterance), &queue_counters);
                 was_speaking = false;
             }
         } else if was_speaking && !utterance.is_empty() {
-            enqueue_sidecar_utterance(&job_tx, std::mem::take(&mut utterance), &queue_counters);
+            finish_sidecar_utterance(&job_tx, std::mem::take(&mut utterance), &queue_counters);
             was_speaking = false;
         }
+        samples_received = samples_received.saturating_add(samples.len());
     }
 
     // Let the worker drain its queue (post-stop jobs are skipped, and a single
@@ -2777,9 +3127,21 @@ fn run_sidecar_inner_mpsc(
         silence_windows = gating_stats.silence_windows,
         "live sidecar gating summary"
     );
+    if let Some(gate) = draft_gate.as_ref() {
+        tracing::info!(
+            vad_mode = "energy",
+            samples_fed = gate.stats.samples_fed,
+            samples_gated = gate.stats.samples_gated,
+            speaking_windows = gate.stats.speaking_windows,
+            silence_windows = gate.stats.silence_windows,
+            "live draft gating summary"
+        );
+    }
     tracing::info!(
         lines = lines,
         duration_secs = format!("{:.1}", duration),
+        draft_jobs_replaced = draft_jobs.replaced.load(Ordering::Relaxed),
+        draft_results_replaced = draft_results.replaced.load(Ordering::Relaxed),
         "live sidecar ended (recording mode)"
     );
 
@@ -2792,6 +3154,7 @@ pub fn run_sidecar_mpsc(
     _rx: std::sync::mpsc::Receiver<Vec<f32>>,
     _stop_flag: Arc<AtomicBool>,
     _config: &Config,
+    _partial_publisher: Option<LivePartialPublisher>,
 ) {
     tracing::warn!("live sidecar requires the whisper feature");
 }
@@ -2893,10 +3256,22 @@ fn derive_session_status(
     // perfectly healthy — gating on it would re-introduce the #258 flicker.
     let standalone_active = lt_pid_state.is_active();
 
-    let (sidecar_active, diagnostic) = if recording_pid.is_some() {
+    let (sidecar_active, sidecar_diagnostic) = if recording_pid.is_some() {
         evaluate_recording_sidecar_status(live_status.as_ref(), now)
     } else {
         (false, None)
+    };
+    let diagnostic = if standalone_active {
+        live_status.as_ref().and_then(|status| {
+            (status.state == LiveStatusState::Failed).then(|| {
+                status
+                    .diagnostic
+                    .clone()
+                    .unwrap_or_else(|| "live transcript failed".into())
+            })
+        })
+    } else {
+        sidecar_diagnostic
     };
 
     let active = standalone_active || sidecar_active;
@@ -2924,12 +3299,23 @@ fn derive_session_status(
     } else {
         None
     };
+    let latest_final_age_secs = live_status.as_ref().and_then(|status| {
+        (status.line_count > 0).then(|| {
+            let latest_final_end_secs = status
+                .last_offset_ms
+                .saturating_add(status.last_duration_ms)
+                as f64
+                / 1000.0;
+            (duration_secs - latest_final_end_secs).max(0.0)
+        })
+    });
 
     SessionStatus {
         active,
         pid,
         line_count,
         duration_secs,
+        latest_final_age_secs,
         session_id: live_status
             .as_ref()
             .and_then(|status| status.session_id.clone()),
@@ -3214,6 +3600,124 @@ mod tests {
 
         assert_eq!(counters.pending.load(Ordering::Relaxed), 0);
         assert_eq!(counters.dropped.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn sidecar_draft_mailbox_keeps_only_the_newest_pending_snapshot() {
+        let mailbox = SidecarDraftMailbox::default();
+        mailbox.offer_latest(SidecarDraftJob {
+            utterance_sequence: 1,
+            samples: vec![0.1; 1600],
+            offset_ms: 0,
+            audio_snapshot_at: Instant::now(),
+        });
+        mailbox.offer_latest(SidecarDraftJob {
+            utterance_sequence: 1,
+            samples: vec![0.2; 3200],
+            offset_ms: 0,
+            audio_snapshot_at: Instant::now(),
+        });
+
+        let pending = mailbox.take().unwrap();
+        assert_eq!(pending.samples.len(), 3200);
+        assert_eq!(mailbox.replaced.load(Ordering::Relaxed), 1);
+        assert!(mailbox.take().is_none());
+    }
+
+    #[test]
+    fn long_sidecar_drafts_roll_forward_with_bounded_audio() {
+        let samples: Vec<f32> = (0..48_000).map(|sample| sample as f32).collect();
+        let (window, start) = sidecar_draft_window(&samples, 32_000);
+
+        assert_eq!(start, 16_000);
+        assert_eq!(window.len(), 32_000);
+        assert_eq!(window.first(), Some(&16_000.0));
+        assert_eq!(window.last(), Some(&47_999.0));
+    }
+
+    #[test]
+    fn draft_gate_speech_end_immediately_supersedes_the_visible_draft() {
+        let config = Config::default();
+        let mut gate = RecordingDraftGate::new(&config);
+        let (mut publisher, mut subscriber) = crate::live_partials::channel(9, 2);
+        let samples = vec![0.006; 1600];
+        let mut snapshot = None;
+        for chunk in 0..10 {
+            if let RecordingDraftGateEvent::Snapshot(job) =
+                gate.process(&samples, 0.006, chunk * samples.len(), &mut publisher)
+            {
+                snapshot = Some(job);
+            }
+        }
+        let snapshot = snapshot.expect("one second of quiet speech should schedule a draft");
+        assert_eq!(snapshot.samples.len(), SIDECAR_FIRST_DRAFT_SAMPLES);
+        assert_eq!(
+            publisher.try_publish("provisional".into(), 0),
+            crate::live_partials::PartialPublishOutcome::Published
+        );
+        let crate::live_partials::LivePartialEvent::Partial(_) = subscriber.try_recv().unwrap()
+        else {
+            panic!("published draft should be visible before speech ends");
+        };
+
+        let silence = vec![0.0; 1600];
+        let mut ended = false;
+        for chunk in 0..6 {
+            ended |= matches!(
+                gate.process(&silence, 0.0, (10 + chunk) * silence.len(), &mut publisher,),
+                RecordingDraftGateEvent::SpeechEnded
+            );
+        }
+        assert!(ended, "energy hangover should eventually end the draft");
+
+        let crate::live_partials::LivePartialEvent::Superseded(signal) =
+            subscriber.try_recv().unwrap()
+        else {
+            panic!("speech end must invalidate a provisional draft before final inference");
+        };
+        assert_eq!(signal.reason, SupersessionReason::Finalizing);
+        assert!(subscriber.try_recv().is_none());
+    }
+
+    #[test]
+    fn draft_gate_does_not_schedule_silence() {
+        let config = Config::default();
+        let mut gate = RecordingDraftGate::new(&config);
+        let (mut publisher, mut subscriber) = crate::live_partials::channel(10, 2);
+        let samples = vec![0.0002; 1600];
+
+        for chunk in 0..20 {
+            assert!(matches!(
+                gate.process(&samples, 0.0002, chunk * samples.len(), &mut publisher,),
+                RecordingDraftGateEvent::None
+            ));
+        }
+
+        assert!(subscriber.try_recv().is_none());
+        assert!(!gate.was_speaking);
+    }
+
+    #[test]
+    fn draft_gate_keeps_long_speech_audio_bounded() {
+        let mut config = Config::default();
+        config.transcription.partial_max_secs = 1;
+        let mut gate = RecordingDraftGate::new(&config);
+        let (mut publisher, _subscriber) = crate::live_partials::channel(11, 2);
+        let samples = vec![0.02; 1600];
+        let mut snapshots = 0;
+
+        for chunk in 0..50 {
+            if let RecordingDraftGateEvent::Snapshot(job) =
+                gate.process(&samples, 0.02, chunk * samples.len(), &mut publisher)
+            {
+                snapshots += 1;
+                assert!(job.samples.len() <= 16_000);
+                assert!(gate.utterance.len() <= 16_000);
+            }
+        }
+
+        assert_eq!(snapshots, 3);
+        assert!(gate.utterance.len() <= 16_000);
     }
 
     #[test]
@@ -4247,6 +4751,28 @@ mod tests {
 
     #[cfg(all(feature = "whisper", feature = "streaming"))]
     #[test]
+    fn session_status_reports_final_freshness_without_provisional_text() {
+        let dir = tempdir().unwrap();
+        let status_path = dir.path().join("live-status.json");
+        let mut live_status = live_status_with_state(LiveStatusState::Healthy);
+        live_status.start_time = Local::now() - ChronoDuration::seconds(10);
+        std::fs::write(&status_path, serde_json::to_string(&live_status).unwrap()).unwrap();
+
+        let status = derive_session_status(
+            pid::PidFileState::Inactive,
+            Some(std::process::id()),
+            &status_path,
+            &dir.path().join("live.jsonl"),
+        );
+
+        let age = status
+            .latest_final_age_secs
+            .expect("final freshness should be available");
+        assert!((8.0..=9.0).contains(&age), "unexpected final age: {age}");
+    }
+
+    #[cfg(all(feature = "whisper", feature = "streaming"))]
+    #[test]
     fn sidecar_failed_state_overrides_active_recording() {
         let dir = tempdir().unwrap();
         let status_path = dir.path().join("live-status.json");
@@ -4264,6 +4790,27 @@ mod tests {
         assert!(!status.active);
         assert_eq!(status.source, None);
         assert_eq!(status.diagnostic.as_deref(), Some("sidecar failed"));
+    }
+
+    #[cfg(all(feature = "whisper", feature = "streaming"))]
+    #[test]
+    fn standalone_failed_state_is_visible_to_status_readers() {
+        let dir = tempdir().unwrap();
+        let status_path = dir.path().join("live-status.json");
+        let mut live_status = live_status_with_state(LiveStatusState::Failed);
+        live_status.diagnostic = Some("recognizer unavailable".into());
+        std::fs::write(&status_path, serde_json::to_string(&live_status).unwrap()).unwrap();
+
+        let status = derive_session_status(
+            pid::PidFileState::Active(std::process::id()),
+            None,
+            &status_path,
+            &dir.path().join("live.jsonl"),
+        );
+
+        assert!(status.active);
+        assert_eq!(status.source, Some(TranscriptSource::Standalone));
+        assert_eq!(status.diagnostic.as_deref(), Some("recognizer unavailable"));
     }
 
     #[test]

@@ -240,9 +240,11 @@ Semantics:
 - `history_grounding = false` omits the battle card but still permits live-only
   nudges. When enabled, graph/structured/FTS retrieval runs only on the slow
   worker after stable finals or a topic shift.
-- `live_partials = true` applies only when the copilot owns a standalone
-  streaming Whisper session in-process. External capture and non-streaming
-  backends report `final_only` and continue using durable finals.
+- `live_partials = true` enables ephemeral partial coaching. Standalone Live
+  publishes in-process. Since the 2026-08-25 live-draft amendment, normal
+  Recording can publish the same replaceable evidence through the capture
+  owner's authenticated local relay. Non-streaming backends remain
+  `final_only`, and durable history still contains finals only.
 - `partial_debounce_ms` bounds correction coalescing before a fast model request.
 - `mode` supplies the default opportunity, cadence, threshold, and tone policy.
   `--mode` selects it per session.
@@ -266,12 +268,12 @@ minutes copilot stop
 
 Without `--live`, the foreground process attaches through
 `read_events_since_seq`; it never polls the live transcript JSONL behind
-another process and reports `final_only`. If `--live` is requested while
-another capture process is active, it also attaches `final_only` rather than
-pretending that cross-process partial delivery exists. With `--live` and no
-external capture, the same process owns standalone capture and the partial
-channel. A non-streaming backend or disabled `live_partials` toggle still runs
-that session `final_only`.
+another process. If another capture process is active and advertises
+`capture_relay_partials`, the consumer may attach to that authenticated local
+relay. Older or non-streaming capture owners remain `final_only`. With
+`--live` and no external capture, the same process owns standalone capture and
+the partial channel. A non-streaming backend or disabled `live_partials`
+toggle still runs that session `final_only`.
 
 ## Deferred Work
 

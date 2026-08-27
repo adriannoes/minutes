@@ -1,4 +1,8 @@
 use crate::transcribe::streaming_whisper_params;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use whisper_rs::WhisperContext;
 
 // ──────────────────────────────────────────────────────────────
@@ -17,8 +21,9 @@ use whisper_rs::WhisperContext;
 //   - Full re-transcription on each pass (not incremental). Whisper
 //     is fast enough on the accumulated buffer because we're using
 //     the small/base model and utterances are short (<2 min).
-//   - No segment stitching needed — we always transcribe from t=0
-//     so whisper sees full context. Each pass replaces the previous.
+//   - No segment stitching needed. Until the configured cost ceiling we
+//     transcribe from t=0; longer speech uses the newest bounded window.
+//     Each pass replaces the previous, and the final still uses everything.
 //   - Partial results are emitted via callback; the final result on
 //     silence replaces all partials.
 //   - Uses the same WhisperContext (preloaded model) as batch mode.
@@ -26,10 +31,10 @@ use whisper_rs::WhisperContext;
 // Why full re-transcription instead of incremental:
 //   Incremental (transcribe only the new 2s chunk) produces worse
 //   quality because whisper loses context from earlier speech.
-//   Full re-transcription from t=0 gives consistent output at the
-//   cost of increasing latency as the utterance grows. For typical
-//   dictation utterances (<30s), re-transcription takes <500ms on
-//   Apple Silicon with the base model. Acceptable.
+//   Full re-transcription from t=0 gives consistent output for typical
+//   utterances. Once the configured ceiling is reached, a rolling window
+//   prevents latency from growing without bound while keeping current speech
+//   available. Finalization retains the complete utterance.
 //
 // Performance budget:
 //   - base model: ~200ms for 10s audio on M-series
@@ -75,9 +80,14 @@ pub struct StreamingWhisper {
     language: Option<String>,
     /// Whether we've created a state before (suppress init noise on subsequent calls).
     has_created_state: bool,
-    /// Cap on partial-transcription buffer length, in samples at 16kHz. Past
-    /// this length, partials are skipped (final still runs at end of utterance).
+    /// Cap on partial-transcription window length, in samples at 16kHz. Past
+    /// this length, partials use the newest bounded window while finalization
+    /// still uses the complete utterance.
     partial_max_samples: usize,
+    /// Optional session stop signal. Recording sidecars use this to abort an
+    /// in-flight Whisper pass so optional live evidence cannot hold capture
+    /// shutdown open after the WAV has been sealed.
+    abort_signal: Option<Arc<AtomicBool>>,
 }
 
 impl StreamingWhisper {
@@ -88,10 +98,10 @@ impl StreamingWhisper {
 
     /// Create a new streaming transcriber with a custom partial-cap limit
     /// (in seconds). Past this many seconds of accumulated audio the partial
-    /// `state.full(...)` pass is skipped on each `feed()` call. The utterance
-    /// still finalizes correctly via `finalize()` when the caller (typically
-    /// VAD/silence detection in `live_transcript.rs`) decides the utterance
-    /// is over.
+    /// `state.full(...)` pass uses the newest bounded window. The utterance
+    /// still finalizes from its complete buffer via `finalize()` when the
+    /// caller (typically VAD/silence detection in `live_transcript.rs`)
+    /// decides the utterance is over.
     ///
     /// Why this matters: partial cost is O(buffer_len). At ~200ms per 10s of
     /// audio on Apple Silicon with the base model, a 60s buffer takes ~1.2s
@@ -108,30 +118,29 @@ impl StreamingWhisper {
             language,
             has_created_state: false,
             partial_max_samples,
+            abort_signal: None,
         }
+    }
+
+    /// Abort an in-flight Whisper pass when `abort_signal` becomes true.
+    ///
+    /// Ordinary standalone streaming keeps the historical behavior. Capture
+    /// sidecars opt in because their draft/final evidence is optional and must
+    /// yield immediately to recording shutdown.
+    pub fn with_abort_signal(mut self, abort_signal: Arc<AtomicBool>) -> Self {
+        self.abort_signal = Some(abort_signal);
+        self
     }
 
     /// Feed audio samples. Returns a partial result if enough audio has
     /// accumulated since the last transcription.
     ///
-    /// Once `audio_buffer` exceeds `partial_max_samples`, partials are skipped
-    /// to avoid CPU runaway (cost grows with buffer length). The utterance
-    /// still terminates correctly via `finalize()` when the caller detects
-    /// silence or hits its own utterance cap. From the user's perspective,
-    /// the live transcript stops refreshing during very long uninterrupted
-    /// speech, then catches up at finalize.
+    /// Once `audio_buffer` exceeds `partial_max_samples`, partials use the
+    /// newest bounded window to avoid CPU runaway while staying current during
+    /// long uninterrupted speech. `finalize()` still sees the full utterance.
     pub fn feed(&mut self, samples: &[f32], ctx: &WhisperContext) -> Option<StreamingResult> {
         self.audio_buffer.extend_from_slice(samples);
         self.samples_since_partial += samples.len();
-
-        // Skip partial passes once the buffer is long enough that
-        // `state.full()` would dominate the partial interval.
-        if self.partial_max_samples > 0 && self.audio_buffer.len() > self.partial_max_samples {
-            // Reset the counter so we don't fire a partial the instant we drop
-            // back under the cap (which we won't until reset()).
-            self.samples_since_partial = 0;
-            return None;
-        }
 
         // Only transcribe if enough new audio AND enough total audio
         if self.samples_since_partial >= PARTIAL_INTERVAL_SAMPLES
@@ -165,6 +174,16 @@ impl StreamingWhisper {
         self.audio_buffer.len() as f64 / 16000.0
     }
 
+    fn transcription_window_start(&self, is_final: bool) -> usize {
+        if is_final || self.partial_max_samples == 0 {
+            0
+        } else {
+            self.audio_buffer
+                .len()
+                .saturating_sub(self.partial_max_samples)
+        }
+    }
+
     /// Run whisper on the full accumulated buffer.
     fn transcribe(&mut self, ctx: &WhisperContext, is_final: bool) -> Option<StreamingResult> {
         // Suppress whisper's noisy C-level stderr output on subsequent state creations.
@@ -181,16 +200,21 @@ impl StreamingWhisper {
         let mut params = streaming_whisper_params();
         params.set_n_threads(self.n_threads);
         params.set_language(self.language.as_deref());
+        if let Some(abort_signal) = self.abort_signal.as_ref().map(Arc::clone) {
+            params.set_abort_callback_safe(move || abort_signal.load(Ordering::Relaxed));
+        }
 
         let start = std::time::Instant::now();
 
-        if let Err(e) = state.full(params, &self.audio_buffer) {
+        let window_start = self.transcription_window_start(is_final);
+        let transcription_audio = &self.audio_buffer[window_start..];
+        if let Err(e) = state.full(params, transcription_audio) {
             tracing::warn!("streaming whisper failed: {}", e);
             return None;
         }
 
         let elapsed_ms = start.elapsed().as_millis();
-        let duration_secs = self.audio_buffer.len() as f64 / 16000.0;
+        let duration_secs = transcription_audio.len() as f64 / 16000.0;
 
         // Extract text from all segments
         let num_segments = state.full_n_segments();
@@ -320,6 +344,26 @@ mod tests {
     fn zero_partial_max_disables_cap() {
         let sw = StreamingWhisper::with_partial_max_secs(None, 0);
         assert_eq!(sw.partial_max_samples, 0);
-        // The feed() check `partial_max_samples > 0` short-circuits the cap.
+        // A zero cap keeps the historical full-buffer partial behavior.
+    }
+
+    #[test]
+    fn long_partial_uses_recent_bounded_window_but_final_uses_everything() {
+        let mut sw = StreamingWhisper::with_partial_max_secs(None, 30);
+        sw.audio_buffer.resize(45 * 16000, 0.0);
+
+        assert_eq!(sw.transcription_window_start(false), 15 * 16000);
+        assert_eq!(sw.transcription_window_start(true), 0);
+    }
+
+    #[test]
+    fn recording_sidecar_abort_signal_is_explicit_and_shared() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let sw = StreamingWhisper::new(None).with_abort_signal(Arc::clone(&stop));
+        let configured = sw.abort_signal.expect("abort signal should be configured");
+
+        assert!(!configured.load(Ordering::Relaxed));
+        stop.store(true, Ordering::Relaxed);
+        assert!(configured.load(Ordering::Relaxed));
     }
 }

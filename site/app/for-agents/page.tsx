@@ -69,7 +69,7 @@ const toolGroups = [
     label: "Live and dictation",
     tools: [
       ["start_live_transcript", "Start real-time transcription with per-utterance JSONL output."],
-      ["read_live_transcript", "Read utterances from the active session with cursor or time window."],
+      ["read_live_transcript", "Read finalized lines and, when requested, one fresh provisional current-speech draft."],
       ["start_dictation", "Speak to clipboard and daily notes."],
       ["stop_dictation", "Stop dictation mode."],
     ],
@@ -183,7 +183,7 @@ const tasks = [
     task: "User wants real-time coaching during a meeting",
     steps: [
       "Call start_live_transcript to begin streaming.",
-      "Poll read_live_transcript with a cursor to get new utterances.",
+      "When the user asks for help, call read_live_transcript with include_current to get recent finals plus at most one fresh provisional draft.",
       "When the meeting ends, call stop_recording or the session times out.",
     ],
   },
@@ -861,4 +861,3 @@ export default function ForAgentsPage() {
     </div>
   );
 }
-

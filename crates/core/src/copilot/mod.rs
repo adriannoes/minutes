@@ -39,9 +39,10 @@ pub use provider::{
     ModelEventSink, ModelHealth, ModelHealthStatus, ModelPrivacyClass, ModelStreamEvent,
 };
 pub use relay::{
-    capture_relay_discovery_path, plan_capture_attachment, CaptureAttachPlan, CaptureRelayClient,
-    CaptureRelayDiscovery, CaptureRelayError, CaptureRelayServer, RelayCursor, RelayFrame,
-    RelayTranscriptUpdate, RelayTransport,
+    capture_relay_discovery_path, plan_capture_attachment, reduce_relay_draft, CaptureAttachPlan,
+    CaptureRelayClient, CaptureRelayDiscovery, CaptureRelayError, CaptureRelayServer,
+    RelayCurrentDraft, RelayCursor, RelayDraftSnapshot, RelayDraftState, RelayFrame,
+    RelayTranscriptUpdate, RelayTransport, CURRENT_DRAFT_STALE_AFTER,
 };
 pub use routing::{route_fast_model, FastModelRoute, ProviderProbe, RoutingPolicy};
 pub use runner::{
