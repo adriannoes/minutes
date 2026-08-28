@@ -2,9 +2,9 @@
 // step 15) from the GitHub and npm APIs. Coarse on purpose: better slightly
 // stale and reliable than a flaky build-time fetch.
 // Contributors excludes anonymous entries and dependency automation.
-// Last refreshed: 2026-08-24.
+// Last refreshed: 2026-08-28.
 
-export const GITHUB_STARS = "1,446";
-export const GITHUB_FORKS = "156";
-export const GITHUB_CONTRIBUTORS = "29";
-export const NPM_MONTHLY_DOWNLOADS = "4,300";
+export const GITHUB_STARS = "1,455";
+export const GITHUB_FORKS = "157";
+export const GITHUB_CONTRIBUTORS = "30";
+export const NPM_MONTHLY_DOWNLOADS = "3,200";
