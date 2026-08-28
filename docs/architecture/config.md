@@ -34,6 +34,11 @@ So `minutes record --device "MacBook Pro Microphone"` always wins over `[recordi
 | `parakeet_boost_limit` / `parakeet_boost_score` | `0` / `2.0` | Knowledge-graph phrase boosting; 0 = off |
 | `name_correction` | `"off"` | Post-pass name correction against attendees and vocabulary. Values: `"off"` or `"conservative"`; off by default. |
 
+VAD files are resolved under `model_path`: `ggml-silero-v6.2.0.bin`, plus
+`silero-vad-v6.2.0.onnx` when `vad_engine = "ort-silero"`. Run
+`minutes setup --vad` to download only those files into that directory without
+changing `transcription.model`.
+
 ### `[diarization]` — speaker attribution
 
 | key | default | meaning |

@@ -935,6 +935,10 @@ enum Commands {
         #[arg(short, long, default_value = "small")]
         model: String,
 
+        /// Download only the Silero VAD model(s) into the configured model directory; takes precedence over --model
+        #[arg(long)]
+        vad: bool,
+
         /// List available models
         #[arg(long)]
         list: bool,
@@ -2364,6 +2368,7 @@ fn main() -> Result<()> {
         Commands::Sources => cmd_sources(),
         Commands::Setup {
             model,
+            vad,
             list,
             diarization,
             parakeet,
@@ -2371,7 +2376,9 @@ fn main() -> Result<()> {
             sherpa,
             demo,
         } => {
-            if demo {
+            if vad {
+                cmd_setup_vad()
+            } else if demo {
                 cmd_setup_demo()
             } else if parakeet {
                 cmd_setup_parakeet(&parakeet_model)
@@ -7407,6 +7414,36 @@ fn cmd_setup(model: &str, list: bool, diarization: bool) -> Result<()> {
         config_path.display()
     );
 
+    download_vad_models(model_dir)?;
+
+    // Also list available input devices
+    let devices = minutes_core::capture::list_input_devices();
+    if !devices.is_empty() {
+        eprintln!("\nAvailable audio input devices:");
+        for d in &devices {
+            eprintln!("  {}", d);
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_setup_vad() -> Result<()> {
+    let config = Config::load_strict().map_err(anyhow::Error::msg)?;
+    let model_dir = &config.transcription.model_path;
+    std::fs::create_dir_all(model_dir)?;
+
+    eprintln!(
+        "Downloading Silero VAD model(s) to {} ...",
+        model_dir.display()
+    );
+    download_vad_models(model_dir)?;
+    eprintln!("Silero VAD model download step finished.");
+
+    Ok(())
+}
+
+fn download_vad_models(model_dir: &Path) -> Result<()> {
     // Auto-download Silero VAD model (prevents transcription loops on non-English audio)
     let vad_dest = model_dir.join("ggml-silero-v6.2.0.bin");
     if !vad_dest.exists() {
@@ -7448,15 +7485,6 @@ fn cmd_setup(model: &str, list: bool, diarization: bool) -> Result<()> {
                     e
                 );
             }
-        }
-    }
-
-    // Also list available input devices
-    let devices = minutes_core::capture::list_input_devices();
-    if !devices.is_empty() {
-        eprintln!("\nAvailable audio input devices:");
-        for d in &devices {
-            eprintln!("  {}", d);
         }
     }
 
@@ -9336,6 +9364,95 @@ life (qmd://life/)
             assert!(!help.contains("temporarily unavailable"), "{help}");
             assert!(!help.contains("#513"), "{help}");
         }
+    }
+
+    #[test]
+    fn setup_vad_flag_parses_with_default_and_explicit_models() {
+        let parsed =
+            Cli::try_parse_from(["minutes", "setup", "--vad"]).expect("setup --vad must parse");
+        assert!(matches!(
+            parsed.command,
+            Commands::Setup {
+                vad: true,
+                ref model,
+                ..
+            } if model == "small"
+        ));
+
+        let parsed = Cli::try_parse_from(["minutes", "setup", "--vad", "--model", "large-v3"])
+            .expect("setup --vad --model large-v3 must parse");
+        assert!(matches!(
+            parsed.command,
+            Commands::Setup {
+                vad: true,
+                ref model,
+                ..
+            } if model == "large-v3"
+        ));
+    }
+
+    #[test]
+    fn setup_vad_uses_custom_model_path_without_changing_config_or_whisper_model() {
+        with_temp_home(|home| {
+            let model_dir = home.join("custom-models");
+            std::fs::create_dir_all(&model_dir).unwrap();
+            std::fs::write(
+                model_dir.join("ggml-silero-v6.2.0.bin"),
+                b"existing ggml VAD model",
+            )
+            .unwrap();
+
+            #[cfg(feature = "vad-ort")]
+            std::fs::write(
+                model_dir.join("silero-vad-v6.2.0.onnx"),
+                b"existing ONNX VAD model",
+            )
+            .unwrap();
+
+            let config = Config {
+                transcription: minutes_core::config::TranscriptionConfig {
+                    model: "large-v3".into(),
+                    model_path: model_dir.clone(),
+                    ..Config::default().transcription
+                },
+                ..Config::default()
+            };
+            config.save().unwrap();
+            let config_path = Config::config_path();
+            let config_before = std::fs::read(&config_path).unwrap();
+
+            cmd_setup_vad().unwrap();
+
+            assert_eq!(std::fs::read(&config_path).unwrap(), config_before);
+            assert!(model_dir.join("ggml-silero-v6.2.0.bin").exists());
+            assert!(!model_dir.join("ggml-large-v3.bin").exists());
+        });
+    }
+
+    #[test]
+    fn setup_download_vad_models_skips_existing_files_without_network() {
+        let temp = tempfile::tempdir().unwrap();
+        let ggml_path = temp.path().join("ggml-silero-v6.2.0.bin");
+        std::fs::write(&ggml_path, b"existing ggml VAD model").unwrap();
+
+        #[cfg(feature = "vad-ort")]
+        let onnx_path = {
+            let path = temp.path().join("silero-vad-v6.2.0.onnx");
+            std::fs::write(&path, b"existing ONNX VAD model").unwrap();
+            path
+        };
+
+        download_vad_models(temp.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read(&ggml_path).unwrap(),
+            b"existing ggml VAD model"
+        );
+        #[cfg(feature = "vad-ort")]
+        assert_eq!(
+            std::fs::read(&onnx_path).unwrap(),
+            b"existing ONNX VAD model"
+        );
     }
 
     #[test]
