@@ -139,7 +139,7 @@ private struct LinearPCMLayout {
             return Float(Double(signedValue) / scale)
         }
 
-        let midpoint = Double(mask) / 2.0
+        let midpoint = pow(2.0, Double(bitsPerChannel - 1))
         guard midpoint > 0 else { return nil }
         return Float((Double(raw) - midpoint) / midpoint)
     }
@@ -218,6 +218,134 @@ private func decodedSamples(
     return decoded ? output : nil
 }
 
+private func monoFloatBuffer(samples: [Float], sampleRate: Double) -> AVAudioPCMBuffer? {
+    guard let format = AVAudioFormat(
+        commonFormat: .pcmFormatFloat32,
+        sampleRate: sampleRate,
+        channels: 1,
+        interleaved: false
+    ),
+    let buffer = AVAudioPCMBuffer(
+        pcmFormat: format,
+        frameCapacity: AVAudioFrameCount(samples.count)
+    ),
+    let destination = buffer.floatChannelData?[0] else {
+        return nil
+    }
+    buffer.frameLength = AVAudioFrameCount(samples.count)
+    destination.update(from: samples, count: samples.count)
+    return buffer
+}
+
+private func convertMonoBuffer(
+    _ sourceBuffer: AVAudioPCMBuffer,
+    to targetFormat: AVAudioFormat
+) throws -> AVAudioPCMBuffer {
+    guard let converter = AVAudioConverter(from: sourceBuffer.format, to: targetFormat) else {
+        throw NSError(
+            domain: "MinutesSystemAudioRecord",
+            code: 2,
+            userInfo: [NSLocalizedDescriptionKey: "could not create AVAudioConverter"]
+        )
+    }
+    let ratio = targetFormat.sampleRate / sourceBuffer.format.sampleRate
+    let capacity =
+        AVAudioFrameCount((Double(sourceBuffer.frameLength) * ratio).rounded(.up)) + 1
+    guard let converted = AVAudioPCMBuffer(
+        pcmFormat: targetFormat,
+        frameCapacity: max(capacity, 1)
+    ) else {
+        throw NSError(
+            domain: "MinutesSystemAudioRecord",
+            code: 3,
+            userInfo: [NSLocalizedDescriptionKey: "could not allocate converted audio buffer"]
+        )
+    }
+
+    var providedInput = false
+    var conversionError: NSError?
+    let status = converter.convert(to: converted, error: &conversionError) { _, outStatus in
+        if providedInput {
+            outStatus.pointee = .endOfStream
+            return nil
+        }
+        providedInput = true
+        outStatus.pointee = .haveData
+        return sourceBuffer
+    }
+    if let conversionError {
+        throw conversionError
+    }
+    if status == .error {
+        throw NSError(
+            domain: "MinutesSystemAudioRecord",
+            code: 4,
+            userInfo: [NSLocalizedDescriptionKey: "AVAudioConverter failed"]
+        )
+    }
+    return converted
+}
+
+private final class FixedFormatStemWriter {
+    private let url: URL
+    private var file: AVAudioFile?
+    private(set) var framesSilenced: UInt64 = 0
+
+    init(url: URL) {
+        self.url = url
+    }
+
+    @discardableResult
+    func write(_ buffer: AVAudioPCMBuffer) throws -> AVAudioFrameCount {
+        if file == nil {
+            file = try AVAudioFile(forWriting: url, settings: buffer.format.settings)
+        }
+        guard let file else { return 0 }
+
+        let output: AVAudioPCMBuffer
+        if buffer.format.sampleRate == file.processingFormat.sampleRate {
+            output = buffer
+        } else {
+            output = try convertMonoBuffer(buffer, to: file.processingFormat)
+        }
+        try file.write(from: output)
+        return output.frameLength
+    }
+
+    @discardableResult
+    func writeSilence(
+        sourceFrameCount: AVAudioFrameCount,
+        sourceSampleRate: Double
+    ) throws -> AVAudioFrameCount {
+        guard let file, sourceSampleRate > 0 else { return 0 }
+        let ratio = file.processingFormat.sampleRate / sourceSampleRate
+        let frameCount = max(
+            AVAudioFrameCount((Double(sourceFrameCount) * ratio).rounded()),
+            1
+        )
+        guard let silence = AVAudioPCMBuffer(
+            pcmFormat: file.processingFormat,
+            frameCapacity: frameCount
+        ),
+        let samples = silence.floatChannelData?[0] else {
+            throw NSError(
+                domain: "MinutesSystemAudioRecord",
+                code: 5,
+                userInfo: [NSLocalizedDescriptionKey: "could not allocate silence buffer"]
+            )
+        }
+        silence.frameLength = frameCount
+        samples.initialize(repeating: 0, count: Int(frameCount))
+        try file.write(from: silence)
+        framesSilenced += UInt64(frameCount)
+        return frameCount
+    }
+
+    func close() {
+        file = nil
+    }
+}
+
 private func runPCMDecoderSelfTest() -> Bool {
     let signedPacked = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked
     let signedHighAligned = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsAlignedHigh
@@ -273,14 +401,126 @@ private func runPCMDecoderSelfTest() -> Bool {
         )
     )
 
+    var unsignedSilenceBytes: [UInt8] = []
+    appendLittleEndian(UInt16(0x8000), to: &unsignedSilenceBytes)
+    let unsignedSilence = decodedSamples(
+        bytes: unsignedSilenceBytes,
+        frameCount: 1,
+        asbd: testASBD(
+            channels: 1,
+            bitsPerChannel: 16,
+            bytesPerFrame: 2,
+            flags: kAudioFormatFlagIsPacked
+        )
+    )
+
     let tolerance: Float = 0.000_01
     let cases = [int16, highAligned, int32, stereoFloat]
-    let passed = cases.allSatisfy { samples in
+    let decoderCasesPassed = cases.allSatisfy { samples in
         guard let samples, samples.count == 2 else { return false }
         return abs(samples[0] - 0.5) < tolerance && abs(samples[1] + 0.5) < tolerance
     }
+    let unsignedSilencePassed = unsignedSilence.map {
+        $0.count == 1 && abs($0[0]) < tolerance
+    } ?? false
+
+    var stemCasesPassed = false
+    var selfTestFramesSilenced: UInt64 = 0
+    let temporaryDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("minutes-pcm-self-test-\(UUID().uuidString)")
+    do {
+        try FileManager.default.createDirectory(
+            at: temporaryDirectory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
+
+        let rateChangeURL = temporaryDirectory.appendingPathComponent("rate-change.wav")
+        let rateChangeWriter = FixedFormatStemWriter(url: rateChangeURL)
+        guard let firstSegment = monoFloatBuffer(
+            samples: [Float](repeating: 0.25, count: 480),
+            sampleRate: 48_000
+        ) else { throw NSError(domain: "MinutesPCMTest", code: 1) }
+        try rateChangeWriter.write(firstSegment)
+
+        var secondSegmentBytes: [UInt8] = []
+        for _ in 0..<160 {
+            appendLittleEndian(Int32(16_384) << 16, to: &secondSegmentBytes)
+        }
+        guard let secondSamples = decodedSamples(
+            bytes: secondSegmentBytes,
+            frameCount: 160,
+            asbd: testASBD(
+                channels: 1,
+                bitsPerChannel: 16,
+                bytesPerFrame: 4,
+                flags: signedHighAligned
+            )
+        ),
+        let secondSegment = monoFloatBuffer(samples: secondSamples, sampleRate: 16_000) else {
+            throw NSError(domain: "MinutesPCMTest", code: 2)
+        }
+        try rateChangeWriter.write(secondSegment)
+        rateChangeWriter.close()
+
+        let rateChangeFile = try AVAudioFile(forReading: rateChangeURL)
+        guard let rateChangeAudio = AVAudioPCMBuffer(
+            pcmFormat: rateChangeFile.processingFormat,
+            frameCapacity: AVAudioFrameCount(rateChangeFile.length)
+        ) else { throw NSError(domain: "MinutesPCMTest", code: 3) }
+        try rateChangeFile.read(into: rateChangeAudio)
+        let rateChangeLengthPassed = rateChangeFile.fileFormat.sampleRate == 48_000
+            && rateChangeAudio.frameLength >= 900
+        let tailStart = Int(rateChangeAudio.frameLength) * 3 / 4
+        let tailPresent = rateChangeAudio.floatChannelData.map { channels in
+            guard Int(rateChangeAudio.frameLength) > tailStart else { return false }
+            let tail = UnsafeBufferPointer(
+                start: channels[0] + tailStart,
+                count: Int(rateChangeAudio.frameLength) - tailStart
+            )
+            return tail.contains { abs($0) > 0.1 }
+        } ?? false
+
+        let silenceURL = temporaryDirectory.appendingPathComponent("silence-fill.wav")
+        let silenceWriter = FixedFormatStemWriter(url: silenceURL)
+        guard let supported = monoFloatBuffer(
+            samples: [Float](repeating: 0.25, count: 120),
+            sampleRate: 48_000
+        ) else { throw NSError(domain: "MinutesPCMTest", code: 4) }
+        try silenceWriter.write(supported)
+        let silencedFrames = try silenceWriter.writeSilence(
+            sourceFrameCount: 80,
+            sourceSampleRate: 48_000
+        )
+        silenceWriter.close()
+
+        let silenceFile = try AVAudioFile(forReading: silenceURL)
+        guard let silenceAudio = AVAudioPCMBuffer(
+            pcmFormat: silenceFile.processingFormat,
+            frameCapacity: AVAudioFrameCount(silenceFile.length)
+        ) else { throw NSError(domain: "MinutesPCMTest", code: 5) }
+        try silenceFile.read(into: silenceAudio)
+        let silenceSpanPassed = silenceAudio.frameLength == 200
+            && silencedFrames == 80
+            && silenceWriter.framesSilenced == 80
+            && (silenceAudio.floatChannelData.map { channels in
+                (120..<200).allSatisfy { abs(channels[0][$0]) < tolerance }
+            } ?? false)
+
+        stemCasesPassed = rateChangeLengthPassed && tailPresent && silenceSpanPassed
+        selfTestFramesSilenced = silenceWriter.framesSilenced
+    } catch {
+        fputs("PCM stem self-test failed: \(error)\n", stderr)
+    }
+
+    let passed = decoderCasesPassed && unsignedSilencePassed && stemCasesPassed
     if passed {
-        emitJSON(["event": "pcm_decoder_self_test", "status": "ok", "cases": cases.count])
+        emitJSON([
+            "event": "pcm_decoder_self_test",
+            "status": "ok",
+            "cases": cases.count + 3,
+            "frames_silenced": selfTestFramesSilenced,
+        ])
     } else {
         fputs("PCM decoder self-test failed\n", stderr)
     }
@@ -307,12 +547,13 @@ final class NativeCallRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOut
     private var latestMicLevel: UInt32 = 0
     private var protocolReady = false
     private var pendingSourceEvents: [[String: Any]] = []
-    private var reportedSourceFormats = Set<String>()
+    private var lastReportedSourceFormats: [String: String] = [:]
     private var reportedDecodeFailures = Set<String>()
+    private var reportedStemWriteFailures = Set<String>()
 
     // Per-source stem writers
-    private var voiceStemFile: AVAudioFile?
-    private var systemStemFile: AVAudioFile?
+    private var voiceStemWriter: FixedFormatStemWriter?
+    private var systemStemWriter: FixedFormatStemWriter?
     // Set once stop() has closed the stems, and never cleared. Both stem files
     // are created lazily on first sample, so without this a sample arriving
     // after the close reopens the file with AVAudioFile(forWriting:), which
@@ -435,6 +676,12 @@ final class NativeCallRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOut
         let stemDir = outputURL.deletingLastPathComponent()
         voiceStemURL = stemDir.appendingPathComponent("\(baseName).voice.wav")
         systemStemURL = stemDir.appendingPathComponent("\(baseName).system.wav")
+        if let voiceStemURL {
+            voiceStemWriter = FixedFormatStemWriter(url: voiceStemURL)
+        }
+        if let systemStemURL {
+            systemStemWriter = FixedFormatStemWriter(url: systemStemURL)
+        }
 
         try await stream.startCapture()
 
@@ -490,8 +737,8 @@ final class NativeCallRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOut
         // nil'ing on the main thread races with writes on sampleQueue.
         sampleQueue.sync {
             stemsClosed = true
-            voiceStemFile = nil
-            systemStemFile = nil
+            voiceStemWriter?.close()
+            systemStemWriter?.close()
         }
 
         guard let stream else {
@@ -557,7 +804,9 @@ final class NativeCallRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOut
                 "call_audio_live": systemLive,
                 "mic_live": micLive,
                 "call_audio_level": self.latestSystemLevel,
-                "mic_level": self.latestMicLevel
+                "mic_level": self.latestMicLevel,
+                "mic_frames_silenced": self.voiceStemWriter?.framesSilenced ?? 0,
+                "system_frames_silenced": self.systemStemWriter?.framesSilenced ?? 0,
             ]
             if let data = try? JSONSerialization.data(withJSONObject: payload),
                let json = String(data: data, encoding: .utf8) {
@@ -607,14 +856,23 @@ final class NativeCallRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOut
         default:
             return
         }
-        reportSourceFormatOnce(sourceName: sourceName, asbd: asbd)
-
-        guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else {
-            return
-        }
+        reportSourceFormatTransition(sourceName: sourceName, asbd: asbd)
 
         let sampleCount = CMSampleBufferGetNumSamples(sampleBuffer)
         guard sampleCount > 0 else { return }
+        let frameCount = AVAudioFrameCount(sampleCount)
+        let sampleRate = asbd.mSampleRate
+
+        guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else {
+            silenceUndecodableFrames(
+                source: source,
+                sourceName: sourceName,
+                frameCount: frameCount,
+                sampleRate: sampleRate,
+                asbd: asbd
+            )
+            return
+        }
 
         var contiguousLength: Int = 0
         let totalLength = CMBlockBufferGetDataLength(blockBuffer)
@@ -626,9 +884,16 @@ final class NativeCallRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOut
             totalLengthOut: nil,
             dataPointerOut: &dataPointer
         )
-        guard totalLength > 0 else { return }
-
-        let sampleRate = asbd.mSampleRate
+        guard totalLength > 0 else {
+            silenceUndecodableFrames(
+                source: source,
+                sourceName: sourceName,
+                frameCount: frameCount,
+                sampleRate: sampleRate,
+                asbd: asbd
+            )
+            return
+        }
 
         // Stems are always mono float32 — mix down if multi-channel
         guard let monoFormat = AVAudioFormat(
@@ -636,15 +901,39 @@ final class NativeCallRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOut
             sampleRate: sampleRate,
             channels: 1,
             interleaved: false
-        ) else { return }
+        ) else {
+            silenceUndecodableFrames(
+                source: source,
+                sourceName: sourceName,
+                frameCount: frameCount,
+                sampleRate: sampleRate,
+                asbd: asbd
+            )
+            return
+        }
 
-        let frameCount = AVAudioFrameCount(sampleCount)
         guard let pcmBuffer = AVAudioPCMBuffer(pcmFormat: monoFormat, frameCapacity: frameCount) else {
+            silenceUndecodableFrames(
+                source: source,
+                sourceName: sourceName,
+                frameCount: frameCount,
+                sampleRate: sampleRate,
+                asbd: asbd
+            )
             return
         }
         pcmBuffer.frameLength = frameCount
 
-        guard let monoPtr = pcmBuffer.floatChannelData?[0] else { return }
+        guard let monoPtr = pcmBuffer.floatChannelData?[0] else {
+            silenceUndecodableFrames(
+                source: source,
+                sourceName: sourceName,
+                frameCount: frameCount,
+                sampleRate: sampleRate,
+                asbd: asbd
+            )
+            return
+        }
         let decoded: Bool
         if pointerStatus == kCMBlockBufferNoErr,
            let dataPointer,
@@ -679,37 +968,29 @@ final class NativeCallRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOut
         }
 
         guard decoded else {
-            reportDecodeFailureOnce(sourceName: sourceName, asbd: asbd)
+            silenceUndecodableFrames(
+                source: source,
+                sourceName: sourceName,
+                frameCount: frameCount,
+                sampleRate: sampleRate,
+                asbd: asbd
+            )
             return
         }
 
-        // Lazily create the stem only after the first buffer decodes. An
-        // unsupported source format must not leave a plausible empty WAV.
-        let stemFile: AVAudioFile?
+        // Lazily create the stem only after the first buffer decodes. The
+        // writer then retains that file's processing format for the capture.
+        let stemWriter: FixedFormatStemWriter?
         switch source {
         case .microphone:
-            if voiceStemFile == nil, let url = voiceStemURL {
-                do {
-                    voiceStemFile = try AVAudioFile(forWriting: url, settings: monoFormat.settings)
-                } catch {
-                    fputs("failed to create voice stem file: \(error)\n", stderr)
-                }
-            }
-            stemFile = voiceStemFile
+            stemWriter = voiceStemWriter
         case .audio:
-            if systemStemFile == nil, let url = systemStemURL {
-                do {
-                    systemStemFile = try AVAudioFile(forWriting: url, settings: monoFormat.settings)
-                } catch {
-                    fputs("failed to create system stem file: \(error)\n", stderr)
-                }
-            }
-            stemFile = systemStemFile
+            stemWriter = systemStemWriter
         default:
             return
         }
 
-        guard let file = stemFile else { return }
+        guard let stemWriter else { return }
 
         var sumSquares: Float = 0
         for frame in 0..<Int(frameCount) {
@@ -728,18 +1009,46 @@ final class NativeCallRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOut
         }
 
         do {
-            try file.write(from: pcmBuffer)
+            try stemWriter.write(pcmBuffer)
         } catch {
-            fputs("stem write failed: \(error)\n", stderr)
+            reportStemWriteFailureOnce(sourceName: sourceName, error: error)
         }
     }
 
-    private func reportSourceFormatOnce(
+    private func silenceUndecodableFrames(
+        source: SCStreamOutputType,
+        sourceName: String,
+        frameCount: AVAudioFrameCount,
+        sampleRate: Double,
+        asbd: AudioStreamBasicDescription
+    ) {
+        reportDecodeFailureOnce(sourceName: sourceName, asbd: asbd)
+        let writer: FixedFormatStemWriter?
+        switch source {
+        case .microphone:
+            writer = voiceStemWriter
+        case .audio:
+            writer = systemStemWriter
+        default:
+            return
+        }
+        do {
+            try writer?.writeSilence(
+                sourceFrameCount: frameCount,
+                sourceSampleRate: sampleRate
+            )
+        } catch {
+            reportStemWriteFailureOnce(sourceName: sourceName, error: error)
+        }
+    }
+
+    private func reportSourceFormatTransition(
         sourceName: String,
         asbd: AudioStreamBasicDescription
     ) {
         let signature = sourceFormatSignature(sourceName: sourceName, asbd: asbd)
-        guard reportedSourceFormats.insert(signature).inserted else { return }
+        guard lastReportedSourceFormats[sourceName] != signature else { return }
+        lastReportedSourceFormats[sourceName] = signature
         let flags = asbd.mFormatFlags
         var payload: [String: Any] = [
             "event": "audio_format",
@@ -776,6 +1085,7 @@ final class NativeCallRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOut
         let payload: [String: Any] = [
             "event": "audio_format_unsupported",
             "source": sourceName,
+            "sample_rate": asbd.mSampleRate,
             "format_id": formatIDString(asbd.mFormatID),
             "format_flags": asbd.mFormatFlags,
             "bits_per_channel": asbd.mBitsPerChannel,
@@ -786,6 +1096,13 @@ final class NativeCallRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOut
         ]
         queueSourceEvent(payload)
         fputs("unsupported \(sourceName) PCM layout; stem buffer withheld\n", stderr)
+    }
+
+    private func reportStemWriteFailureOnce(sourceName: String, error: Error) {
+        let description = String(describing: error)
+        let signature = "\(sourceName):\(description)"
+        guard reportedStemWriteFailures.insert(signature).inserted else { return }
+        fputs("stem write failed for \(sourceName): \(description)\n", stderr)
     }
 
     private func sourceFormatSignature(
