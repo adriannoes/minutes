@@ -8764,6 +8764,27 @@ fn cmd_logs(errors: bool, lines: usize) -> Result<()> {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
+    /// Parse CLI args on a thread with a generous stack. `Commands` has
+    /// ~70 variants and clap's derive parser builds large temporaries in
+    /// debug builds; on Windows the default test-thread stack overflowed
+    /// (`STATUS_STACK_OVERFLOW` in `copilot_start_parses_goal_and_surface`
+    /// on #883). Production parsing runs once on the main thread and is
+    /// unaffected; this keeps the tests honest without shrinking coverage.
+    fn parse_cli<I, T>(args: I) -> Result<Cli, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let args: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
+        std::thread::Builder::new()
+            .name("cli-parse-test".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || Cli::try_parse_from(args))
+            .expect("spawn cli parse thread")
+            .join()
+            .expect("cli parse thread panicked")
+    }
+
     use super::*;
     use minutes_core::autoresearch::{
         DecodeHintEvalCaseResult, DecodeHintEvalHintDebug, DecodeHintEvalOptions,
@@ -9322,14 +9343,14 @@ life (qmd://life/)
         assert_eq!(report.features.get("qmd_collection_status"), Some(&false));
         assert_eq!(report.features.get("register_qmd_collection"), Some(&false));
 
-        let help = Cli::try_parse_from(["minutes", "qmd", "--help"])
+        let help = parse_cli(["minutes", "qmd", "--help"])
             .err()
             .expect("qmd help exits through clap")
             .to_string();
         assert!(help.contains("status or cleanup"));
         assert!(!help.to_lowercase().contains("register"));
 
-        let parsed = Cli::try_parse_from(["minutes", "qmd", "cleanup"])
+        let parsed = parse_cli(["minutes", "qmd", "cleanup"])
             .expect("cleanup must be the advertised persistent-QMD remediation");
         assert!(matches!(
             parsed.command,
@@ -9356,7 +9377,7 @@ life (qmd://life/)
             ["minutes", "people", "merge", "--help"].as_slice(),
             ["minutes", "commitments", "--help"].as_slice(),
         ] {
-            let help = Cli::try_parse_from(args)
+            let help = parse_cli(args)
                 .err()
                 .expect("graph help exits through clap")
                 .to_string()
@@ -9368,8 +9389,7 @@ life (qmd://life/)
 
     #[test]
     fn setup_vad_flag_parses_with_default_and_explicit_models() {
-        let parsed =
-            Cli::try_parse_from(["minutes", "setup", "--vad"]).expect("setup --vad must parse");
+        let parsed = parse_cli(["minutes", "setup", "--vad"]).expect("setup --vad must parse");
         assert!(matches!(
             parsed.command,
             Commands::Setup {
@@ -9379,7 +9399,7 @@ life (qmd://life/)
             } if model == "small"
         ));
 
-        let parsed = Cli::try_parse_from(["minutes", "setup", "--vad", "--model", "large-v3"])
+        let parsed = parse_cli(["minutes", "setup", "--vad", "--model", "large-v3"])
             .expect("setup --vad --model large-v3 must parse");
         assert!(matches!(
             parsed.command,
@@ -9657,20 +9677,20 @@ life (qmd://life/)
 
     #[test]
     fn knowledge_status_bridge_is_hidden_strict_and_privacy_safe() {
-        let parsed = Cli::try_parse_from(["minutes", "knowledge-status", "--json"])
+        let parsed = parse_cli(["minutes", "knowledge-status", "--json"])
             .expect("trusted MCP bridge must remain callable");
         assert!(matches!(
             parsed.command,
             Commands::KnowledgeStatus { json: true }
         ));
-        let readiness = Cli::try_parse_from(["minutes", "agent-readiness", "--json"])
+        let readiness = parse_cli(["minutes", "agent-readiness", "--json"])
             .expect("trusted agent-readiness bridge must remain callable");
         assert!(matches!(
             readiness.command,
             Commands::AgentReadiness { json: true }
         ));
         assert!(command_requires_strict_config_bridge(&readiness.command));
-        let root = Cli::try_parse_from(["minutes", "meetings-root", "--json"])
+        let root = parse_cli(["minutes", "meetings-root", "--json"])
             .expect("trusted meeting-root bridge must remain callable");
         assert!(matches!(
             root.command,
@@ -9747,7 +9767,7 @@ life (qmd://life/)
                 "--json",
             ],
         ] {
-            let parsed = Cli::try_parse_from(args).expect("resummarize must parse");
+            let parsed = parse_cli(args).expect("resummarize must parse");
             assert!(matches!(parsed.command, Commands::Resummarize { .. }));
         }
     }
@@ -9756,13 +9776,12 @@ life (qmd://life/)
     fn resummarize_ingest_flag_defaults_off_and_parses_on() {
         // The knowledge log is append-only, so ingestion must never be
         // implied by --apply.
-        let default = Cli::try_parse_from(["minutes", "resummarize", "m.md", "--apply"]).unwrap();
+        let default = parse_cli(["minutes", "resummarize", "m.md", "--apply"]).unwrap();
         match default.command {
             Commands::Resummarize { ingest, .. } => assert!(!ingest),
             _ => panic!("expected a Resummarize command"),
         }
-        let opted =
-            Cli::try_parse_from(["minutes", "resummarize", "m.md", "--apply", "--ingest"]).unwrap();
+        let opted = parse_cli(["minutes", "resummarize", "m.md", "--apply", "--ingest"]).unwrap();
         match opted.command {
             Commands::Resummarize { ingest, .. } => assert!(ingest),
             _ => panic!("expected a Resummarize command"),
@@ -9787,8 +9806,7 @@ life (qmd://life/)
         ];
 
         // Without --fp16: must parse, fp16 must be false.
-        let parsed_without =
-            Cli::try_parse_from(common).expect("parakeet-helper without --fp16 must parse");
+        let parsed_without = parse_cli(common).expect("parakeet-helper without --fp16 must parse");
         match parsed_without.command {
             Commands::ParakeetHelper { fp16, .. } => assert!(!fp16),
             _ => panic!("expected ParakeetHelper variant"),
@@ -9797,8 +9815,7 @@ life (qmd://life/)
         // With --fp16: must parse, fp16 must be true.
         let mut with_fp16: Vec<&str> = common.to_vec();
         with_fp16.push("--fp16");
-        let parsed_with =
-            Cli::try_parse_from(with_fp16).expect("parakeet-helper --fp16 must parse");
+        let parsed_with = parse_cli(with_fp16).expect("parakeet-helper --fp16 must parse");
         match parsed_with.command {
             Commands::ParakeetHelper { fp16, .. } => assert!(fp16),
             _ => panic!("expected ParakeetHelper variant"),
@@ -9807,7 +9824,7 @@ life (qmd://life/)
 
     #[test]
     fn import_accepts_audio_path_for_recovery_alias() {
-        let parsed = Cli::try_parse_from([
+        let parsed = parse_cli([
             "minutes",
             "import",
             "/Users/test/.minutes/native-captures/2026-05-19-120148-call.voice.wav",
@@ -10629,7 +10646,7 @@ life (qmd://life/)
 
     #[test]
     fn transcribe_subcommand_parses_minimal_args() {
-        let parsed = Cli::try_parse_from(["minutes", "transcribe", "/tmp/audio.wav"])
+        let parsed = parse_cli(["minutes", "transcribe", "/tmp/audio.wav"])
             .expect("transcribe must parse with only a file path");
         match parsed.command {
             Commands::Transcribe {
@@ -10651,7 +10668,7 @@ life (qmd://life/)
     fn process_authorized_proof_is_hidden_atomic_and_does_not_change_visible_args() {
         use clap::CommandFactory;
 
-        let help = Cli::try_parse_from(["minutes", "process", "--help"])
+        let help = parse_cli(["minutes", "process", "--help"])
             .err()
             .expect("process help exits through clap")
             .to_string();
@@ -10679,7 +10696,7 @@ life (qmd://life/)
             ]
         );
 
-        let minimal = Cli::try_parse_from(["minutes", "process", "/tmp/audio.wav"])
+        let minimal = parse_cli(["minutes", "process", "/tmp/audio.wav"])
             .expect("ordinary process invocation remains unchanged");
         assert!(matches!(
             minimal.command,
@@ -10691,7 +10708,7 @@ life (qmd://life/)
             }
         ));
 
-        assert!(Cli::try_parse_from([
+        assert!(parse_cli([
             "minutes",
             "process",
             "/tmp/audio.wav",
@@ -10700,7 +10717,7 @@ life (qmd://life/)
         ])
         .is_err());
 
-        let authorized = Cli::try_parse_from([
+        let authorized = parse_cli([
             "minutes",
             "process",
             "authorized-input.wav",
@@ -10725,7 +10742,7 @@ life (qmd://life/)
 
     #[test]
     fn copilot_start_parses_goal_and_surface() {
-        let parsed = Cli::try_parse_from([
+        let parsed = parse_cli([
             "minutes",
             "copilot",
             "start",
@@ -10758,7 +10775,7 @@ life (qmd://life/)
 
     #[test]
     fn copilot_start_requires_goal() {
-        assert!(Cli::try_parse_from(["minutes", "copilot", "start"]).is_err());
+        assert!(parse_cli(["minutes", "copilot", "start"]).is_err());
     }
 
     #[test]
@@ -10807,7 +10824,7 @@ life (qmd://life/)
 
     #[test]
     fn copilot_status_json_flag_parses_without_hosting_a_provider() {
-        let parsed = Cli::try_parse_from(["minutes", "copilot", "status", "--json"])
+        let parsed = parse_cli(["minutes", "copilot", "status", "--json"])
             .expect("copilot status JSON bridge must remain callable");
         let Commands::Copilot { action } = parsed.command else {
             panic!("expected copilot command");
@@ -10818,7 +10835,7 @@ life (qmd://life/)
 
     #[test]
     fn copilot_feedback_parses_explicit_rating() {
-        let parsed = Cli::try_parse_from([
+        let parsed = parse_cli([
             "minutes",
             "copilot",
             "feedback",
@@ -10841,7 +10858,7 @@ life (qmd://life/)
 
     #[test]
     fn copilot_eval_parses_deterministic_suite_options() {
-        let parsed = Cli::try_parse_from([
+        let parsed = parse_cli([
             "minutes",
             "copilot",
             "eval",
@@ -10944,7 +10961,7 @@ life (qmd://life/)
 
     #[test]
     fn coach_alias_exposes_one_command_setup() {
-        let parsed = Cli::try_parse_from(["minutes", "coach", "setup"])
+        let parsed = parse_cli(["minutes", "coach", "setup"])
             .expect("the plain-language Coach setup command must parse");
         assert!(matches!(
             parsed.command,
@@ -11319,7 +11336,7 @@ life (qmd://life/)
 
     #[test]
     fn context_search_parses_an_explicit_source_path() {
-        let parsed = Cli::try_parse_from([
+        let parsed = parse_cli([
             "minutes",
             "context",
             "search",
@@ -11527,7 +11544,7 @@ life (qmd://life/)
 
     #[test]
     fn copilot_alias_still_exposes_setup() {
-        let parsed = Cli::try_parse_from(["minutes", "copilot", "setup"])
+        let parsed = parse_cli(["minutes", "copilot", "setup"])
             .expect("the existing Copilot setup command must keep parsing");
         assert!(matches!(
             parsed.command,
@@ -11542,7 +11559,7 @@ life (qmd://life/)
 
     #[test]
     fn coach_setup_parses_model_and_retune_controls() {
-        let forced = Cli::try_parse_from([
+        let forced = parse_cli([
             "minutes",
             "coach",
             "setup",
@@ -11560,7 +11577,7 @@ life (qmd://life/)
             } if model == "custom/coach:latest"
         ));
 
-        let retune = Cli::try_parse_from(["minutes", "coach", "setup", "--retune"]).unwrap();
+        let retune = parse_cli(["minutes", "coach", "setup", "--retune"]).unwrap();
         assert!(matches!(
             retune.command,
             Commands::Copilot {
@@ -11570,7 +11587,7 @@ life (qmd://life/)
                 }
             }
         ));
-        assert!(Cli::try_parse_from([
+        assert!(parse_cli([
             "minutes",
             "coach",
             "setup",
@@ -12227,7 +12244,7 @@ life (qmd://life/)
 
     #[test]
     fn transcribe_subcommand_parses_all_flags() {
-        let parsed = Cli::try_parse_from([
+        let parsed = parse_cli([
             "minutes",
             "transcribe",
             "/tmp/audio.wav",
