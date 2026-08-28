@@ -79,6 +79,10 @@ The README is now the product overview and install guide, not the only home for 
 - Concise agent index: <https://useminutes.app/llms.txt>
 - Full agent index: <https://useminutes.app/llms-full.txt>
 
+## Who it's for
+
+Minutes is the capture layer for a memory you own. Two kinds of people use it: those who live in an agent afterwards (Claude Code, Cursor, Codex, OpenCode over MCP, or the CLI) and fold meetings into their own vault or wiki, and those who read results in the desktop app. The roadmap names both — see [docs/personas.md](docs/personas.md).
+
 ## Choose your surface
 
 - `Desktop app` — `brew install --cask silverstein/tap/minutes`
