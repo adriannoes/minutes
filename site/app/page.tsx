@@ -604,7 +604,37 @@ export default function Home() {
         <p className="mt-3 font-mono text-[12px] uppercase tracking-[0.14em] text-[var(--text-secondary)]">
           From meetings to memos to agents
         </p>
-        <div className="mt-8 grid gap-px bg-[var(--border)] sm:grid-cols-2 lg:grid-cols-3">
+        <div className="mt-8 grid gap-px bg-[var(--border)] sm:grid-cols-2">
+          <div className="bg-[var(--bg)] px-6 py-6">
+            <p className="font-mono text-[10px] uppercase tracking-[0.18em] text-[var(--accent)]">
+              If your agent is the interface
+            </p>
+            <h3 className="mt-3 font-serif text-[20px] leading-6 text-[var(--text)]">
+              Minutes is the capture layer of a memory you own
+            </h3>
+            <p className="mt-3 text-[14px] leading-6 text-[var(--text-secondary)]">
+              Wait for the call banner, record, and never open the app again.
+              Claude Code, Cursor, Codex, or OpenCode call{" "}
+              <span className="font-mono text-[13px]">search_meetings</span> over
+              MCP, and the markdown folds into your own vault or wiki. The recap
+              is optional; the agent is the reader.
+            </p>
+          </div>
+          <div className="bg-[var(--bg)] px-6 py-6">
+            <p className="font-mono text-[10px] uppercase tracking-[0.18em] text-[var(--accent)]">
+              If you read the results yourself
+            </p>
+            <h3 className="mt-3 font-serif text-[20px] leading-6 text-[var(--text)]">
+              Minutes is a complete local notetaker
+            </h3>
+            <p className="mt-3 text-[14px] leading-6 text-[var(--text-secondary)]">
+              Transcript, speakers, summary, and action items in one inspectable
+              file, with Recall to ask about the meeting afterwards. No account,
+              no server, and no agent required.
+            </p>
+          </div>
+        </div>
+        <div className="mt-px grid gap-px bg-[var(--border)] sm:grid-cols-2 lg:grid-cols-3">
           {featureGrid.map((item) => (
             <div key={item.title} className="bg-[var(--bg)] px-6 py-6">
               <p className="font-mono text-[10px] uppercase tracking-[0.18em] text-[var(--accent)]">
