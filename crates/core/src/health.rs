@@ -343,7 +343,7 @@ pub fn vad_model_status(config: &Config) -> HealthItem {
         detail: if let Some(path) = found {
             format!("Silero VAD installed at {}.", path.display())
         } else {
-            "Silero VAD not installed. Run `minutes setup` to download it. \
+            "Silero VAD not installed. Run `minutes setup --vad` to download it. \
              Without it, non-English audio may produce transcription loops."
                 .into()
         },
@@ -750,6 +750,24 @@ mod tests {
                 item.state
             );
         }
+    }
+
+    #[test]
+    fn missing_vad_model_health_points_to_vad_only_setup() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config {
+            transcription: crate::config::TranscriptionConfig {
+                model_path: temp.path().to_path_buf(),
+                ..Config::default().transcription
+            },
+            ..Config::default()
+        };
+
+        let item = vad_model_status(&config);
+
+        assert_eq!(item.label, "VAD model");
+        assert_eq!(item.state, "attention");
+        assert!(item.detail.contains("setup --vad"));
     }
 
     #[test]
