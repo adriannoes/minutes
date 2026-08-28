@@ -239,15 +239,9 @@ private func monoFloatBuffer(samples: [Float], sampleRate: Double) -> AVAudioPCM
 
 private func convertMonoBuffer(
     _ sourceBuffer: AVAudioPCMBuffer,
-    to targetFormat: AVAudioFormat
+    to targetFormat: AVAudioFormat,
+    using converter: AVAudioConverter
 ) throws -> AVAudioPCMBuffer {
-    guard let converter = AVAudioConverter(from: sourceBuffer.format, to: targetFormat) else {
-        throw NSError(
-            domain: "MinutesSystemAudioRecord",
-            code: 2,
-            userInfo: [NSLocalizedDescriptionKey: "could not create AVAudioConverter"]
-        )
-    }
     let ratio = targetFormat.sampleRate / sourceBuffer.format.sampleRate
     let capacity =
         AVAudioFrameCount((Double(sourceBuffer.frameLength) * ratio).rounded(.up)) + 1
@@ -289,7 +283,32 @@ private func convertMonoBuffer(
 private final class FixedFormatStemWriter {
     private let url: URL
     private var file: AVAudioFile?
+    private var converter: AVAudioConverter?
+    private var converterInputFormat: AVAudioFormat?
     private(set) var framesSilenced: UInt64 = 0
+
+    /// One converter per (input format → stem format). Recreating it per buffer
+    /// discards the resampler's filter state at every buffer boundary and
+    /// allocates ~50 times a second; reusing it keeps the resampled stream
+    /// continuous across a rate transition.
+    private func converter(
+        from inputFormat: AVAudioFormat,
+        to targetFormat: AVAudioFormat
+    ) throws -> AVAudioConverter {
+        if let converter, let converterInputFormat, converterInputFormat == inputFormat {
+            return converter
+        }
+        guard let created = AVAudioConverter(from: inputFormat, to: targetFormat) else {
+            throw NSError(
+                domain: "MinutesSystemAudioRecord",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "could not create AVAudioConverter"]
+            )
+        }
+        converter = created
+        converterInputFormat = inputFormat
+        return created
+    }
 
     init(url: URL) {
         self.url = url
@@ -306,7 +325,11 @@ private final class FixedFormatStemWriter {
         if buffer.format.sampleRate == file.processingFormat.sampleRate {
             output = buffer
         } else {
-            output = try convertMonoBuffer(buffer, to: file.processingFormat)
+            output = try convertMonoBuffer(
+                buffer,
+                to: file.processingFormat,
+                using: try converter(from: buffer.format, to: file.processingFormat)
+            )
         }
         try file.write(from: output)
         return output.frameLength
@@ -343,6 +366,8 @@ private final class FixedFormatStemWriter {
 
     func close() {
         file = nil
+        converter = nil
+        converterInputFormat = nil
     }
 }
 
