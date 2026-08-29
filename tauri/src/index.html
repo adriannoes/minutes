@@ -3490,6 +3490,48 @@
       color: var(--text-secondary);
     }
 
+    .meeting-list-loading {
+      padding-top: 12px;
+    }
+
+    .meeting-list-skeletons {
+      display: grid;
+      gap: 6px;
+    }
+
+    .meeting-list-skeleton {
+      display: grid;
+      gap: 8px;
+      padding: 12px 16px 12px 28px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+    }
+
+    .meeting-list-skeleton-title,
+    .meeting-list-skeleton-meta {
+      display: block;
+      height: 8px;
+      background: var(--border);
+      border-radius: var(--radius);
+    }
+
+    .meeting-list-skeleton-title {
+      width: 58%;
+    }
+
+    .meeting-list-skeleton-meta {
+      width: 28%;
+    }
+
+    .meeting-list-loading .empty-state {
+      padding: 18px 20px;
+    }
+
+    .meeting-list-loading .sub {
+      font-variant-numeric: tabular-nums;
+    }
+
     /* ── About view ── */
     .about-overlay {
       position: fixed;
@@ -5988,10 +6030,25 @@
     <!-- Markdown viewer (replaces meeting list when a file is open) -->
 
     <!-- Meeting list -->
-    <div class="meetings-scroll" id="meetings-scroll">
-      <div class="empty-state">
-        <div class="title">No meetings yet</div>
-        <div class="sub">Record your first conversation to get started.</div>
+    <div class="meetings-scroll" id="meetings-scroll" aria-busy="true">
+      <div class="meeting-list-loading" id="meeting-list-loading" role="status" aria-live="polite">
+        <div class="meeting-list-skeletons" aria-hidden="true">
+          <div class="meeting-list-skeleton" data-meeting-skeleton>
+            <span class="meeting-list-skeleton-title"></span>
+            <span class="meeting-list-skeleton-meta"></span>
+          </div>
+          <div class="meeting-list-skeleton" data-meeting-skeleton>
+            <span class="meeting-list-skeleton-title"></span>
+            <span class="meeting-list-skeleton-meta"></span>
+          </div>
+          <div class="meeting-list-skeleton" data-meeting-skeleton>
+            <span class="meeting-list-skeleton-title"></span>
+            <span class="meeting-list-skeleton-meta"></span>
+          </div>
+        </div>
+        <div class="empty-state">
+          <div class="sub" id="meeting-list-loading-copy">Loading meetings…</div>
+        </div>
       </div>
     </div>
 
@@ -7421,6 +7478,7 @@
     const noteInput = document.getElementById('note-inline-input');
     const footer = document.getElementById('footer');
     const meetingsScroll = document.getElementById('meetings-scroll');
+    const meetingInventoryLoadingTemplate = document.getElementById('meeting-list-loading').cloneNode(true);
     const documentsToggle = document.getElementById('btn-documents-toggle');
     const sidebarCollapseButton = document.getElementById('btn-sidebar-collapse');
     const sidebarExpandRail = document.getElementById('btn-sidebar-expand');
@@ -11396,6 +11454,53 @@
     let meetingInventoryGeneration = 0;
     let meetingInventoryRetryTimer = null;
     let meetingInventoryFingerprint = null;
+    let meetingInventoryLoadingTimer = null;
+    let meetingInventoryLoadingStartedAt = null;
+    let meetingInventoryWaitingOnBusy = false;
+
+    function updateMeetingInventoryLoadingCopy() {
+      if (documentsViewActive || meetingInventoryFingerprint !== null) return;
+      const copy = document.getElementById('meeting-list-loading-copy');
+      if (!copy || meetingInventoryLoadingStartedAt === null) return;
+      const elapsedSeconds = Math.floor((Date.now() - meetingInventoryLoadingStartedAt) / 1000);
+      if (meetingInventoryWaitingOnBusy) {
+        copy.textContent = 'Waiting for another Minutes task to finish…';
+      } else if (elapsedSeconds >= 3) {
+        copy.textContent = `Still loading your meetings… (${elapsedSeconds}s)`;
+      } else {
+        copy.textContent = 'Loading meetings…';
+      }
+    }
+
+    function beginMeetingInventoryLoading() {
+      if (meetingInventoryFingerprint !== null || documentsViewActive) return;
+      if (meetingInventoryLoadingStartedAt === null) {
+        meetingInventoryLoadingStartedAt = Date.now();
+      }
+      if (!document.getElementById('meeting-list-loading')) {
+        meetingsScroll.replaceChildren(meetingInventoryLoadingTemplate.cloneNode(true));
+      }
+      meetingsScroll.setAttribute('aria-busy', 'true');
+      updateMeetingInventoryLoadingCopy();
+      if (!meetingInventoryLoadingTimer) {
+        meetingInventoryLoadingTimer = window.setInterval(updateMeetingInventoryLoadingCopy, 1000);
+      }
+    }
+
+    function setMeetingInventoryWaitingOnBusy(waiting) {
+      meetingInventoryWaitingOnBusy = waiting;
+      updateMeetingInventoryLoadingCopy();
+    }
+
+    function finishMeetingInventoryLoading() {
+      if (meetingInventoryLoadingTimer) {
+        clearInterval(meetingInventoryLoadingTimer);
+        meetingInventoryLoadingTimer = null;
+      }
+      meetingInventoryLoadingStartedAt = null;
+      meetingInventoryWaitingOnBusy = false;
+      meetingsScroll.setAttribute('aria-busy', 'false');
+    }
 
     function fingerprintMeetingInventory(meetings) {
       return JSON.stringify(meetings.map((meeting) => [
@@ -11427,10 +11532,15 @@
         return;
       }
       const generation = ++meetingInventoryGeneration;
+      beginMeetingInventoryLoading();
       let meetings = [];
       try {
         meetings = options.patient === true
-          ? await invokeInventoryPatiently(120000)
+          ? await invokeInventoryPatiently(120000, () => {
+              if (generation === meetingInventoryGeneration) {
+                setMeetingInventoryWaitingOnBusy(true);
+              }
+            })
           : await withUiDeadline(
               invoke('cmd_list_meetings', { limit: 30 }),
               'Meeting inventory'
@@ -11441,6 +11551,7 @@
           invalidateProactiveContextBundle();
         }
         meetingInventoryFingerprint = nextFingerprint;
+        finishMeetingInventoryLoading();
         setSearchError(null);
         renderMeetings(meetings);
       } catch (e) {
@@ -11479,6 +11590,7 @@
           return;
         }
         setSearchError(e);
+        finishMeetingInventoryLoading();
         // NOT renderMeetings([]) — an empty array means "this user has no
         // meetings" and renders the first-run card. A failed read tells us
         // nothing about what is on disk, so it must not make that claim.
@@ -11715,7 +11827,7 @@
       failed.className = 'empty-state';
       failed.innerHTML = `
         <div class="onboarding-content">
-          <h2>Couldn't read your meetings</h2>
+          <h2>Couldn't load your meetings</h2>
           <p class="onboarding-sub">Your notes on disk are untouched — this was a problem reading the list. A large library can take longer than the check allows.</p>
           <div class="onboarding-actions">
             <button class="btn btn-primary btn-sm" id="inventory-retry-btn">Try again</button>
@@ -11765,7 +11877,7 @@
     // finishes. The budget bounds how long we keep RETRYING; one already-running
     // scan can still exceed it, because the backend worker cannot be cancelled
     // and abandoning it would only waste the work.
-    async function invokeInventoryPatiently(budgetMs) {
+    async function invokeInventoryPatiently(budgetMs, onBusy) {
       const deadline = Date.now() + budgetMs;
       while (true) {
         try {
@@ -11774,6 +11886,7 @@
           const busy = String((e && e.message) || e || '').toLowerCase()
             .includes('still checking');
           if (!busy || Date.now() >= deadline) throw e;
+          if (onBusy) onBusy();
           await new Promise((resolve) => window.setTimeout(resolve, 1000));
         }
       }
