@@ -4,7 +4,8 @@ use crate::error::SearchError;
 use crate::markdown::stable_active_corpus_revision;
 use crate::markdown::{
     extract_field, is_inactive_corpus_dir_name, read_stable_active_markdown, split_frontmatter,
-    stable_active_corpus_revision_with_budget, stable_markdown_file_identity,
+    stable_active_corpus_revision_with_budget,
+    stable_active_corpus_revision_with_budget_and_snapshot_hook, stable_markdown_file_identity,
     ActiveCorpusReadBudget, ActiveCorpusRevisionError, Frontmatter, IntentKind, Sensitivity,
     StableActiveCorpusRevision, StableMarkdownFileIdentity, StableMarkdownSnapshot,
     ACTIVE_CORPUS_MAX_AUTHORIZATION_ATTEMPTS,
@@ -65,7 +66,8 @@ fn with_stable_active_corpus_with_hooks<T>(
     mut before_postcheck: impl FnMut(),
 ) -> Result<T, SearchError> {
     let envelope = ActiveCorpusReadBudget::new();
-    for _ in 0..ACTIVE_CORPUS_MAX_AUTHORIZATION_ATTEMPTS {
+    for attempt in 0..ACTIVE_CORPUS_MAX_AUTHORIZATION_ATTEMPTS {
+        let precheck_started = std::time::Instant::now();
         envelope.check_deadline().map_err(|_| {
             SearchError::Io(std::io::Error::other(
                 "meeting corpus could not be verified safely",
@@ -77,21 +79,33 @@ fn with_stable_active_corpus_with_hooks<T>(
         let before = stable_active_corpus_revision_with_budget(dir, envelope.fresh_pass())
             .map_err(|error| corpus_authorization_error("verified", error))?
             .with_read_budget(envelope.fresh_materialization_pass());
+        let precheck_duration = precheck_started.elapsed();
         after_precheck();
         envelope.check_deadline().map_err(|_| {
             SearchError::Io(std::io::Error::other(
                 "meeting corpus authorization deadline elapsed",
             ))
         })?;
+        let operation_started = std::time::Instant::now();
         let value = operation(&before)?;
+        let operation_duration = operation_started.elapsed();
         envelope.check_deadline().map_err(|_| {
             SearchError::Io(std::io::Error::other(
                 "meeting corpus authorization deadline elapsed",
             ))
         })?;
         before_postcheck();
+        let postcheck_started = std::time::Instant::now();
         let after = stable_active_corpus_revision_with_budget(dir, envelope.fresh_pass())
             .map_err(|error| corpus_authorization_error("reverified", error))?;
+        let postcheck_duration = postcheck_started.elapsed();
+        tracing::debug!(
+            attempt = attempt + 1,
+            precheck_duration_ms = precheck_duration.as_millis() as u64,
+            operation_duration_ms = operation_duration.as_millis() as u64,
+            postcheck_duration_ms = postcheck_duration.as_millis() as u64,
+            "meeting corpus authorized operation"
+        );
         if before == after {
             return Ok(value);
         }
@@ -119,6 +133,104 @@ fn revision_snapshot(
     })
 }
 
+fn policy_verified_result(
+    mut result: SearchResult,
+    snapshot: &StableMarkdownSnapshot,
+    filters: &SearchFilters,
+    query: &str,
+) -> Option<(SearchResult, bool)> {
+    let (frontmatter_str, body) = split_frontmatter(&snapshot.content);
+    if frontmatter_str.is_empty() {
+        return None;
+    }
+    let frontmatter = serde_yaml::from_str::<Frontmatter>(frontmatter_str).ok()?;
+    let is_restricted = matches!(frontmatter.sensitivity, Some(Sensitivity::Restricted));
+    if !filters.include_restricted && is_restricted {
+        return None;
+    }
+
+    let live_query = result.matched_via_alias.as_deref().unwrap_or(query);
+    let live_query_trimmed = live_query.trim();
+    let live_snippet = if live_query_trimmed.is_empty() {
+        // Empty query is the documented list mode. It still needs every
+        // policy/filter check below, but has no text predicate.
+        Some(String::new())
+    } else {
+        crate::search_index::live_fts_match_snippet(&frontmatter.title, body, live_query_trimmed)
+    }?;
+    if filters.content_type.as_ref().is_some_and(|expected| {
+        let actual = match frontmatter.r#type {
+            crate::markdown::ContentType::Meeting => "meeting",
+            crate::markdown::ContentType::Memo => "memo",
+            crate::markdown::ContentType::Dictation => "dictation",
+        };
+        actual != expected
+    }) {
+        return None;
+    }
+    let live_date = frontmatter.date.to_rfc3339();
+    if filters
+        .since
+        .as_ref()
+        .is_some_and(|since| live_date < *since)
+    {
+        return None;
+    }
+    if filters.attendee.as_ref().is_some_and(|attendee| {
+        let needle = attendee.to_lowercase();
+        !frontmatter
+            .normalized_attendees()
+            .iter()
+            .chain(frontmatter.people.iter())
+            .any(|candidate| candidate.to_lowercase().contains(&needle))
+    }) {
+        return None;
+    }
+    if filters.recorded_by.as_ref().is_some_and(|recorded_by| {
+        !frontmatter.recorded_by.as_ref().is_some_and(|candidate| {
+            candidate
+                .to_lowercase()
+                .contains(&recorded_by.to_lowercase())
+        })
+    }) {
+        return None;
+    }
+    if filters.intent_kind.as_ref().is_some_and(|intent_kind| {
+        !frontmatter
+            .intents
+            .iter()
+            .any(|intent| &intent.kind == intent_kind)
+    }) {
+        return None;
+    }
+    if filters.owner.as_ref().is_some_and(|owner| {
+        let needle = owner.to_lowercase();
+        !frontmatter
+            .action_items
+            .iter()
+            .any(|item| item.assignee.to_lowercase().contains(&needle))
+            && !frontmatter.intents.iter().any(|intent| {
+                intent
+                    .who
+                    .as_ref()
+                    .is_some_and(|who| who.to_lowercase().contains(&needle))
+            })
+    }) {
+        return None;
+    }
+
+    result.path = snapshot.path.clone();
+    result.title = frontmatter.title;
+    result.date = live_date;
+    result.content_type = match frontmatter.r#type {
+        crate::markdown::ContentType::Meeting => "meeting".into(),
+        crate::markdown::ContentType::Memo => "memo".into(),
+        crate::markdown::ContentType::Dictation => "dictation".into(),
+    };
+    result.snippet = live_snippet;
+    Some((result, is_restricted))
+}
+
 fn retain_policy_verified_results(
     results: &mut Vec<SearchResult>,
     filters: &SearchFilters,
@@ -126,113 +238,16 @@ fn retain_policy_verified_results(
     revision: &StableActiveCorpusRevision,
 ) -> Result<(), SearchError> {
     let candidates = std::mem::take(results);
-    for mut result in candidates {
+    for result in candidates {
         // Stale index rows absent from the pre-operation allowlist are
         // ineligible even if the path becomes readable during this query.
         if !revision.contains_path(&result.path) {
             continue;
         }
         let snapshot = revision_snapshot(revision, &result.path)?;
-        let (frontmatter_str, body) = split_frontmatter(&snapshot.content);
-        if frontmatter_str.is_empty() {
-            continue;
+        if let Some((result, _)) = policy_verified_result(result, &snapshot, filters, query) {
+            results.push(result);
         }
-        let Ok(frontmatter) = serde_yaml::from_str::<Frontmatter>(frontmatter_str) else {
-            continue;
-        };
-        if !filters.include_restricted
-            && matches!(frontmatter.sensitivity, Some(Sensitivity::Restricted))
-        {
-            continue;
-        }
-
-        let live_query = result.matched_via_alias.as_deref().unwrap_or(query);
-        let live_query_trimmed = live_query.trim();
-        let live_snippet = if live_query_trimmed.is_empty() {
-            // Empty query is the documented list mode. It still needs every
-            // policy/filter check below, but has no text predicate.
-            Some(String::new())
-        } else {
-            crate::search_index::live_fts_match_snippet(
-                &frontmatter.title,
-                body,
-                live_query_trimmed,
-            )
-        };
-        let Some(live_snippet) = live_snippet else {
-            continue;
-        };
-        if filters.content_type.as_ref().is_some_and(|expected| {
-            let actual = match frontmatter.r#type {
-                crate::markdown::ContentType::Meeting => "meeting",
-                crate::markdown::ContentType::Memo => "memo",
-                crate::markdown::ContentType::Dictation => "dictation",
-            };
-            actual != expected
-        }) {
-            continue;
-        }
-        let live_date = frontmatter.date.to_rfc3339();
-        if filters
-            .since
-            .as_ref()
-            .is_some_and(|since| live_date < *since)
-        {
-            continue;
-        }
-        if filters.attendee.as_ref().is_some_and(|attendee| {
-            let needle = attendee.to_lowercase();
-            !frontmatter
-                .normalized_attendees()
-                .iter()
-                .chain(frontmatter.people.iter())
-                .any(|candidate| candidate.to_lowercase().contains(&needle))
-        }) {
-            continue;
-        }
-        if filters.recorded_by.as_ref().is_some_and(|recorded_by| {
-            !frontmatter.recorded_by.as_ref().is_some_and(|candidate| {
-                candidate
-                    .to_lowercase()
-                    .contains(&recorded_by.to_lowercase())
-            })
-        }) {
-            continue;
-        }
-        if filters.intent_kind.as_ref().is_some_and(|intent_kind| {
-            !frontmatter
-                .intents
-                .iter()
-                .any(|intent| &intent.kind == intent_kind)
-        }) {
-            continue;
-        }
-        if filters.owner.as_ref().is_some_and(|owner| {
-            let needle = owner.to_lowercase();
-            !frontmatter
-                .action_items
-                .iter()
-                .any(|item| item.assignee.to_lowercase().contains(&needle))
-                && !frontmatter.intents.iter().any(|intent| {
-                    intent
-                        .who
-                        .as_ref()
-                        .is_some_and(|who| who.to_lowercase().contains(&needle))
-                })
-        }) {
-            continue;
-        }
-
-        result.path = snapshot.path;
-        result.title = frontmatter.title;
-        result.date = live_date;
-        result.content_type = match frontmatter.r#type {
-            crate::markdown::ContentType::Meeting => "meeting".into(),
-            crate::markdown::ContentType::Memo => "memo".into(),
-            crate::markdown::ContentType::Dictation => "dictation".into(),
-        };
-        result.snippet = live_snippet;
-        results.push(result);
     }
     Ok(())
 }
@@ -1854,6 +1869,9 @@ fn search_with_mode_and_vocabulary(
     if !dir.exists() {
         return Err(SearchError::DirNotFound(dir.display().to_string()));
     }
+    if query.trim().is_empty() {
+        return list_from_stable_corpus(dir, filters, mode);
+    }
     with_stable_active_corpus(dir, |revision| {
         search_with_mode_and_vocabulary_once(
             query,
@@ -1864,6 +1882,90 @@ fn search_with_mode_and_vocabulary(
             revision,
         )
     })
+}
+
+/// Materialize empty-query results during the mandatory pre-operation corpus
+/// attestation. List mode has no text predicate, so building a full FTS5
+/// projection and then re-reading every projected row cannot add authority or
+/// improve the result. The complete post-operation attestation remains the
+/// publication gate: additions, removals, replacements, content changes, and
+/// sensitivity flips still fail closed exactly as they do for text search.
+fn list_from_stable_corpus(
+    dir: &Path,
+    filters: &SearchFilters,
+    mode: SyncMode,
+) -> Result<Vec<SearchResult>, SearchError> {
+    crate::policy_fs::retire_legacy_policy_caches().map_err(|error| {
+        SearchError::Io(std::io::Error::other(format!(
+            "retire legacy durable policy caches before listing: {error}"
+        )))
+    })?;
+    let envelope = ActiveCorpusReadBudget::new();
+    for attempt in 0..ACTIVE_CORPUS_MAX_AUTHORIZATION_ATTEMPTS {
+        envelope.check_deadline().map_err(|_| {
+            SearchError::Io(std::io::Error::other(
+                "meeting corpus could not be verified safely",
+            ))
+        })?;
+
+        let precheck_started = std::time::Instant::now();
+        let mut results = Vec::new();
+        let mut restricted_results = Vec::new();
+        let before = stable_active_corpus_revision_with_budget_and_snapshot_hook(
+            dir,
+            envelope.fresh_pass(),
+            |snapshot| {
+                let candidate = SearchResult {
+                    path: snapshot.path.clone(),
+                    title: String::new(),
+                    date: String::new(),
+                    content_type: String::new(),
+                    snippet: String::new(),
+                    matched_via_alias: None,
+                };
+                if let Some((result, is_restricted)) =
+                    policy_verified_result(candidate, snapshot, filters, "")
+                {
+                    if is_restricted {
+                        restricted_results.push(result);
+                    } else {
+                        results.push(result);
+                    }
+                }
+            },
+        )
+        .map_err(|error| corpus_authorization_error("verified", error))?
+        .with_read_budget(envelope.fresh_materialization_pass());
+        results.sort_by(|left, right| right.date.cmp(&left.date));
+        restricted_results.sort_by(|left, right| right.date.cmp(&left.date));
+        results.append(&mut restricted_results);
+        let precheck_duration = precheck_started.elapsed();
+
+        envelope.check_deadline().map_err(|_| {
+            SearchError::Io(std::io::Error::other(
+                "meeting corpus authorization deadline elapsed",
+            ))
+        })?;
+        let postcheck_started = std::time::Instant::now();
+        let after = stable_active_corpus_revision_with_budget(dir, envelope.fresh_pass())
+            .map_err(|error| corpus_authorization_error("reverified", error))?;
+        let postcheck_duration = postcheck_started.elapsed();
+
+        tracing::debug!(
+            attempt = attempt + 1,
+            ?mode,
+            precheck_duration_ms = precheck_duration.as_millis() as u64,
+            postcheck_duration_ms = postcheck_duration.as_millis() as u64,
+            result_count = results.len(),
+            "meeting list phases"
+        );
+        if before == after {
+            return Ok(results);
+        }
+    }
+    Err(SearchError::Io(std::io::Error::other(
+        "meeting corpus changed while materializing the result",
+    )))
 }
 
 fn search_with_mode_and_vocabulary_once(
@@ -1878,8 +1980,12 @@ fn search_with_mode_and_vocabulary_once(
     if !dir.exists() {
         return Err(SearchError::DirNotFound(dir.display().to_string()));
     }
+    let open_started = std::time::Instant::now();
     let index = crate::search_index::SearchIndex::open(config)?;
+    let open_duration = open_started.elapsed();
+    let sync_started = std::time::Instant::now();
     let stats = index.sync_for_active_corpus(config, mode, revision)?;
+    let sync_duration = sync_started.elapsed();
     if stats.indexed + stats.updated + stats.removed + stats.errored > 0 {
         tracing::info!(
             indexed = stats.indexed,
@@ -1893,14 +1999,27 @@ fn search_with_mode_and_vocabulary_once(
 
     let expansions = vocabulary_search_expansions(query, vocabulary_override);
     if expansions.len() <= 1 {
+        let search_started = std::time::Instant::now();
         let mut results = index.search(query, filters, None)?;
         if filters.include_restricted {
             results
                 .extend(index.search_restricted_live_for_active_corpus(query, filters, revision)?);
         }
+        let search_duration = search_started.elapsed();
         // Normal and explicit-override restricted candidates pass through one
         // identical live-snapshot, filter, and exact-FTS authorization gate.
+        let policy_started = std::time::Instant::now();
         retain_policy_verified_results(&mut results, filters, query, revision)?;
+        let policy_duration = policy_started.elapsed();
+        tracing::debug!(
+            list_mode = query.trim().is_empty(),
+            open_duration_ms = open_duration.as_millis() as u64,
+            sync_duration_ms = sync_duration.as_millis() as u64,
+            search_duration_ms = search_duration.as_millis() as u64,
+            policy_duration_ms = policy_duration.as_millis() as u64,
+            result_count = results.len(),
+            "meeting search phases"
+        );
         return Ok(results);
     }
 
@@ -3684,6 +3803,42 @@ mod tests {
         create_test_file(dir.path(), "2026-06-10-pricing-sync.md", NORMAL_MEETING);
         create_test_file(dir.path(), "2026-06-11-board.md", RESTRICTED_MEETING);
         dir
+    }
+
+    #[test]
+    fn direct_list_matches_policy_verified_private_projection() {
+        let _guard = crate::test_support::home_env_lock();
+        let dir = restricted_test_dir();
+        let config = Config {
+            output_dir: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+
+        for filters in [
+            SearchFilters::default(),
+            SearchFilters {
+                include_restricted: true,
+                ..Default::default()
+            },
+        ] {
+            let projected = with_stable_active_corpus(dir.path(), |revision| {
+                search_with_mode_and_vocabulary_once(
+                    "",
+                    &config,
+                    &filters,
+                    SyncMode::Auto,
+                    None,
+                    revision,
+                )
+            })
+            .unwrap();
+            let direct = search_with_mode("", &config, &filters, SyncMode::Auto).unwrap();
+
+            assert_eq!(
+                serde_json::to_value(direct).unwrap(),
+                serde_json::to_value(projected).unwrap()
+            );
+        }
     }
 
     #[test]

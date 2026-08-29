@@ -1699,6 +1699,7 @@ where
             "{label} is still checking. Minutes limited this check to one background worker; try again after the current check finishes."
         )),
         JsonInventoryAdmission::Leader(lease) => {
+            let started = Instant::now();
             let joined = tauri::async_runtime::spawn_blocking(move || {
                 // The lease remains owned by the non-cancellable worker even
                 // when the invoking webview future is dropped.
@@ -1706,6 +1707,12 @@ where
                 task()
             })
             .await;
+            tracing::info!(
+                inventory = label,
+                duration_ms = started.elapsed().as_millis() as u64,
+                succeeded = matches!(&joined, Ok(Ok(_))),
+                "JSON inventory completed"
+            );
             match joined {
                 Ok(result) => result,
                 Err(error) => Err(format!("{label} stopped unexpectedly: {error}")),
@@ -7700,8 +7707,10 @@ fn meeting_has_prep(attendees: &[String], prep_slugs: &std::collections::HashSet
 }
 
 fn list_meetings_value(limit: usize) -> Result<serde_json::Value, String> {
+    let prep_started = Instant::now();
     let config = Config::load();
     let prep_slugs = scan_prep_slugs();
+    let prep_duration = prep_started.elapsed();
     let filters = minutes_core::search::SearchFilters {
         content_type: None,
         since: None,
@@ -7711,9 +7720,12 @@ fn list_meetings_value(limit: usize) -> Result<serde_json::Value, String> {
         recorded_by: None,
         include_restricted: true,
     };
+    let search_started = Instant::now();
     let results = minutes_core::search::search("", &config, &filters)
         .map_err(|error| format!("Meeting inventory failed: {error}"))?;
+    let search_duration = search_started.elapsed();
     let limited: Vec<_> = results.into_iter().take(limit).collect();
+    let badges_started = Instant::now();
     let enriched: Result<Vec<serde_json::Value>, String> = limited
         .iter()
         .map(|result| {
@@ -7724,6 +7736,14 @@ fn list_meetings_value(limit: usize) -> Result<serde_json::Value, String> {
             Ok(value)
         })
         .collect();
+    let badges_duration = badges_started.elapsed();
+    tracing::debug!(
+        prep_duration_ms = prep_duration.as_millis() as u64,
+        search_duration_ms = search_duration.as_millis() as u64,
+        badge_duration_ms = badges_duration.as_millis() as u64,
+        result_count = limited.len(),
+        "meeting inventory phases"
+    );
     Ok(serde_json::json!(enriched?))
 }
 

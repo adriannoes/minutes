@@ -747,6 +747,20 @@ pub(crate) fn stable_active_corpus_revision_with_budget(
     root: &Path,
     budget: ActiveCorpusReadBudget,
 ) -> Result<StableActiveCorpusRevision, ActiveCorpusRevisionError> {
+    stable_active_corpus_revision_with_budget_and_snapshot_hook(root, budget, |_| {})
+}
+
+/// Build an exact active-corpus revision while deriving transient data from
+/// each descriptor-stable snapshot.
+///
+/// The callback's output is owned by the caller and is not retained in the
+/// content-free revision. Aggregate readers must still compare a complete
+/// post-operation revision before publishing anything derived here.
+pub(crate) fn stable_active_corpus_revision_with_budget_and_snapshot_hook(
+    root: &Path,
+    budget: ActiveCorpusReadBudget,
+    mut observe_snapshot: impl FnMut(&StableMarkdownSnapshot),
+) -> Result<StableActiveCorpusRevision, ActiveCorpusRevisionError> {
     budget.check_deadline()?;
     let canonical_root = root
         .canonicalize()
@@ -754,6 +768,7 @@ pub(crate) fn stable_active_corpus_revision_with_budget(
     budget.consume_path(&canonical_root)?;
     let mut entries = BTreeMap::new();
     let mut excluded_candidates = 0usize;
+    let mut candidates = Vec::new();
     let walker = walkdir::WalkDir::new(&canonical_root)
         .follow_links(false)
         .into_iter()
@@ -781,26 +796,64 @@ pub(crate) fn stable_active_corpus_revision_with_budget(
             continue;
         }
         budget.consume(1, 0, 0)?;
-        let Some(snapshot) =
-            read_stable_active_markdown_with_budget(entry.path(), &canonical_root, &budget)
-        else {
-            // Do not log candidate paths: malformed or restricted-looking
-            // names are themselves conversation metadata on agent-loaded log
-            // surfaces. Aggregate the warning to keep hostile corpora bounded.
-            excluded_candidates = excluded_candidates.saturating_add(1);
-            continue;
-        };
-        budget.check_deadline()?;
-        budget.consume(0, 0, snapshot.content.len() as u64)?;
-        budget.consume_path(&snapshot.path)?;
-        entries.insert(
-            snapshot.path,
-            StableMarkdownAttestation {
-                content_sha256: snapshot.content_sha256,
-                file_identity: snapshot.file_identity,
-            },
-        );
+        candidates.push(entry.into_path());
     }
+
+    // Descriptor-stable reads are independent once the bounded, no-follow
+    // traversal has identified candidates. A small worker set removes the
+    // per-file syscall latency without changing the shared deadline, byte,
+    // file, directory, or retained-path budgets. Results are still assembled
+    // on this thread into the same exact content-free BTreeMap revision.
+    let worker_count = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(8)
+        .min(candidates.len().max(1));
+    let candidates = std::sync::Arc::new(candidates);
+    let next_candidate = std::sync::atomic::AtomicUsize::new(0);
+    let (send_snapshot, receive_snapshot) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let candidates = std::sync::Arc::clone(&candidates);
+            let budget = budget.clone();
+            let send_snapshot = send_snapshot.clone();
+            let canonical_root = &canonical_root;
+            let next_candidate = &next_candidate;
+            scope.spawn(move || loop {
+                let index = next_candidate.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(path) = candidates.get(index) else {
+                    break;
+                };
+                let snapshot =
+                    read_stable_active_markdown_with_budget(path, canonical_root, &budget);
+                if send_snapshot.send(snapshot).is_err() {
+                    break;
+                }
+            });
+        }
+        drop(send_snapshot);
+        for snapshot in receive_snapshot {
+            let Some(snapshot) = snapshot else {
+                // Do not log candidate paths: malformed or restricted-looking
+                // names are themselves conversation metadata on agent-loaded log
+                // surfaces. Aggregate the warning to keep hostile corpora bounded.
+                excluded_candidates = excluded_candidates.saturating_add(1);
+                continue;
+            };
+            budget.check_deadline()?;
+            budget.consume(0, 0, snapshot.content.len() as u64)?;
+            budget.consume_path(&snapshot.path)?;
+            observe_snapshot(&snapshot);
+            entries.insert(
+                snapshot.path,
+                StableMarkdownAttestation {
+                    content_sha256: snapshot.content_sha256,
+                    file_identity: snapshot.file_identity,
+                },
+            );
+        }
+        Ok::<(), ActiveCorpusRevisionError>(())
+    })?;
     if excluded_candidates > 0 {
         tracing::warn!(
             excluded_candidates,
