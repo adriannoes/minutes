@@ -270,8 +270,13 @@ jobs:
               rm -f "$publish_log"
               return 0
             fi
-            if grep -Fqi "already uploaded" "$publish_log"; then
-              echo "$crate@$VERSION is already uploaded; treating this rerun as successful."
+            # cargo reports a previously published version two ways depending
+            # on where it notices: "already uploaded" from the registry, or
+            # "already exists on crates.io index" from the index refresh
+            # (seen on the v0.25.5 rerun, which then never reached minutes-cli).
+            if grep -Fqi "already uploaded" "$publish_log" \
+              || grep -Fqi "already exists on crates.io index" "$publish_log"; then
+              echo "$crate@$VERSION is already published; treating this rerun as successful."
               rm -f "$publish_log"
               return 0
             fi
