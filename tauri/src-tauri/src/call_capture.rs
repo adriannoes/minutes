@@ -22,7 +22,100 @@ pub struct CallSourceHealth {
     pub call_audio_live: bool,
     pub mic_level: u32,
     pub call_audio_level: u32,
+    pub mic_frames_silenced: u64,
+    pub system_frames_silenced: u64,
     pub last_update: String,
+}
+
+const HELPER_STDERR_INITIAL_LOG_LIMIT: usize = 5;
+const HELPER_STDERR_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+#[derive(Debug)]
+struct HelperStderrRateLimiter {
+    initial_lines_logged: usize,
+    suppressed_lines: u64,
+    last_log_at: Instant,
+}
+
+impl HelperStderrRateLimiter {
+    fn new(now: Instant) -> Self {
+        Self {
+            initial_lines_logged: 0,
+            suppressed_lines: 0,
+            last_log_at: now,
+        }
+    }
+
+    /// Returns the number of lines suppressed before the current line when
+    /// the current line should be logged, or `None` when it should be hidden.
+    fn observe(&mut self, now: Instant) -> Option<u64> {
+        if self.initial_lines_logged < HELPER_STDERR_INITIAL_LOG_LIMIT {
+            self.initial_lines_logged += 1;
+            self.last_log_at = now;
+            return Some(0);
+        }
+        if now.duration_since(self.last_log_at) >= HELPER_STDERR_LOG_INTERVAL {
+            let suppressed = std::mem::take(&mut self.suppressed_lines);
+            self.last_log_at = now;
+            return Some(suppressed);
+        }
+        self.suppressed_lines += 1;
+        None
+    }
+}
+
+fn spawn_helper_stderr_drain(stderr: std::process::ChildStderr) {
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        let mut limiter = HelperStderrRateLimiter::new(Instant::now());
+        for line in reader.lines() {
+            match line {
+                Ok(line) => {
+                    if let Some(suppressed) = limiter.observe(Instant::now()) {
+                        tracing::warn!(
+                            helper_stderr = line,
+                            suppressed_since_last = suppressed,
+                            "native call helper stderr"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "failed to drain native call helper stderr");
+                    break;
+                }
+            }
+        }
+        if limiter.suppressed_lines > 0 {
+            tracing::warn!(
+                suppressed = limiter.suppressed_lines,
+                "native call helper stderr lines suppressed before stream closed"
+            );
+        }
+    });
+}
+
+pub(crate) fn capture_warning_for_audio_format_unsupported(value: &serde_json::Value) -> String {
+    let source = value
+        .get("source")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown source");
+    let field = |name: &str| {
+        value
+            .get(name)
+            .map(serde_json::Value::to_string)
+            .unwrap_or_else(|| "unknown".into())
+    };
+    format!(
+        "Native call capture silenced undecodable {source} audio (ASBD: sample_rate={}, format_id={}, format_flags={}, bits_per_channel={}, bytes_per_packet={}, bytes_per_frame={}, frames_per_packet={}, channels={}).",
+        field("sample_rate"),
+        field("format_id"),
+        field("format_flags"),
+        field("bits_per_channel"),
+        field("bytes_per_packet"),
+        field("bytes_per_frame"),
+        field("frames_per_packet"),
+        field("channels"),
+    )
 }
 
 /// Paths to per-source audio stems written by the native call helper.
@@ -192,6 +285,8 @@ impl NativeCallCaptureSession {
                 call_audio_live: false,
                 mic_level: 0,
                 call_audio_level: 0,
+                mic_frames_silenced: 0,
+                system_frames_silenced: 0,
                 last_update: chrono::Local::now().to_rfc3339(),
             })
     }
@@ -383,6 +478,8 @@ pub fn start_native_call_capture(
         call_audio_live: false,
         mic_level: 0,
         call_audio_level: 0,
+        mic_frames_silenced: 0,
+        system_frames_silenced: 0,
         last_update: chrono::Local::now().to_rfc3339(),
     }));
     let mut command = Command::new(&helper);
@@ -398,6 +495,11 @@ pub fn start_native_call_capture(
         .stdout
         .take()
         .ok_or_else(|| "native call helper did not expose stdout".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "native call helper did not expose stderr".to_string())?;
+    spawn_helper_stderr_drain(stderr);
     let (tx, rx) = mpsc::channel();
     let (microphone_status_tx, microphone_status_rx) = mpsc::channel();
     let microphone_status_expected =
@@ -479,6 +581,14 @@ pub fn start_native_call_capture(
                                 .and_then(|v| v.as_u64())
                                 .map(|v| v as u32)
                                 .unwrap_or(0);
+                            current.mic_frames_silenced = value
+                                .get("mic_frames_silenced")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            current.system_frames_silenced = value
+                                .get("system_frames_silenced")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
                             current.last_update = chrono::Local::now().to_rfc3339();
                         }
                     }
@@ -530,6 +640,24 @@ pub fn start_native_call_capture(
                             .unwrap_or("configured microphone");
                         let _ = microphone_status_tx
                             .send(MicrophoneStartupStatus::Fallback(name.to_string()));
+                    }
+                    Some("audio_format") => {
+                        tracing::info!(
+                            audio_format = %value,
+                            "native call source audio format negotiated"
+                        );
+                    }
+                    Some("audio_format_unsupported") => {
+                        let message = capture_warning_for_audio_format_unsupported(&value);
+                        tracing::warn!(
+                            audio_format = %value,
+                            "native call source PCM layout is unsupported; stem buffer silenced"
+                        );
+                        if let Ok(mut warnings) = warnings_for_thread.lock() {
+                            if !warnings.contains(&message) {
+                                warnings.push(message);
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -632,16 +760,75 @@ fn find_native_call_helper_binary() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    use super::find_native_call_helper_binary;
     use super::{
-        finish_microphone_startup_handshake, native_call_helper_args, parse_macos_major_version,
-        resolve_microphone_selection, MicrophoneSelection, MicrophoneStartupStatus,
+        capture_warning_for_audio_format_unsupported, finish_microphone_startup_handshake,
+        native_call_helper_args, parse_macos_major_version, resolve_microphone_selection,
+        HelperStderrRateLimiter, MicrophoneSelection, MicrophoneStartupStatus,
+        HELPER_STDERR_INITIAL_LOG_LIMIT, HELPER_STDERR_LOG_INTERVAL,
     };
     use std::{
         ffi::OsString,
         path::Path,
         sync::{mpsc, Arc, Mutex},
-        time::Duration,
+        time::{Duration, Instant},
     };
+
+    #[test]
+    fn helper_stderr_rate_limiter_logs_initial_lines_then_periodically() {
+        let start = Instant::now();
+        let mut limiter = HelperStderrRateLimiter::new(start);
+
+        for _ in 0..HELPER_STDERR_INITIAL_LOG_LIMIT {
+            assert_eq!(limiter.observe(start), Some(0));
+        }
+        assert_eq!(limiter.observe(start), None);
+        assert_eq!(limiter.observe(start + Duration::from_secs(9)), None);
+        assert_eq!(limiter.observe(start + HELPER_STDERR_LOG_INTERVAL), Some(2));
+        assert_eq!(limiter.observe(start + HELPER_STDERR_LOG_INTERVAL), None);
+    }
+
+    #[test]
+    fn unsupported_audio_warning_names_source_and_asbd() {
+        let warning = capture_warning_for_audio_format_unsupported(&serde_json::json!({
+            "source": "microphone",
+            "sample_rate": 16_000,
+            "format_id": "lpcm",
+            "format_flags": 4,
+            "bits_per_channel": 16,
+            "bytes_per_packet": 4,
+            "bytes_per_frame": 4,
+            "frames_per_packet": 1,
+            "channels": 1,
+        }));
+        assert!(warning.contains("microphone"));
+        assert!(warning.contains("ASBD"));
+        assert!(warning.contains("sample_rate=16000"));
+        assert!(warning.contains("bits_per_channel=16"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_helper_decodes_hfp_pcm_container_layouts() {
+        let helper = find_native_call_helper_binary().expect("native call helper should be built");
+        let output = std::process::Command::new(helper)
+            .arg("--self-test-pcm-decoder")
+            .output()
+            .expect("PCM decoder self-test should launch");
+
+        assert!(
+            output.status.success(),
+            "PCM decoder self-test failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let receipt: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .expect("PCM decoder self-test should emit one JSON receipt");
+        assert_eq!(receipt["event"], "pcm_decoder_self_test");
+        assert_eq!(receipt["status"], "ok");
+        assert_eq!(receipt["cases"], 7);
+        assert_eq!(receipt["frames_silenced"], 80);
+    }
 
     #[test]
     fn parses_major_version_from_product_version() {

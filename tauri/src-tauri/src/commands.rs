@@ -15063,6 +15063,8 @@ mod tests {
             call_audio_live,
             mic_level,
             call_audio_level,
+            mic_frames_silenced: 0,
+            system_frames_silenced: 0,
             last_update: now.to_rfc3339(),
         }
     }
@@ -16645,6 +16647,55 @@ mod tests {
             input.recovery_health.is_none(),
             "healthy captures must not be marked"
         );
+    }
+
+    #[test]
+    fn unsupported_audio_format_warning_reaches_queued_recording_health() {
+        with_temp_home(|home| {
+            let capture_dir = home.join("native-capture-warning-test");
+            std::fs::create_dir_all(&capture_dir).unwrap();
+            let mov = capture_dir.join("call.mov");
+            std::fs::write(&mov, vec![7_u8; 64_000]).unwrap();
+            write_test_wav(&capture_dir.join("call.voice.wav"), 48_000, 4_000_000);
+            write_test_wav(&capture_dir.join("call.system.wav"), 48_000, 4_000_000);
+
+            let warning = crate::call_capture::capture_warning_for_audio_format_unsupported(
+                &serde_json::json!({
+                    "event": "audio_format_unsupported",
+                    "source": "microphone",
+                    "sample_rate": 16_000,
+                    "format_id": "lpcm",
+                    "format_flags": 4,
+                    "bits_per_channel": 16,
+                    "bytes_per_packet": 4,
+                    "bytes_per_frame": 4,
+                    "frames_per_packet": 1,
+                    "channels": 1,
+                }),
+            );
+            let now = chrono::Local::now();
+            let job = queue_native_call_capture_for_processing(
+                CaptureMode::Meeting,
+                Some("Unsupported format warning".into()),
+                &mov,
+                None,
+                None,
+                now,
+                now,
+                None,
+                None,
+                Some(warning.clone()),
+            )
+            .expect("native call capture should queue");
+
+            let health = job
+                .recording_health
+                .expect("capture warning must be persisted on the queued job");
+            assert!(health
+                .capture_warnings
+                .iter()
+                .any(|capture_warning| capture_warning.message == warning));
+        });
     }
 
     /// An absent stem is not a truncated one. Single-stem captures are a
