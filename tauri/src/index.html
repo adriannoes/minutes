@@ -1624,6 +1624,10 @@
 
     .processing-jobs {
       display: grid;
+      /* minmax(0, 1fr): a grid track's implicit min-width is `auto`, so a
+         card with a nowrap title widened the track past the column and the
+         state pill was clipped by the pane edge ("SUMMARIZI…"). */
+      grid-template-columns: minmax(0, 1fr);
       gap: 8px;
       margin-top: 12px;
     }
@@ -1639,6 +1643,7 @@
     }
 
     .processing-job {
+      min-width: 0;
       border-radius: var(--radius);
       padding: 10px 12px;
       background: var(--bg-elevated);
@@ -8460,7 +8465,10 @@
           processingBar.classList.add('active');
           liveBar.classList.remove('active'); // T4
           isLiveTranscript = false;
-          callBanner.classList.remove('active');
+          // A background job does not preclude a new call recording, so keep
+          // the call banner visible while processing; only starting/recording
+          // hide it. Hiding it here made back-to-back calls invisible (#885).
+          callBanner.classList.toggle('active', !!(activeCallSession && !activeCallSession.dismissed));
           setFooterCaptureMode(false);
           processingStage.textContent =
             status.processingStageLabel
