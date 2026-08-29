@@ -77,7 +77,13 @@ try {
   const [packed] = JSON.parse(packOutput);
   if (!packed?.filename || !packed?.integrity) throw new Error("npm pack returned no filename or integrity");
   const hasCanonicalIntegrity = packed.integrity === lockedSdk.integrity;
-  if (!hasCanonicalIntegrity && process.platform !== "win32") {
+  // The committed lock pins the *published* SDK tarball. A branch that changes
+  // anything under crates/sdk (source, package.json) packs to a different
+  // integrity, which is expected between releases, not drift: the release
+  // workflow packs, publishes, and re-pins independently (#888). Only refuse the
+  // mismatch when a caller explicitly asks for the published tarball.
+  const requirePublishedSdk = process.env.MINUTES_MCP_REQUIRE_PUBLISHED_SDK === "1";
+  if (!hasCanonicalIntegrity && requirePublishedSdk) {
     throw new Error(
       `local minutes-sdk ${sdkPackage.version} integrity does not match the MCP lockfile\n` +
         `  lockfile: ${lockedSdk.integrity}\n  local:    ${packed.integrity}`,
@@ -88,14 +94,17 @@ try {
   const cacheDirectory = path.join(temporaryDirectory, "npm-cache");
   try {
     if (!hasCanonicalIntegrity) {
-      // npm's Windows tar writer emits different archive metadata even after
-      // payload file modes are normalized. The trusted release workflow packs
-      // and publishes on Ubuntu, so the committed lock retains that canonical
-      // registry integrity. Patch only the disposable checkout lock long enough
-      // to prove the same local SDK source installs and builds on Windows.
+      // Two reasons the local tarball can differ from the committed pin: npm's
+      // Windows tar writer emits different archive metadata, and a branch that
+      // changes crates/sdk packs new bytes. Either way the committed lock keeps
+      // the canonical registry integrity; patch only the disposable checkout
+      // lock long enough to prove this SDK source installs and builds.
       mcpLock.packages["node_modules/minutes-sdk"].integrity = packed.integrity;
       await writeFile(mcpLockFile, `${JSON.stringify(mcpLock, null, 2)}\n`, "utf8");
-      console.log("Using Windows-local SDK archive integrity for this CI install only.");
+      console.log(
+        `Local minutes-sdk ${sdkPackage.version} differs from the published pin; ` +
+          "using its archive integrity for this install only (lock restored afterwards).",
+      );
     }
     runNpm(["cache", "add", tarball, "--cache", cacheDirectory], root);
     runNpm(["ci", "--cache", cacheDirectory], mcpDirectory);
