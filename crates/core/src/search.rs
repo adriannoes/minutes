@@ -5525,4 +5525,3 @@ mod tests {
             .all(|stale| stale.entry.what != "Draft board pricing memo"));
     }
 }
-
