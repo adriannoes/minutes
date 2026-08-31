@@ -52,12 +52,12 @@ pub struct CallDetector {
     /// Back off individual browsers after Apple Events / automation failures so
     /// one denied path does not get retried every poll or suppress other browsers.
     browser_probe_backoff_until: Mutex<HashMap<String, Instant>>,
-    /// Recent successful browser-based Meet detection. Prevents fast native-app
-    /// polling from immediately relabeling the same active session as Slack.
-    recent_google_meet_until: Mutex<Option<Instant>>,
+    /// Recent successful browser-based Meet detection, tagged with the
+    /// browser that produced the hit.
+    recent_google_meet_until: Mutex<Option<BrowserSticky>>,
     /// Recent successful browser-based Teams detection. Same role as the Meet
     /// sticky field but for Microsoft Teams in a browser tab.
-    recent_teams_web_until: Mutex<Option<Instant>>,
+    recent_teams_web_until: Mutex<Option<BrowserSticky>>,
     /// Log mic-gate transitions once instead of spamming every poll.
     last_mic_live: Mutex<Option<bool>>,
 }
@@ -201,19 +201,30 @@ fn detected_for(provider: MeetingProvider) -> DetectActiveCallResult {
     }
 }
 
-fn remember_sticky(sticky: &Mutex<Option<Instant>>, ttl: Duration) {
-    *sticky.lock().unwrap() = Some(Instant::now() + ttl);
+/// Sticky window for a browser-path hit. The browser identity is required:
+/// a stale Chrome Meet sticky must not re-arm when Arc holds the mic.
+#[derive(Debug, Clone)]
+struct BrowserSticky {
+    until: Instant,
+    browser_app: String,
 }
 
-fn sticky_alive(sticky: &Mutex<Option<Instant>>) -> bool {
+fn remember_sticky(sticky: &Mutex<Option<BrowserSticky>>, browser_app: &str, ttl: Duration) {
+    *sticky.lock().unwrap() = Some(BrowserSticky {
+        until: Instant::now() + ttl,
+        browser_app: browser_app.to_string(),
+    });
+}
+
+fn sticky_alive(sticky: &Mutex<Option<BrowserSticky>>) -> Option<String> {
     let mut guard = sticky.lock().unwrap();
-    match *guard {
-        Some(until) if Instant::now() < until => true,
+    match guard.as_ref() {
+        Some(state) if Instant::now() < state.until => Some(state.browser_app.clone()),
         Some(_) => {
             *guard = None;
-            false
+            None
         }
-        None => false,
+        None => None,
     }
 }
 
@@ -273,9 +284,76 @@ fn native_app_has_active_input(
         .any(|pid| active_input_pids.contains(pid))
 }
 
+/// Chromium-family probe apps whose process trees can be attributed.
+/// Capture lives in the sandboxed Audio Service child; recursive pid/ppid
+/// expansion from these exact main-process names includes it. Safari is
+/// absent — WebKit PIDs parent to launchd, so it stays on the generic gate.
+const CHROMIUM_FAMILY_INPUT_ROOTS: &[&str] =
+    &["Google Chrome", "Google Chrome Canary", "Chromium", "Arc"];
+
+/// Exact-name roots plus recursive children. Unlike
+/// `native_app_candidate_process_pids`, this does not prefix-match: that
+/// helper would treat "Google Chrome Canary" as a "Google Chrome" root.
+fn browser_family_candidate_pids(
+    root_process_name: &str,
+    processes: &[RunningProcess],
+) -> HashSet<u32> {
+    let mut candidates: HashSet<u32> = processes
+        .iter()
+        .filter(|process| process.name.eq_ignore_ascii_case(root_process_name))
+        .map(|process| process.pid)
+        .collect();
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for process in processes {
+            if candidates.contains(&process.ppid) && candidates.insert(process.pid) {
+                changed = true;
+            }
+        }
+    }
+
+    candidates
+}
+
+/// Browser-path liveness: generic `mic_live` when attribution is unavailable
+/// or the browser is Safari; otherwise that Chromium-family process tree.
+fn browser_path_input_allowed(
+    browser_app: &str,
+    mic_live: bool,
+    processes: Option<&[RunningProcess]>,
+    active_input_pids: Option<&HashSet<u32>>,
+) -> bool {
+    let Some(active_input_pids) = active_input_pids else {
+        return mic_live;
+    };
+    if browser_app.eq_ignore_ascii_case("Safari") {
+        return mic_live;
+    }
+    let Some(root_process_name) = CHROMIUM_FAMILY_INPUT_ROOTS
+        .iter()
+        .copied()
+        .find(|root| root.eq_ignore_ascii_case(browser_app))
+    else {
+        return false;
+    };
+    let Some(processes) = processes else {
+        return false;
+    };
+    browser_family_candidate_pids(root_process_name, processes)
+        .iter()
+        .any(|pid| active_input_pids.contains(pid))
+}
+
 enum BrowserMeetProbe {
-    Detected { provider: MeetingProvider },
-    PermissionDenied { browser_app: String },
+    Detected {
+        provider: MeetingProvider,
+        browser_app: String,
+    },
+    PermissionDenied {
+        browser_app: String,
+    },
     Error,
     NoBrowserProcesses,
     NoMatch,
@@ -833,12 +911,22 @@ impl CallDetector {
             .filter(|app| app.as_str() != "google-meet" && app.as_str() != "teams-web")
             .collect();
 
-        if has_google_meet && mic_live && sticky_alive(&self.recent_google_meet_until) {
-            return detected_for(MeetingProvider::GoogleMeet);
+        if has_google_meet {
+            if let Some(browser_app) = sticky_alive(&self.recent_google_meet_until) {
+                if browser_path_input_allowed(&browser_app, mic_live, processes, active_input_pids)
+                {
+                    return detected_for(MeetingProvider::GoogleMeet);
+                }
+            }
         }
 
-        if has_teams_web && mic_live && sticky_alive(&self.recent_teams_web_until) {
-            return detected_for(MeetingProvider::TeamsWeb);
+        if has_teams_web {
+            if let Some(browser_app) = sticky_alive(&self.recent_teams_web_until) {
+                if browser_path_input_allowed(&browser_app, mic_live, processes, active_input_pids)
+                {
+                    return detected_for(MeetingProvider::TeamsWeb);
+                }
+            }
         }
 
         if !mic_live {
@@ -848,13 +936,23 @@ impl CallDetector {
         if (has_google_meet || has_teams_web) && (force_browser_probe || self.browser_probe_due()) {
             if let Some(probe) = browser_probe(self, running, has_google_meet, has_teams_web) {
                 match probe {
-                    BrowserMeetProbe::Detected { provider } => {
-                        let sticky = match provider {
-                            MeetingProvider::GoogleMeet => &self.recent_google_meet_until,
-                            MeetingProvider::TeamsWeb => &self.recent_teams_web_until,
-                        };
-                        remember_sticky(sticky, provider.sticky_duration());
-                        return detected_for(provider);
+                    BrowserMeetProbe::Detected {
+                        provider,
+                        browser_app,
+                    } => {
+                        if browser_path_input_allowed(
+                            &browser_app,
+                            mic_live,
+                            processes,
+                            active_input_pids,
+                        ) {
+                            let sticky = match provider {
+                                MeetingProvider::GoogleMeet => &self.recent_google_meet_until,
+                                MeetingProvider::TeamsWeb => &self.recent_teams_web_until,
+                            };
+                            remember_sticky(sticky, &browser_app, provider.sticky_duration());
+                            return detected_for(provider);
+                        }
                     }
                     BrowserMeetProbe::PermissionDenied { browser_app } => {
                         return DetectActiveCallResult::PermissionWarning { browser_app };
@@ -1050,11 +1148,13 @@ impl CallDetector {
                         if want_meet && looks_like_google_meet_meeting_url(&tab.url) {
                             return BrowserMeetProbe::Detected {
                                 provider: MeetingProvider::GoogleMeet,
+                                browser_app: app_name.to_string(),
                             };
                         }
                         if want_teams && looks_like_teams_meeting_tab(&tab.url, &tab.title) {
                             return BrowserMeetProbe::Detected {
                                 provider: MeetingProvider::TeamsWeb,
+                                browser_app: app_name.to_string(),
                             };
                         }
                     }
@@ -1754,16 +1854,20 @@ mod tests {
 
         remember_sticky(
             &detector.recent_google_meet_until,
+            "Google Chrome",
             MeetingProvider::GoogleMeet.sticky_duration(),
         );
-        assert!(sticky_alive(&detector.recent_google_meet_until));
+        assert!(sticky_alive(&detector.recent_google_meet_until).is_some());
 
         {
             let mut sticky = detector.recent_google_meet_until.lock().unwrap();
-            *sticky = Some(Instant::now() - Duration::from_secs(1));
+            *sticky = Some(BrowserSticky {
+                until: Instant::now() - Duration::from_secs(1),
+                browser_app: "Google Chrome".into(),
+            });
         }
 
-        assert!(!sticky_alive(&detector.recent_google_meet_until));
+        assert!(sticky_alive(&detector.recent_google_meet_until).is_none());
     }
 
     #[test]
@@ -1821,6 +1925,7 @@ mod tests {
                 assert!(!want_teams);
                 Some(BrowserMeetProbe::Detected {
                     provider: MeetingProvider::GoogleMeet,
+                    browser_app: "Google Chrome".into(),
                 })
             },
         );
@@ -1847,6 +1952,7 @@ mod tests {
                 assert!(!want_teams);
                 Some(BrowserMeetProbe::Detected {
                     provider: MeetingProvider::GoogleMeet,
+                    browser_app: "Google Chrome".into(),
                 })
             },
         );
@@ -2107,6 +2213,7 @@ mod tests {
                 assert!(!want_teams);
                 Some(BrowserMeetProbe::Detected {
                     provider: MeetingProvider::GoogleMeet,
+                    browser_app: "Google Chrome".into(),
                 })
             },
         );
@@ -2155,6 +2262,7 @@ mod tests {
 
         remember_sticky(
             &detector.recent_google_meet_until,
+            "Safari",
             MeetingProvider::GoogleMeet.sticky_duration(),
         );
         let running = ["Safari".into()];
@@ -2176,7 +2284,7 @@ mod tests {
         });
 
         assert!(!native_detected);
-        assert!(sticky_alive(&detector.recent_google_meet_until));
+        assert!(sticky_alive(&detector.recent_google_meet_until).is_some());
     }
 
     #[test]
@@ -2560,15 +2668,403 @@ mod tests {
 
         remember_sticky(
             &detector.recent_teams_web_until,
+            "Google Chrome",
             MeetingProvider::TeamsWeb.sticky_duration(),
         );
-        assert!(sticky_alive(&detector.recent_teams_web_until));
+        assert!(sticky_alive(&detector.recent_teams_web_until).is_some());
 
         {
             let mut sticky = detector.recent_teams_web_until.lock().unwrap();
-            *sticky = Some(Instant::now() - Duration::from_secs(1));
+            *sticky = Some(BrowserSticky {
+                until: Instant::now() - Duration::from_secs(1),
+                browser_app: "Google Chrome".into(),
+            });
         }
 
-        assert!(!sticky_alive(&detector.recent_teams_web_until));
+        assert!(sticky_alive(&detector.recent_teams_web_until).is_none());
+    }
+
+    fn meet_detected_in(browser_app: &str) -> BrowserMeetProbe {
+        BrowserMeetProbe::Detected {
+            provider: MeetingProvider::GoogleMeet,
+            browser_app: browser_app.into(),
+        }
+    }
+
+    fn teams_web_detected_in(browser_app: &str) -> BrowserMeetProbe {
+        BrowserMeetProbe::Detected {
+            provider: MeetingProvider::TeamsWeb,
+            browser_app: browser_app.into(),
+        }
+    }
+
+    fn process(pid: u32, ppid: u32, name: &str) -> RunningProcess {
+        RunningProcess {
+            pid,
+            ppid,
+            name: name.into(),
+        }
+    }
+
+    // One snapshot per enabled Chromium root. Keep 1:1 with
+    // `CHROMIUM_FAMILY_INPUT_ROOTS` — do not infer Canary from Chrome.
+    const CHROMIUM_FAMILY_ROOT_FIXTURES: &[(&str, &str)] = &[
+        ("Google Chrome", "Google Chrome Helper"),
+        ("Google Chrome Canary", "Google Chrome Canary Helper"),
+        ("Chromium", "Chromium Helper"),
+        ("Arc", "Arc Helper"),
+    ];
+
+    #[test]
+    fn chrome_audio_service_child_holding_input_detects_meet() {
+        let detector = CallDetector::new(test_call_detection_config(vec!["google-meet".into()]));
+        let config = detector.current_config();
+        let processes = vec![
+            process(200, 1, "Google Chrome"),
+            process(210, 200, "Google Chrome Helper"),
+        ];
+        let active_input_pids = HashSet::from([210]);
+
+        let result = detector.detect_active_call_from_process_snapshot(
+            &config,
+            true,
+            &processes,
+            Some(&active_input_pids),
+            true,
+            |_detector, _running, _want_meet, _want_teams| Some(meet_detected_in("Google Chrome")),
+        );
+
+        assert_eq!(result, detected_for(MeetingProvider::GoogleMeet));
+        assert_eq!(
+            sticky_alive(&detector.recent_google_meet_until).as_deref(),
+            Some("Google Chrome")
+        );
+    }
+
+    #[test]
+    fn stale_meet_tab_with_superwhisper_is_rejected_on_fresh_probe() {
+        let detector = CallDetector::new(test_call_detection_config(vec!["google-meet".into()]));
+        let config = detector.current_config();
+        let processes = vec![
+            process(200, 1, "Google Chrome"),
+            process(210, 200, "Google Chrome Helper"),
+            process(900, 1, "superwhisper"),
+        ];
+        let active_input_pids = HashSet::from([900]);
+
+        let result = detector.detect_active_call_from_process_snapshot(
+            &config,
+            true,
+            &processes,
+            Some(&active_input_pids),
+            true,
+            |_detector, _running, _want_meet, _want_teams| Some(meet_detected_in("Google Chrome")),
+        );
+
+        assert_eq!(result, DetectActiveCallResult::None);
+        assert!(sticky_alive(&detector.recent_google_meet_until).is_none());
+    }
+
+    #[test]
+    fn stale_meet_tab_with_superwhisper_is_rejected_on_live_sticky() {
+        let detector = CallDetector::new(test_call_detection_config(vec!["google-meet".into()]));
+        detector.schedule_next_browser_probe();
+        remember_sticky(
+            &detector.recent_google_meet_until,
+            "Google Chrome",
+            MeetingProvider::GoogleMeet.sticky_duration(),
+        );
+        let config = detector.current_config();
+        let processes = vec![
+            process(200, 1, "Google Chrome"),
+            process(210, 200, "Google Chrome Helper"),
+            process(900, 1, "superwhisper"),
+        ];
+        let active_input_pids = HashSet::from([900]);
+
+        let result = detector.detect_active_call_from_process_snapshot(
+            &config,
+            true,
+            &processes,
+            Some(&active_input_pids),
+            false,
+            |_detector, _running, _want_meet, _want_teams| {
+                panic!("rate-limited sticky poll must not reach the browser probe")
+            },
+        );
+
+        assert_eq!(result, DetectActiveCallResult::None);
+        assert_eq!(
+            sticky_alive(&detector.recent_google_meet_until).as_deref(),
+            Some("Google Chrome")
+        );
+    }
+
+    #[test]
+    fn arc_holding_input_does_not_arm_chrome_meet_tab() {
+        let detector = CallDetector::new(test_call_detection_config(vec!["google-meet".into()]));
+        let config = detector.current_config();
+        let processes = vec![
+            process(200, 1, "Google Chrome"),
+            process(210, 200, "Google Chrome Helper"),
+            process(400, 1, "Arc"),
+            process(410, 400, "Arc Helper"),
+        ];
+        let active_input_pids = HashSet::from([410]);
+
+        let result = detector.detect_active_call_from_process_snapshot(
+            &config,
+            true,
+            &processes,
+            Some(&active_input_pids),
+            true,
+            |_detector, _running, _want_meet, _want_teams| Some(meet_detected_in("Google Chrome")),
+        );
+
+        assert_eq!(result, DetectActiveCallResult::None);
+    }
+
+    #[test]
+    fn chrome_meet_sticky_is_not_rearmed_by_arc_holding_input() {
+        let detector = CallDetector::new(test_call_detection_config(vec!["google-meet".into()]));
+        detector.schedule_next_browser_probe();
+        remember_sticky(
+            &detector.recent_google_meet_until,
+            "Google Chrome",
+            MeetingProvider::GoogleMeet.sticky_duration(),
+        );
+        let config = detector.current_config();
+        let processes = vec![
+            process(200, 1, "Google Chrome"),
+            process(210, 200, "Google Chrome Helper"),
+            process(400, 1, "Arc"),
+            process(410, 400, "Arc Helper"),
+        ];
+        let active_input_pids = HashSet::from([410]);
+
+        let result = detector.detect_active_call_from_process_snapshot(
+            &config,
+            true,
+            &processes,
+            Some(&active_input_pids),
+            false,
+            |_detector, _running, _want_meet, _want_teams| {
+                panic!("rate-limited sticky poll must not reach the browser probe")
+            },
+        );
+
+        assert_eq!(result, DetectActiveCallResult::None);
+        assert_eq!(
+            sticky_alive(&detector.recent_google_meet_until).as_deref(),
+            Some("Google Chrome")
+        );
+    }
+
+    #[test]
+    fn browser_meet_falls_back_to_generic_mic_gate_when_attribution_unavailable() {
+        let detector = CallDetector::new(test_call_detection_config(vec!["google-meet".into()]));
+        let config = detector.current_config();
+        let processes = vec![
+            process(200, 1, "Google Chrome"),
+            process(210, 200, "Google Chrome Helper"),
+            process(900, 1, "superwhisper"),
+        ];
+
+        let result = detector.detect_active_call_from_process_snapshot(
+            &config,
+            true,
+            &processes,
+            None,
+            true,
+            |_detector, _running, _want_meet, _want_teams| Some(meet_detected_in("Google Chrome")),
+        );
+
+        assert_eq!(result, detected_for(MeetingProvider::GoogleMeet));
+    }
+
+    #[test]
+    fn safari_webkit_pid_with_ppid_1_follows_generic_mic_gate() {
+        let detector = CallDetector::new(test_call_detection_config(vec!["google-meet".into()]));
+        let config = detector.current_config();
+        let processes = vec![
+            process(400, 1, "Safari"),
+            process(501, 1, "com.apple.WebKit.WebContent"),
+        ];
+        let webkit_input = HashSet::from([501]);
+
+        let webkit_result = detector.detect_active_call_from_process_snapshot(
+            &config,
+            true,
+            &processes,
+            Some(&webkit_input),
+            true,
+            |_detector, _running, _want_meet, _want_teams| Some(meet_detected_in("Safari")),
+        );
+        assert_eq!(webkit_result, detected_for(MeetingProvider::GoogleMeet));
+
+        let detector = CallDetector::new(test_call_detection_config(vec!["google-meet".into()]));
+        let processes = vec![
+            process(400, 1, "Safari"),
+            process(501, 1, "com.apple.WebKit.WebContent"),
+            process(900, 1, "superwhisper"),
+        ];
+        let superwhisper_input = HashSet::from([900]);
+        let superwhisper_result = detector.detect_active_call_from_process_snapshot(
+            &config,
+            true,
+            &processes,
+            Some(&superwhisper_input),
+            true,
+            |_detector, _running, _want_meet, _want_teams| Some(meet_detected_in("Safari")),
+        );
+        assert_eq!(
+            superwhisper_result,
+            detected_for(MeetingProvider::GoogleMeet)
+        );
+    }
+
+    #[test]
+    fn chromium_family_audio_service_input_detects_meet_for_each_enabled_root() {
+        let production: Vec<&str> = CHROMIUM_FAMILY_INPUT_ROOTS.to_vec();
+        let fixtures: Vec<&str> = CHROMIUM_FAMILY_ROOT_FIXTURES
+            .iter()
+            .map(|(app, _)| *app)
+            .collect();
+        assert_eq!(production, fixtures);
+
+        for (index, (browser_app, audio_service_child_name)) in
+            CHROMIUM_FAMILY_ROOT_FIXTURES.iter().enumerate()
+        {
+            let detector =
+                CallDetector::new(test_call_detection_config(vec!["google-meet".into()]));
+            let config = detector.current_config();
+            let main_pid = 200 + (index as u32) * 10;
+            let audio_pid = main_pid + 1;
+            let processes = vec![
+                process(main_pid, 1, browser_app),
+                process(audio_pid, main_pid, audio_service_child_name),
+            ];
+            let active_input_pids = HashSet::from([audio_pid]);
+
+            let result = detector.detect_active_call_from_process_snapshot(
+                &config,
+                true,
+                &processes,
+                Some(&active_input_pids),
+                true,
+                |_detector, _running, _want_meet, _want_teams| Some(meet_detected_in(browser_app)),
+            );
+
+            assert_eq!(
+                result,
+                detected_for(MeetingProvider::GoogleMeet),
+                "{browser_app}"
+            );
+            assert_eq!(
+                sticky_alive(&detector.recent_google_meet_until).as_deref(),
+                Some(*browser_app)
+            );
+        }
+    }
+
+    #[test]
+    fn chrome_attribution_root_does_not_include_canary_process_family() {
+        let processes = vec![
+            process(200, 1, "Google Chrome"),
+            process(210, 200, "Google Chrome Helper"),
+            process(300, 1, "Google Chrome Canary"),
+            process(310, 300, "Google Chrome Canary Helper"),
+        ];
+
+        let chrome_family = browser_family_candidate_pids("Google Chrome", &processes);
+        assert_eq!(chrome_family, HashSet::from([200, 210]));
+
+        // Native prefix matching treats Canary as Chrome; browser roots must not.
+        let native_style = native_app_candidate_process_pids("Google Chrome", &processes);
+        assert!(native_style.contains(&300) && native_style.contains(&310));
+
+        let detector = CallDetector::new(test_call_detection_config(vec!["google-meet".into()]));
+        let config = detector.current_config();
+        let active_input_pids = HashSet::from([310]);
+        let result = detector.detect_active_call_from_process_snapshot(
+            &config,
+            true,
+            &processes,
+            Some(&active_input_pids),
+            true,
+            |_detector, _running, _want_meet, _want_teams| Some(meet_detected_in("Google Chrome")),
+        );
+        assert_eq!(result, DetectActiveCallResult::None);
+    }
+
+    #[test]
+    fn stale_teams_web_tab_with_superwhisper_is_rejected() {
+        let detector = CallDetector::new(test_call_detection_config(vec!["teams-web".into()]));
+        let config = detector.current_config();
+        let processes = vec![
+            process(200, 1, "Google Chrome"),
+            process(210, 200, "Google Chrome Helper"),
+            process(900, 1, "superwhisper"),
+        ];
+        let active_input_pids = HashSet::from([900]);
+
+        let fresh = detector.detect_active_call_from_process_snapshot(
+            &config,
+            true,
+            &processes,
+            Some(&active_input_pids),
+            true,
+            |_detector, _running, _want_meet, _want_teams| {
+                Some(teams_web_detected_in("Google Chrome"))
+            },
+        );
+        assert_eq!(fresh, DetectActiveCallResult::None);
+        assert!(sticky_alive(&detector.recent_teams_web_until).is_none());
+
+        remember_sticky(
+            &detector.recent_teams_web_until,
+            "Google Chrome",
+            MeetingProvider::TeamsWeb.sticky_duration(),
+        );
+        detector.schedule_next_browser_probe();
+        let sticky = detector.detect_active_call_from_process_snapshot(
+            &config,
+            true,
+            &processes,
+            Some(&active_input_pids),
+            false,
+            |_detector, _running, _want_meet, _want_teams| {
+                panic!("rate-limited sticky poll must not reach the browser probe")
+            },
+        );
+        assert_eq!(sticky, DetectActiveCallResult::None);
+    }
+
+    #[test]
+    fn chrome_audio_service_child_holding_input_detects_teams_web() {
+        let detector = CallDetector::new(test_call_detection_config(vec!["teams-web".into()]));
+        let config = detector.current_config();
+        let processes = vec![
+            process(200, 1, "Google Chrome"),
+            process(210, 200, "Google Chrome Helper"),
+        ];
+        let active_input_pids = HashSet::from([210]);
+
+        let result = detector.detect_active_call_from_process_snapshot(
+            &config,
+            true,
+            &processes,
+            Some(&active_input_pids),
+            true,
+            |_detector, _running, _want_meet, _want_teams| {
+                Some(teams_web_detected_in("Google Chrome"))
+            },
+        );
+
+        assert_eq!(result, detected_for(MeetingProvider::TeamsWeb));
+        assert_eq!(
+            sticky_alive(&detector.recent_teams_web_until).as_deref(),
+            Some("Google Chrome")
+        );
     }
 }
